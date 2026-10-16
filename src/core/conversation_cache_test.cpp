@@ -1,7 +1,9 @@
 #include "strata/core/conversation_cache.hpp"
 
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
+#include <map>
 #include <vector>
 
 using namespace strata::core;
@@ -383,6 +385,83 @@ int main() {
         p2.checkpoints.back().gdn.resize(64, 1);
         check(tiny.put(std::move(p2)), "a pinned one fits an empty cache");
         check(!tiny.put(image({7,8,9})) && tiny.size() == 1, "nothing else fits beside it: parking is refused, the pin stays");
+    }
+    {   // --conversation-cache-dir: images in files, only their identity in RAM
+        std::map<uint64_t, SavedConversation> files;
+        size_t loads = 0, removes = 0;
+        bool fail_next = false;
+        auto disk_of = [&](ConversationCache& c) {
+            c.use_disk({[&](uint64_t f, SavedConversation& out, std::string& why) {
+                            ++loads;
+                            if (fail_next || !files.count(f)) { why = "gone"; return false; }
+                            out = files.at(f);   // the engine reads a copy back; the file stays until remove
+                            return true;
+                        },
+                        [&](uint64_t f) { ++removes; files.erase(f); }});
+        };
+        auto park = [&](ConversationCache& c, uint64_t f, SavedConversation img, size_t bytes) {
+            files[f] = img;
+            return c.put_file(conversation_skeleton(std::move(img)), f, bytes);
+        };
+        {
+            ConversationCache cache(1000, 2);
+            check(cache.frees_ram() && !cache.on_disk(), "RAM by default");
+            disk_of(cache);
+            check(cache.on_disk() && !cache.frees_ram(), "the file tier frees no RAM by evicting");
+            auto a = image({1,2,3});
+            a.checkpoints.push_back(ConversationCheckpoint{});
+            a.checkpoints.back().ids = {1,2};
+            a.checkpoints.back().gdn.resize(32, 5);
+            a.checkpoints.back().pinned = true;
+            a.kv.resize(1);
+            a.kv[0].k.resize(100, 3);
+            check(park(cache, 1, a, 400) && cache.size() == 1 && cache.bytes() == 400, "a file charges its own size");
+            check(cache.best(std::vector<int32_t>{1,2,3,4}, {}, true).tokens == 3, "matching reads the skeleton");
+            check(cache.best(std::vector<int32_t>{1,2,9}, {}, true).tokens == 2, "and its checkpoints");
+            check(cache.longest_tokens() == 3, "longest from the skeleton");
+            auto back = cache.take(0);
+            check(loads == 1 && removes == 1 && files.empty() && cache.size() == 0 && cache.bytes() == 0,
+                  "take reads the file back and removes it");
+            check(back.live.ids == a.live.ids && back.live.gdn == a.live.gdn && back.kv.size() == 1 &&
+                  back.kv[0].k == a.kv[0].k, "the whole image comes back");
+            check(back.checkpoints.size() == 1 && back.checkpoints[0].pinned && back.checkpoints[0].gdn.size() == 32,
+                  "checkpoints come back with the pin the file does not carry");
+            std::vector<ConversationKv> kv(1); kv[0].k.resize(50);
+            cache.retain(std::move(kv), 3);
+            check(cache.retained_bytes() == 0, "no K/V is retained in RAM with the file tier");
+            check(park(cache, 2, image({4}), 300) && park(cache, 3, image({5}), 300) && cache.size() == 2,
+                  "two fill the slots");
+            check(park(cache, 4, image({6}), 300) && cache.size() == 2 && cache.evictions() == 1 && !files.count(2),
+                  "a third evicts the oldest and removes its file");
+            check(!park(cache, 5, image({7}), 2000) && !files.count(5), "a file over the budget is refused and removed");
+            fail_next = true;
+            const size_t i = cache.best(std::vector<int32_t>{5,1}, {}, true).index;
+            auto bad = cache.take(i);
+            check(bad.kv.empty() && bad.live.ids.empty() && cache.last_error() == "gone" && !files.count(3),
+                  "an unreadable file is an empty image, its file removed");
+            fail_next = false;
+            check(cache.size() == 1 && files.size() == 1, "one left");
+            check(cache.put(image({8,9})) && cache.size() == 2, "a RAM image still parks beside the files");
+            check(cache.take(cache.best(std::vector<int32_t>{8,9,1}, {}, true).index).live.gdn.size() == 64,
+                  "and comes back without a file read");
+        }
+        check(files.size() == 1 && files.count(4), "the files outlive the cache (a restart finds them)");
+        files.clear();
+        {   // slots 0 with the file tier: no slot limit, the byte budget alone prunes the oldest
+            ConversationCache cache(1000, SIZE_MAX);
+            disk_of(cache);
+            for (uint64_t f = 1; f <= 10; ++f) check(park(cache, f, image({int32_t(f)}), 100), "every one fits the budget");
+            check(cache.size() == 10 && cache.evictions() == 0, "ten parked beside one another");
+            check(park(cache, 11, image({11}), 250) && cache.size() == 8 && cache.evictions() == 3 &&
+                  !files.count(1) && !files.count(3) && files.count(4), "over the budget: the oldest files go");
+        }
+        check(files.size() == 8, "and outlive it");
+        {
+            ConversationCache cache(1000, SIZE_MAX);
+            disk_of(cache);
+            check(park(cache, 20, image({20}), 100) && cache.clear() == 1 && files.size() == 8 && !files.count(20),
+                  "clear() (a non-finite-logits flush) removes the files it holds");
+        }
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

@@ -30,7 +30,7 @@ SessionSaveReclaimed session_save_reclaim(std::vector<ConversationCheckpoint>& c
         room = available();
         if (done()) return out;
     }
-    while (true) {
+    while (cache.frees_ram()) {   // a file-tier entry gives back disk space, not RAM
         const size_t before = cache.bytes();
         if (!cache.evict_oldest()) break; // pinned conversations stay parked
         ++out.parked;
