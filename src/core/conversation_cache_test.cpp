@@ -562,20 +562,18 @@ int main() {
     }
     {   // --conversation-cache-dir: images in files, only their identity in RAM
         std::map<uint64_t, SavedConversation> files;
-        size_t loads = 0, removes = 0;
-        bool fail_next = false;
-        auto disk_of = [&](ConversationCache& c) {
-            c.use_disk({[&](uint64_t f, SavedConversation& out, std::string& why) {
-                            ++loads;
-                            if (fail_next || !files.count(f)) { why = "gone"; return false; }
-                            out = files.at(f);   // the engine reads a copy back; the file stays until remove
-                            return true;
-                        },
-                        [&](uint64_t f) { ++removes; files.erase(f); }});
-        };
+        size_t removes = 0;
+        auto disk_of = [&](ConversationCache& c) { c.use_disk([&](uint64_t f) { ++removes; files.erase(f); }); };
         auto park = [&](ConversationCache& c, uint64_t f, SavedConversation img, size_t bytes) {
             files[f] = img;
-            return c.put_file(conversation_skeleton(std::move(img)), f, bytes);
+            return c.put_file(conversation_skeleton(img, img.checkpoints), f, bytes);
+        };
+        // the engine's read: a copy of the file (the file stays until it is removed)
+        auto read_file = [&](uint64_t f, SavedConversation& out, std::string& why) {
+            if (!files.count(f)) { why = "gone"; return false; }
+            out = files.at(f);
+            for (auto& c : out.checkpoints) c.pinned = false;   // a file carries no pins
+            return true;
         };
         {
             ConversationCache cache(1000, 2);
@@ -593,13 +591,14 @@ int main() {
             check(cache.best(std::vector<int32_t>{1,2,3,4}, {}, true).tokens == 3, "matching reads the skeleton");
             check(cache.best(std::vector<int32_t>{1,2,9}, {}, true).tokens == 2, "and its checkpoints");
             check(cache.longest_tokens() == 3, "longest from the skeleton");
-            auto back = cache.take(0);
-            check(loads == 1 && removes == 1 && files.empty() && cache.size() == 0 && cache.bytes() == 0,
-                  "take reads the file back and removes it");
+            SavedConversation back;
+            check(cache.load_with(cache.detach(0), back, read_file) && removes == 0 && files.count(1) &&
+                  cache.size() == 0 && cache.bytes() == 0, "load_with reads the file back and hands it on");
             check(back.live.ids == a.live.ids && back.live.gdn == a.live.gdn && back.kv.size() == 1 &&
                   back.kv[0].k == a.kv[0].k, "the whole image comes back");
             check(back.checkpoints.size() == 1 && back.checkpoints[0].pinned && back.checkpoints[0].gdn.size() == 32,
                   "checkpoints come back with the pin the file does not carry");
+            files.erase(1);
             std::vector<ConversationKv> kv(1); kv[0].k.resize(50);
             cache.retain(std::move(kv), 3);
             check(cache.retained_bytes() == 0, "no K/V is retained in RAM with the file tier");
@@ -608,19 +607,21 @@ int main() {
             check(park(cache, 4, image({6}), 300) && cache.size() == 2 && cache.evictions() == 1 && !files.count(2),
                   "a third evicts the oldest and removes its file");
             check(!park(cache, 5, image({7}), 2000) && !files.count(5), "a file over the budget is refused and removed");
-            fail_next = true;
             const size_t i = cache.best(std::vector<int32_t>{5,1}, {}, true).index;
-            auto bad = cache.take(i);
-            check(bad.kv.empty() && bad.live.ids.empty() && cache.last_error() == "gone" && !files.count(3),
-                  "an unreadable file is an empty image, its file removed");
-            fail_next = false;
+            SavedConversation bad;
+            check(!cache.load_with(cache.detach(i), bad, [](uint64_t, SavedConversation&, std::string& why) {
+                      why = "gone"; return false; }) && cache.last_error() == "gone" && !files.count(3),
+                  "an unreadable file fails the read and is removed");
             check(cache.size() == 1 && files.size() == 1, "one left");
             check(cache.put(image({8,9})) && cache.size() == 2, "a RAM image still parks beside the files");
             check(cache.take(cache.best(std::vector<int32_t>{8,9,1}, {}, true).index).live.gdn.size() == 64,
                   "and comes back without a file read");
+            check(cache.take(0).kv.empty() && !files.count(4) && files.empty(),
+                  "take() of a file entry gives its skeleton and removes the file");
+            check(park(cache, 4, image({6}), 300), "parked to a file again");
         }
-        check(files.size() == 1 && files.count(4), "the files outlive the cache (a restart finds them)");
-        {   // load_with: the engine's own read (a streamed restore) in place of disk.load; skeleton from a chain apart
+        check(files.size() == 1 && files.count(4), "going away does not remove the files (the engine does at start)");
+        {   // load_with through the caller's read; skeleton from a chain apart
             ConversationCache cache(1000, 2);
             disk_of(cache);
             auto a = image({1,2,3});
@@ -632,21 +633,20 @@ int main() {
             auto meta = a;
             files[30] = a;
             files[30].checkpoints = chain;
-            const auto skel = conversation_skeleton(std::move(meta), chain);
+            const auto skel = conversation_skeleton(meta, chain);
             check(skel.checkpoints.size() == 1 && skel.checkpoints[0].ids == chain[0].ids && skel.checkpoints[0].pinned &&
                   skel.checkpoints[0].used == 9 && skel.checkpoints[0].gdn.empty() && chain[0].gdn.size() == 32,
                   "skeleton from a chain apart: identities copied, the chain untouched");
             check(cache.put_file(SavedConversation(skel), 30, 100), "parked from a chain apart");
-            const size_t before = loads;
             SavedConversation out;
             size_t reads = 0;
             check(cache.load_with(cache.detach(0), out, [&](uint64_t f, SavedConversation& o, std::string&) {
                       ++reads; o = files.at(f); o.checkpoints[0].pinned = false; o.kv.clear(); return true; }) &&
-                  reads == 1 && loads == before && !files.count(30), "load_with reads through the caller, removes the file");
+                  reads == 1 && files.count(30), "load_with reads through the caller and leaves it the file");
             check(out.kv.empty() && out.checkpoints.size() == 1 && out.checkpoints[0].pinned,
                   "the pin comes back from the skeleton");
             files[31] = image({4});
-            check(cache.put_file(conversation_skeleton(image({4})), 31, 100), "another parked");
+            check(cache.put_file(conversation_skeleton(image({4}), {}), 31, 100), "another parked");
             check(!cache.load_with(cache.detach(0), out, [](uint64_t, SavedConversation&, std::string& why) {
                       why = "streamed read refused"; return false; }) &&
                   cache.last_error() == "streamed read refused" && !files.count(31), "a failed read still removes the file");
@@ -721,8 +721,8 @@ int main() {
             SavedConversation out;
             const size_t before = removes;
             check(cache.load_with(cache.detach(0), out, [&](uint64_t f, SavedConversation& o, std::string&) {
-                      o = files.at(f); return true; }, true) &&
-                  removes == before && files.count(50), "load_with(keep_file) leaves the file");
+                      o = files.at(f); return true; }) &&
+                  removes == before && files.count(50), "load_with leaves the file");
             cache.retain_file(50, 3, 300);
             check(cache.base() && cache.base()->file == 50 && cache.base()->unchanged == 3 && cache.bytes() == 300,
                   "the kept file is the base, charged to the budget");
@@ -748,8 +748,8 @@ int main() {
             check(!cache.base() && !files.count(56), "clear() drops the base too");
             check(park(cache, 57, image({1, 2}), 100), "park again");
             check(!cache.load_with(cache.detach(cache.size() - 1), out, [](uint64_t, SavedConversation&, std::string& why) {
-                      why = "torn"; return false; }, true) && !files.count(57),
-                  "a failed read removes the file even when it was to be kept");
+                      why = "torn"; return false; }) && !files.count(57),
+                  "a failed read removes the file");
         }
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);

@@ -44,11 +44,6 @@ bool park_file_read(const std::string&, uint64_t, SavedConversation&, const Sess
     error = "park files need a POSIX system";
     return false;
 }
-bool park_file_read_image(const std::string&, uint64_t, SavedConversation&, const SessionReadLimits&, ParkFileState&,
-                          std::string& error) {
-    error = "park files need a POSIX system";
-    return false;
-}
 
 #else
 
@@ -454,7 +449,6 @@ bool park_file_write(const std::string& path, uint64_t file, const ParkFileState
                     st.checkpoints[i] = base->checkpoints[k];
                     kept[k] = 1;
                     reused = true;
-                    stats.kept_records += st.checkpoints[i].length;
                     ++stats.kept_checkpoints;
                     break;
                 }
@@ -630,30 +624,6 @@ bool park_file_read(const std::string& path, uint64_t file, SavedConversation& m
     meta = std::move(m);
     state = std::move(st);
     stt.error = SessionError::none;
-    return true;
-}
-
-bool park_file_read_image(const std::string& path, uint64_t file, SavedConversation& image,
-                          const SessionReadLimits& limits, ParkFileState& state, std::string& error) {
-    SavedConversation out;
-    SessionKvTarget t;
-    t.begin = [&out](const SavedConversation&, uint64_t layers, std::string&) { out.kv.resize((size_t) layers); return true; };
-    t.layer = [&out](size_t j, const ConversationKv& h, std::array<uint64_t, 5>& sizes, SessionKvSink& sink, std::string&) {
-        ConversationKv& k = out.kv[j];
-        k.format = h.format; k.cells = h.cells; k.heads = h.heads; k.head_dim = h.head_dim;
-        k.page_size = h.page_size; k.pooled_rows = h.pooled_rows; k.idx_dim = h.idx_dim;
-        const std::array<ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
-        for (size_t p = 0; p < 5; ++p) parts[p]->resize((size_t) sizes[p]);
-        sink.write = [parts](size_t p, size_t at, const void* src, size_t n) {
-            const auto* c = static_cast<const uint8_t*>(src);
-            return parts[p]->visit(at, n, [&](uint8_t* d, size_t m, size_t off) { std::memcpy(d, c + (off - at), m); return true; });
-        };
-        return true;
-    };
-    SavedConversation meta;
-    if (!park_file_read(path, file, meta, t, limits, state, error)) return false;
-    meta.kv = std::move(out.kv);
-    image = std::move(meta);
     return true;
 }
 

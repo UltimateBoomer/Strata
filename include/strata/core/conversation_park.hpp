@@ -56,7 +56,6 @@ struct ParkFileState {
 struct ParkWriteStats {
     uint64_t written = 0;        // bytes written to the file (K/V, records, directory, superblock)
     uint64_t kept_kv = 0;        // K/V bytes left as they were
-    uint64_t kept_records = 0;   // checkpoint record bytes left as they were
     size_t kept_checkpoints = 0;
 };
 inline constexpr uint64_t kParkHashBlock = 1ull << 20;
@@ -74,15 +73,12 @@ bool park_file_write(const std::string& path, uint64_t file, const ParkFileState
                      uint64_t min_free_bytes, const std::function<void()>& beat, ParkFileState& state,
                      ParkWriteStats& stats, std::string& error);
 
-// Reads the file back as session_file_read_streamed does: `meta` gets the running state and the checkpoints (each
-// marked with this file and its record, so an update keeps them), the K/V goes to `target`, layer by layer, each
-// block checked against its hash before it is handed on.  `limits` bound every count before it is allocated and
-// `limits.admit` is asked for the records' RAM.  `status->target_written` as for a session file.
+// Reads the file back with its K/V streamed: `meta` gets the running state and the checkpoints (each marked with this
+// file and its record, so an update keeps them), the K/V goes to `target`, layer by layer, each block checked against
+// its hash before it is handed on.  `limits` bound every count before it is allocated and `limits.admit` is asked for
+// the records' RAM.  `status->target_written`: K/V reached the target (then a failure leaves it partial).
 bool park_file_read(const std::string& path, uint64_t file, SavedConversation& meta, const SessionKvTarget& target,
                     const SessionReadLimits& limits, ParkFileState& state, std::string& error,
                     SessionStatus* status = nullptr);
-// The same into a whole host image (its K/V in `image.kv`).
-bool park_file_read_image(const std::string& path, uint64_t file, SavedConversation& image,
-                          const SessionReadLimits& limits, ParkFileState& state, std::string& error);
 
 } // namespace strata::core

@@ -154,8 +154,8 @@ ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation
                                                           SessionState& session, const ModelGeometry& g,
                                                           const QsaState* draft, std::string& error);
 
-// Disk restore without a host image of the K/V (session_file_read_streamed): `target` refuses, before any K/V byte is
-// written, what conversation_snapshot_validate would refuse - at `begin` the geometry, layer range, live state,
+// Disk restore without a host image of the K/V (park_file_read): `target` refuses, before any K/V byte is written,
+// what conversation_snapshot_validate would refuse - at `begin` the geometry, layer range, live state,
 // checkpoints and layer count, at each layer its geometry and sizes - and writes each layer into this session.  After
 // the read succeeded, conversation_snapshot_stream_finish settles the K/V and restores the running state from `meta`
 // (no K/V: it went to the target).  A read that failed with target_written leaves partial state: the caller MUST NOT
@@ -175,15 +175,15 @@ bool conversation_snapshot_stream_abandon(SessionState& session, const ModelGeom
 // rest of the file is still read, for its hash.  After the read succeeded, conversation_snapshot_stream_finish_prefix
 // settles the K/V up to `upto`; as after restore_prefix the running state is NOT restored - the caller mounts the
 // borrowed checkpoint from `meta`'s checkpoints.  A failure with target_written leaves partial state, as above.
-// conversation_kv_keep_bytes for every layer conversation_snapshot_sources writes, in its order (the draft last,
-// one token fewer: its final cell may not have been computed when the output cap was reached, as for a capture).
-bool conversation_snapshot_keep(std::vector<std::array<uint64_t, 5>>& keep, const SessionState& session,
-                                const ModelGeometry& g, const QsaState& draft, int64_t upto, int64_t unchanged,
-                                std::string& error);
 bool conversation_snapshot_target_prefix(SessionKvTarget& target, int64_t upto, SessionState& session,
                                          const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_stream_finish_prefix(const SavedConversation& meta, int64_t upto,
                                                                SessionState& session, const ModelGeometry& g,
                                                                const QsaState* draft, std::string& error);
+// conversation_kv_keep_bytes for every layer conversation_snapshot_sources writes, in its order (the draft last,
+// one token fewer: its final cell may not have been computed when the output cap was reached, as for a capture).
+bool conversation_snapshot_keep(std::vector<std::array<uint64_t, 5>>& keep, const SessionState& session,
+                                const ModelGeometry& g, const QsaState& draft, int64_t upto, int64_t unchanged,
+                                std::string& error);
 
 } // namespace strata::core

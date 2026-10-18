@@ -602,14 +602,6 @@ public:
         }
         return true;
     }
-    // the buffered bytes in place, at most `n` (a block is read when none are left): nullptr on a read error
-    const uint8_t* span(size_t n, size_t& got) {
-        if (at_ == have_ && !fill()) return nullptr;
-        got = std::min(n, have_ - at_);
-        const uint8_t* p = buf_.get() + at_;
-        at_ += got;
-        return p;
-    }
     std::optional<Ticker> progress;
     uint64_t expected = 0;
 private:
@@ -726,9 +718,6 @@ struct In {
     const SessionReadLimits& limits;
     SessionError kind = SessionError::invalid;
     size_t kv_layer = 0;
-    // streamed read: asked for the checkpoints' RAM once their count is known, before they are allocated
-    std::function<bool(uint64_t checkpoints)> admit_checkpoints;
-    SessionStatus* status = nullptr;   // streamed read: target_written set at the first K/V byte handed on
     bool fail(const std::string& m) { if (error.empty()) error = "session file: " + m; return false; }
     bool raw(void* p, size_t c) {
         if (c > left) return fail("payload ends early");
@@ -762,28 +751,6 @@ struct In {
         b.resize((size_t) n);
         return b.visit(0, b.size(), [&](uint8_t* p, size_t c, size_t) { return raw(p, c); });
     }
-    // a K/V part handed from the read buffer to its sink: no host copy of it
-    bool stream(const SessionKvSink& sink, size_t part, uint64_t expect) {
-        uint64_t n = 0;
-        const uint64_t limit = kv_layer < limits.max_kv_bytes.size() ? limits.max_kv_bytes[kv_layer][part] : UINT64_MAX;
-        if (!count(n, 1, limit)) return false;
-        if (n != expect) return fail("K/V part size differs from its layer header's");
-        if (n && !sink.write) return fail("no K/V target");
-        for (uint64_t at = 0; at < n;) {
-            size_t got = 0;
-            const uint8_t* p = f->span((size_t) (n - at), got);
-            if (!p) { kind = f->kind(); return fail("read error: " + f->error()); }
-            hash.update(p, got);
-            left -= got;
-            if (status) status->target_written = true;
-            if (!sink.write(part, (size_t) at, p, got)) {
-                kind = SessionError::io;
-                return fail("K/V target write" + (sink.error ? ": " + sink.error() : std::string()));
-            }
-            at += got;
-        }
-        return true;
-    }
 };
 
 bool get_checkpoint(In& in, ConversationCheckpoint& c) {
@@ -797,8 +764,7 @@ bool get_checkpoint(In& in, ConversationCheckpoint& c) {
            in.vec(c.block_pos, m[4]) && in.u64(c.used);
 }
 
-// everything before the K/V, and the K/V layer count in `layers`
-bool get_head(In& in, SavedConversation& s, uint64_t& layers) {
+bool get_payload(In& in, SavedConversation& s) {
     for (auto& g : s.geometry) if (!in.i64(g)) return false;
     // checked before any state array is read: a file of another geometry allocates nothing
     if (in.limits.geometry && *in.limits.geometry != s.geometry)
@@ -814,50 +780,19 @@ bool get_head(In& in, SavedConversation& s, uint64_t& layers) {
     uint64_t n = 0;
     // a checkpoint is at least 8 counts + used = 72 bytes; a K/V layer at least 7 + 5 = 96
     if (!in.count(n, 72, in.limits.max_checkpoints)) return false;
-    if (in.admit_checkpoints && !in.admit_checkpoints(n)) { in.kind = SessionError::memory; return false; }
     s.checkpoints.resize((size_t) n);
     for (auto& c : s.checkpoints) if (!get_checkpoint(in, c)) return false;
-    return in.count(layers, 96, in.limits.max_kv_layers);
-}
-
-bool get_kv_header(In& in, ConversationKv& k) {
-    int64_t format = 0;
-    if (!in.i64(format) || !in.i64(k.cells) || !in.i64(k.heads) || !in.i64(k.head_dim) ||
-        !in.i64(k.page_size) || !in.i64(k.pooled_rows) || !in.i64(k.idx_dim)) return false;
-    if (format < INT32_MIN || format > INT32_MAX) return in.fail("invalid K/V format");
-    k.format = (int) format;
-    return true;
-}
-
-bool get_payload(In& in, SavedConversation& s) {
-    uint64_t n = 0;
-    if (!get_head(in, s, n)) return false;
+    if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
     s.kv.resize((size_t) n);
     for (auto& k : s.kv) {
         in.kv_layer = (size_t) (&k - s.kv.data());
-        if (!get_kv_header(in, k)) return false;
+        int64_t format = 0;
+        if (!in.i64(format) || !in.i64(k.cells) || !in.i64(k.heads) || !in.i64(k.head_dim) ||
+            !in.i64(k.page_size) || !in.i64(k.pooled_rows) || !in.i64(k.idx_dim)) return false;
+        if (format < INT32_MIN || format > INT32_MAX) return in.fail("invalid K/V format");
+        k.format = (int) format;
         if (!in.buffer(k.k, 0) || !in.buffer(k.v, 1) || !in.buffer(k.k_scale, 2) || !in.buffer(k.v_scale, 3) ||
             !in.buffer(k.pooled, 4)) return false;
-    }
-    return true;
-}
-
-// The K/V goes to `target`.  A part's byte count sits just before its bytes, so the five are not known together when a
-// layer starts: `target.layer` says from the header's geometry what each part must hold, and every count must match.
-bool get_payload_streamed(In& in, SavedConversation& s, const SessionKvTarget& target) {
-    uint64_t n = 0;
-    if (!get_head(in, s, n)) return false;
-    std::string why;
-    if (target.begin && !target.begin(s, n, why)) return in.fail(why);
-    for (uint64_t i = 0; i < n; ++i) {
-        in.kv_layer = (size_t) i;
-        ConversationKv header;
-        if (!get_kv_header(in, header)) return false;
-        std::array<uint64_t, 5> sizes{};
-        SessionKvSink sink;
-        if (!target.layer || !target.layer((size_t) i, header, sizes, sink, why)) return in.fail(why);
-        for (size_t part = 0; part < 5; ++part)
-            if (!in.stream(sink, part, sizes[part])) return false;
     }
     return true;
 }
@@ -1062,13 +997,6 @@ bool session_model_fingerprint(const std::vector<SessionModelFile>& files, uint6
 namespace {
 uint64_t sat_add(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
 uint64_t sat_mul(uint64_t a, uint64_t b) { return a && b > UINT64_MAX / a ? UINT64_MAX : a * b; }
-
-// one checkpoint at the limits: ids (8 + 4 per token), images (8 + 16 per image), five state arrays (8 + bytes), used
-uint64_t checkpoint_bound(const SessionReadLimits& l) {
-    uint64_t cp = sat_add(16, sat_mul(l.max_tokens, 4 + 16));
-    for (uint64_t b : l.max_state_bytes) cp = sat_add(cp, sat_add(8, b));
-    return sat_add(cp, 8);
-}
 } // namespace
 
 uint64_t session_read_max_file_bytes(const SessionReadLimits& l) {
@@ -1076,7 +1004,10 @@ uint64_t session_read_max_file_bytes(const SessionReadLimits& l) {
     if (l.max_tokens == open || l.max_checkpoints == open || l.max_kv_layers == open) return l.max_file_bytes;
     for (uint64_t b : l.max_state_bytes) if (b == open) return l.max_file_bytes;
     if (l.max_kv_bytes.size() < l.max_kv_layers) return l.max_file_bytes;
-    const uint64_t cp = checkpoint_bound(l);
+    // one checkpoint: ids (8 + 4 per token), images (8 + 16 per image), five state arrays (8 + bytes), used (8)
+    uint64_t cp = sat_add(16, sat_mul(l.max_tokens, 4 + 16));
+    for (uint64_t b : l.max_state_bytes) cp = sat_add(cp, sat_add(8, b));
+    cp = sat_add(cp, 8);
     uint64_t n = kHeader + kTrailer + 18 * 8 + 3 * 8;             // geometry, layer range, cvec
     n = sat_add(n, cp);                                            // live
     n = sat_add(n, sat_add(8, sat_mul(l.max_checkpoints, cp)));    // checkpoints
@@ -1092,14 +1023,6 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes) {
     const uint64_t segments = file_bytes / kBlock + 1;
     // the parsed image (about the payload), the read buffer, a page per buffer segment, the small vectors
     return sat_add(sat_add(sat_add(file_bytes, kBlock), sat_mul(segments, 4096)), uint64_t(1) << 20);
-}
-
-uint64_t session_read_streamed_peak_bytes(uint64_t file_bytes, const SessionReadLimits& limits) {
-    return sat_add(std::min(file_bytes, checkpoint_bound(limits)), kBlock + (uint64_t(1) << 20));
-}
-
-uint64_t session_read_checkpoints_bytes(uint64_t file_bytes, const SessionReadLimits& limits, uint64_t checkpoints) {
-    return std::min(file_bytes, sat_mul(checkpoints, checkpoint_bound(limits)));
 }
 
 namespace {
@@ -1264,10 +1187,8 @@ bool session_file_write(const std::string& path, const SavedConversation& image,
 }
 
 namespace {
-// `target`: the K/V goes there as it is read (session_file_read_streamed) instead of into `image`
 bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
-               size_t& bytes, std::string& error, const SessionReadLimits& limits, SessionStatus& st,
-               const SessionKvTarget* target = nullptr) {
+               size_t& bytes, std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
     error.clear();
     st = {};
     st.error = SessionError::invalid;   // every refusal below, unless the step says otherwise
@@ -1310,7 +1231,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     }
     if (limits.admit) {
         std::string why;
-        if (!limits.admit(target ? session_read_streamed_peak_bytes(size, limits) : session_read_peak_bytes(size), why)) {
+        if (!limits.admit(session_read_peak_bytes(size), why)) {
             st.error = SessionError::memory;
             error = "session file: " + why;
             return false;
@@ -1318,19 +1239,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     }
     SavedConversation parsed;
     In in{&f, SessionHasher(0), payload, error, limits};
-    if (target) {
-        in.status = &st;
-        if (limits.admit) in.admit_checkpoints = [&](uint64_t n) {
-            std::string why;
-            if (limits.admit(session_read_checkpoints_bytes(size, limits, n), why)) return true;
-            error = "session file: " + why;
-            return false;
-        };
-    }
-    if (!(target ? get_payload_streamed(in, parsed, *target) : get_payload(in, parsed))) {
-        st.error = in.kind;
-        return false;
-    }
+    if (!get_payload(in, parsed)) { st.error = in.kind; return false; }
     if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
     uint8_t t[kTrailer];
     if (!f.read(t, kTrailer)) { st.error = f.kind(); error = "session file: trailer read error: " + f.error(); return false; }
@@ -1351,22 +1260,6 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
     bool ok = false;
     try {
         ok = read_impl(path, id, image, bytes, error, limits, st);
-    } catch (const std::bad_alloc&) {
-        error = "session file: out of memory while reading " + path;
-        st.error = SessionError::memory;
-        ok = false;
-    }
-    if (status) *status = st;
-    return ok;
-}
-
-bool session_file_read_streamed(const std::string& path, const SessionFileIdentity& id, SavedConversation& meta,
-                                const SessionKvTarget& target, size_t& bytes, std::string& error,
-                                const SessionReadLimits& limits, SessionStatus* status) {
-    SessionStatus st;
-    bool ok = false;
-    try {
-        ok = read_impl(path, id, meta, bytes, error, limits, st, &target);
     } catch (const std::bad_alloc&) {
         error = "session file: out of memory while reading " + path;
         st.error = SessionError::memory;

@@ -124,8 +124,8 @@ struct SessionStatus {
     bool published = false;
     // write (POSIX): this filesystem cannot flush a folder (fsync EINVAL); the save succeeded without that flush
     bool dir_flush_unsupported = false;
-    // streamed read: K/V bytes reached the target before the read ended.  Together with a failure the target holds
-    // part of this file (or bytes the payload hash then refused) and must not be used.
+    // streamed read (park_file_read): K/V bytes reached the target before the read ended.  Together with a failure
+    // the target holds part of the file and must not be used.
     bool target_written = false;
 };
 
@@ -251,26 +251,15 @@ struct SessionKvSink {
     std::function<bool(size_t part, size_t offset, const void* src, size_t n)> write;
     std::function<std::string()> error;
 };
-// Where a streamed read puts the K/V.  `begin` is asked once the running state, the checkpoints and the K/V layer
-// count are read, before any K/V byte is; `layer` at each layer's header (`header` holds its fields and no bytes),
-// before that layer's bytes: it sets `sizes` to what each part must hold - a part of another size refuses the file -
-// and gives the sink.  Either refuses the file by returning false.
+// Where a streamed read (park_file_read, conversation_park.hpp) puts the K/V.  `begin` is asked once the running
+// state, the checkpoints and the K/V layer count are read, before any K/V byte is; `layer` at each layer's header
+// (`header` holds its fields and no bytes), before that layer's bytes: it sets `sizes` to what each part must hold - a
+// part of another size refuses the file - and gives the sink.  Either refuses the file by returning false.
 struct SessionKvTarget {
     std::function<bool(const SavedConversation& meta, uint64_t layers, std::string& why)> begin;
     std::function<bool(size_t layer, const ConversationKv& header, std::array<uint64_t, 5>& sizes,
                        SessionKvSink& sink, std::string& why)> layer;
 };
-// What a streamed read's RAM preflight is asked for before the running state: the live state at the limits' sizes
-// (at most the file), the 16 MiB read buffer and 1 MiB for the small vectors.  When the checkpoint count is read it
-// is asked again, for that many checkpoints at the limits' sizes (at most the file) - no K/V ever.
-uint64_t session_read_streamed_peak_bytes(uint64_t file_bytes, const SessionReadLimits& limits);
-uint64_t session_read_checkpoints_bytes(uint64_t file_bytes, const SessionReadLimits& limits, uint64_t checkpoints);
-// session_file_read without a host image of the K/V: `meta` gets everything else (meta.kv stays empty) and the K/V
-// goes to `target` as it is read, block by block.  The same validation; the payload hash is known only at the end,
-// so a failure can come after K/V was written: `status->target_written` says so.  On failure `meta` is unchanged.
-bool session_file_read_streamed(const std::string& path, const SessionFileIdentity& id, SavedConversation& meta,
-                                const SessionKvTarget& target, size_t& bytes, std::string& error,
-                                const SessionReadLimits& limits = {}, SessionStatus* status = nullptr);
 
 // The folder the free-space preflight asks about for `path`, by the rules of Windows or of POSIX (exposed so both can
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC

@@ -177,14 +177,20 @@ void full_session(int fmt, int mode, int experts) {
               "streamed file equals captured file");
         check(slurp(p1)==slurp(p2),"streamed file is byte-identical to the captured file");
         {
-            // streamed restore: the file's K/V goes straight into the session's pools, no host image
+            // streamed restore: a park file's K/V goes straight into the session's pools, no host image
+            const std::string pp=(dir/"session.park").string();
+            SessionReadLimits caps;
+            ParkFileState pst;
+            ParkWriteStats pws;
+            check(conversation_session_read_limits(caps,ss,g,draft.state,(uint64_t)ss.max_cells,8,err) &&
+                  park_file_write(pp,1,nullptr,meta,view.checkpoints,sources,caps.max_kv_bytes,{},0,{},pst,pws,err),
+                  "park file of the session");
             fill(91);
             SessionKvTarget target;
             check(conversation_snapshot_target(target,ss,g,&draft.state,err),"streamed restore target");
             SavedConversation m;
             SessionStatus rs;
-            size_t nr=0;
-            check(session_file_read_streamed(p1,id,m,target,nr,err,{},&rs) && rs.target_written && m.kv.empty(),
+            check(park_file_read(pp,1,m,target,{},pst,err,&rs) && rs.target_written && m.kv.empty(),
                   "streamed restore read");
             check(conversation_snapshot_stream_finish(m,ss,g,&draft.state,err)==ConversationRestore::restored,
                   "streamed restore finish");
@@ -200,12 +206,12 @@ void full_session(int fmt, int mode, int experts) {
             SessionState other=ss; other.layer_hi=ss.layer_hi+1;
             SessionKvTarget t2;
             check(conversation_snapshot_target(t2,other,g,&draft.state,err),"target for a mismatched carve");
-            check(!session_file_read_streamed(p1,id,m,t2,nr,err,{},&rs) && !rs.target_written,
+            check(!park_file_read(pp,1,m,t2,{},pst,err,&rs) && !rs.target_written,
                   "mismatched layer range refused before any K/V write");
             // no draft target: the draft layer is one too many
             SessionKvTarget t3;
             check(conversation_snapshot_target(t3,ss,g,nullptr,err),"target without the draft");
-            check(!session_file_read_streamed(p1,id,m,t3,nr,err,{},&rs) && !rs.target_written,
+            check(!park_file_read(pp,1,m,t3,{},pst,err,&rs) && !rs.target_written,
                   "layer count mismatch refused before any K/V write");
         }
         std::error_code ec;
@@ -263,22 +269,30 @@ void full_session(int fmt, int mode, int experts) {
             const fs::path dir=fs::temp_directory_path()/("strata-borrow-test-"+std::to_string(experts)+"-"+
                 std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
             fs::create_directories(dir);
-            const std::string p=(dir/"donor.conv").string();
-            const SessionFileIdentity id{3,4};
-            size_t n=0;
-            check(session_file_write(p,a,id,n,err),"write the donor's file");
+            const std::string p=(dir/"donor.park").string();
+            check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,
+                  "restore A to write its park file");
+            SessionReadLimits caps;
+            SavedConversation pm;
+            std::vector<SessionKvSource> src;
+            ParkFileState pst;
+            ParkWriteStats pws;
+            check(conversation_session_read_limits(caps,ss,g,draft.state,(uint64_t)ss.max_cells,8,err) &&
+                  conversation_snapshot_sources(pm,src,view,ss,g,draft.state,err) &&
+                  park_file_write(p,7,nullptr,pm,view.checkpoints,src,caps.max_kv_bytes,{},0,{},pst,pws,err),
+                  "write the donor's park file");
             fill(203);   // another conversation in the session
             SessionKvTarget too_far;
             SavedConversation m;
             SessionStatus rs;
             check(conversation_snapshot_target_prefix(too_far,(int64_t)a.live.ids.size()+1,ss,g,&draft.state,err) &&
-                  !session_file_read_streamed(p,id,m,too_far,n,err,{},&rs) && !rs.target_written,
+                  !park_file_read(p,7,m,too_far,{},pst,err,&rs) && !rs.target_written,
                   "a prefix past the file's live state is refused before any K/V write");
             SessionKvTarget none;
             check(!conversation_snapshot_target_prefix(none,0,ss,g,&draft.state,err),"an empty prefix is refused");
             SessionKvTarget target;
             check(conversation_snapshot_target_prefix(target,at,ss,g,&draft.state,err),"prefix target");
-            check(session_file_read_streamed(p,id,m,target,n,err,{},&rs) && rs.target_written && m.kv.empty(),
+            check(park_file_read(p,7,m,target,{},pst,err,&rs) && rs.target_written && m.kv.empty(),
                   "streamed prefix read");
             check(conversation_snapshot_stream_finish_prefix(m,(int64_t)a.live.ids.size()+1,ss,g,&draft.state,err)==
                       ConversationRestore::invalid,"finish refuses a prefix past the live state");

@@ -39,6 +39,30 @@ ConversationCheckpoint state(std::vector<int32_t> ids, size_t gdn, uint8_t salt)
     c.dead.assign(16, salt + 3); c.block_pos.assign(8, salt + 4);
     return c;
 }
+// a park file read back into a whole host image (its K/V in `image.kv`)
+bool park_file_read_image(const std::string& path, uint64_t file, SavedConversation& image,
+                          const SessionReadLimits& limits, ParkFileState& state, std::string& error) {
+    SavedConversation out;
+    SessionKvTarget t;
+    t.begin = [&out](const SavedConversation&, uint64_t layers, std::string&) { out.kv.resize((size_t) layers); return true; };
+    t.layer = [&out](size_t j, const ConversationKv& h, std::array<uint64_t, 5>& sizes, SessionKvSink& sink, std::string&) {
+        ConversationKv& k = out.kv[j];
+        k.format = h.format; k.cells = h.cells; k.heads = h.heads; k.head_dim = h.head_dim;
+        k.page_size = h.page_size; k.pooled_rows = h.pooled_rows; k.idx_dim = h.idx_dim;
+        const std::array<ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+        for (size_t p = 0; p < 5; ++p) parts[p]->resize((size_t) sizes[p]);
+        sink.write = [parts](size_t p, size_t at, const void* src, size_t n) {
+            const auto* c = static_cast<const uint8_t*>(src);
+            return parts[p]->visit(at, n, [&](uint8_t* d, size_t m, size_t off) { std::memcpy(d, c + (off - at), m); return true; });
+        };
+        return true;
+    };
+    SavedConversation meta;
+    if (!park_file_read(path, file, meta, t, limits, state, error)) return false;
+    meta.kv = std::move(out.kv);
+    image = std::move(meta);
+    return true;
+}
 // a conversation: running state, checkpoints and K/V layers of uneven sizes (some spanning several hash blocks)
 SavedConversation image(const std::vector<std::array<size_t, 5>>& sizes) {
     SavedConversation s;
@@ -195,7 +219,7 @@ int main(int argc, char** argv) {
               "update the file in place");
         uint64_t keep_total = 0, new_total = 0;
         for (size_t j = 0; j < 3; ++j) for (size_t q = 0; q < 5; ++q) { keep_total += keep[j][q]; new_total += grown[j][q]; }
-        check(wu.kept_kv == keep_total && wu.kept_checkpoints == 1 && wu.kept_records == rs.checkpoints[1].length,
+        check(wu.kept_kv == keep_total && wu.kept_checkpoints == 1,
               "the unchanged prefix and the kept checkpoint are not written");
         check(wu.written == new_total - keep_total + su.checkpoints[1].length + su.live.length + su.directory.length + 4096,
               "an update writes the K/V past the prefix, the new records, the directory and the superblock");
