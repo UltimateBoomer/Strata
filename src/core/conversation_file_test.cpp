@@ -360,6 +360,179 @@ int main() {
               "image K/V plus sources refused");
     }
 
+    // checkpoints written from where they are (no copy in `meta`): the same bytes
+    {
+        SavedConversation meta = original;
+        meta.kv.clear();
+        meta.checkpoints.clear();
+        std::vector<SessionKvSource> sources;
+        for (const auto& k : original.kv) {
+            SessionKvSource s;
+            s.format = k.format; s.cells = k.cells; s.heads = k.heads; s.head_dim = k.head_dim;
+            s.page_size = k.page_size; s.pooled_rows = k.pooled_rows; s.idx_dim = k.idx_dim;
+            const std::array<const ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+            for (size_t i = 0; i < 5; ++i) s.sizes[i] = parts[i]->size();
+            s.read = [parts](size_t part, size_t offset, void* dst, size_t n) {
+                return parts[part]->read(dst, offset, n);
+            };
+            sources.push_back(std::move(s));
+        }
+        const fs::path p = dir / "apart.bin";
+        check(session_file_write(p.string(), meta, original.checkpoints, sources, id, written, error),
+              "write with the checkpoints apart succeeds");
+        check(slurp(p) == image, "checkpoints apart give the same file");
+        SavedConversation both = meta;
+        both.checkpoints = original.checkpoints;
+        check(!session_file_write((dir / "both-cp.bin").string(), both, original.checkpoints, sources, id, written,
+                                  error), "checkpoints in the image and apart refused");
+    }
+    // streamed read: the K/V goes to a target block by block, `meta` gets the rest
+    {
+        struct Target {
+            const SavedConversation* like;   // what the "session" holds: the part sizes it expects
+            std::vector<std::array<ConversationBuffer, 5>> got;
+            uint64_t layers_seen = 0;
+            int refuse_begin = 0, refuse_layer = -1, fail_write_layer = -1;
+            bool wrong_size = false;
+            SessionKvTarget make() {
+                SessionKvTarget t;
+                t.begin = [this](const SavedConversation& m, uint64_t layers, std::string& why) {
+                    layers_seen = layers;
+                    if (!m.kv.empty()) { why = "meta holds K/V"; return false; }
+                    if (refuse_begin) { why = "begin refused"; return false; }
+                    got.assign((size_t) layers, {});
+                    return true;
+                };
+                t.layer = [this](size_t j, const ConversationKv& h, std::array<uint64_t, 5>& sizes,
+                                 SessionKvSink& sink, std::string& why) {
+                    if ((int) j == refuse_layer) { why = "layer refused"; return false; }
+                    const auto& k = like->kv[j];
+                    if (h.format != k.format || h.cells != k.cells || h.pooled_rows != k.pooled_rows) {
+                        why = "header differs"; return false;
+                    }
+                    const std::array<const ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+                    for (size_t i = 0; i < 5; ++i) { sizes[i] = parts[i]->size(); got[j][i].resize(parts[i]->size()); }
+                    if (wrong_size) sizes[0] += 1;
+                    auto* dst = &got[j];
+                    const bool fail = (int) j == fail_write_layer;
+                    sink.write = [dst, fail](size_t part, size_t offset, const void* src, size_t n) {
+                        if (fail) return false;
+                        const auto* from = static_cast<const uint8_t*>(src);
+                        return (*dst)[part].visit(offset, n, [&](uint8_t* d, size_t c, size_t at) {
+                            std::memcpy(d, from + (at - offset), c);
+                            return true;
+                        });
+                    };
+                    sink.error = [] { return std::string("device said no"); };
+                    return true;
+                };
+                return t;
+            }
+            bool same_kv() const {
+                if (got.size() != like->kv.size()) return false;
+                for (size_t j = 0; j < got.size(); ++j) {
+                    const auto& k = like->kv[j];
+                    if (!(got[j][0] == k.k) || !(got[j][1] == k.v) || !(got[j][2] == k.k_scale) ||
+                        !(got[j][3] == k.v_scale) || !(got[j][4] == k.pooled)) return false;
+                }
+                return true;
+            }
+        };
+        auto streamed = [&](const fs::path& p, Target& t, SavedConversation& meta, SessionStatus& st,
+                            const SessionReadLimits& l = {}) {
+            size_t n = 0;
+            error.clear();
+            const SessionKvTarget target = t.make();
+            return session_file_read_streamed(p.string(), id, meta, target, n, error, l, &st) && n == image.size();
+        };
+        SavedConversation meta;
+        SessionStatus st;
+        {
+            Target t{&original};
+            check(streamed(good, t, meta, st) && st.error == SessionError::none, "streamed read succeeds");
+            check(meta.kv.empty() && t.layers_seen == original.kv.size(), "meta has no K/V; begin saw every layer");
+            SavedConversation whole = meta;
+            for (size_t j = 0; j < t.got.size(); ++j) {
+                ConversationKv k;
+                const auto& o = original.kv[j];
+                k.format = o.format; k.cells = o.cells; k.heads = o.heads; k.head_dim = o.head_dim;
+                k.page_size = o.page_size; k.pooled_rows = o.pooled_rows; k.idx_dim = o.idx_dim;
+                k.k = t.got[j][0]; k.v = t.got[j][1]; k.k_scale = t.got[j][2]; k.v_scale = t.got[j][3];
+                k.pooled = t.got[j][4];
+                whole.kv.push_back(std::move(k));
+            }
+            check(same(whole, original), "streamed read gives the same image as the buffered read");
+        }
+        {
+            SavedConversation keep = sample();
+            keep.kv.clear();
+            Target t{&original};
+            t.refuse_begin = 1;
+            check(!streamed(good, t, keep, st) && !st.target_written && error.find("begin refused") != std::string::npos,
+                  "begin refuses before any K/V byte");
+            check(keep.live.ids == original.live.ids && keep.kv.empty(), "a refused read leaves meta unchanged");
+        }
+        {
+            Target t{&original};
+            t.refuse_layer = 0;
+            check(!streamed(good, t, meta, st) && !st.target_written, "first layer refused: nothing written");
+            t = Target{&original};
+            t.refuse_layer = 1;
+            check(!streamed(good, t, meta, st) && st.target_written, "second layer refused: the first was written");
+            t = Target{&original};
+            t.wrong_size = true;
+            check(!streamed(good, t, meta, st) && !st.target_written && error.find("size") != std::string::npos,
+                  "a part of another size refused before its bytes");
+            t = Target{&original};
+            t.fail_write_layer = 2;
+            check(!streamed(good, t, meta, st) && st.target_written && st.error == SessionError::io &&
+                  error.find("device said no") != std::string::npos, "a failing sink fails the read");
+        }
+        {
+            // a flipped K/V byte: only the payload hash at the end catches it, after the K/V was written
+            std::vector<char> bad = image;
+            bad[bad.size() - 16 - 100] ^= 0x5a;
+            const fs::path p = dir / "flipped.bin";
+            spit(p, bad);
+            SavedConversation keep;
+            Target t{&original};
+            check(!streamed(p, t, keep, st) && st.target_written && error.find("checksum") != std::string::npos,
+                  "corrupt K/V caught by the payload hash, reported as written");
+            check(keep.live.ids.empty(), "meta unchanged after a hash failure");
+            spit(p, std::vector<char>(image.begin(), image.begin() + (std::ptrdiff_t) (image.size() / 2)));
+            t = Target{&original};
+            check(!streamed(p, t, keep, st), "truncated file refused by the streamed read");
+        }
+        {
+            // admission: the state first, then the checkpoints once counted - never the K/V
+            std::vector<uint64_t> asked;
+            SessionReadLimits l;
+            l.admit = [&](uint64_t n, std::string&) { asked.push_back(n); return true; };
+            Target t{&original};
+            check(streamed(good, t, meta, st, l) && asked.size() == 2, "streamed read asks admission twice");
+            check(asked[0] == session_read_streamed_peak_bytes(image.size(), l) &&
+                  asked[1] == session_read_checkpoints_bytes(image.size(), l, original.checkpoints.size()),
+                  "the asks are the documented figures");
+            l.max_tokens = 1000; l.max_checkpoints = 2;
+            l.max_state_bytes = {4099, 77, 301, 64, 8};
+            asked.clear();
+            t = Target{&original};
+            check(streamed(good, t, meta, st, l) && asked.size() == 2 && asked[0] + asked[1] < (2u << 20) + (17u << 20),
+                  "bounded limits: the asks are far below the file (its K/V is not counted)");
+            check(asked[0] < (17u << 20) + (1u << 20) && asked[1] < (1u << 20),
+                  "the asks are the read buffer and the state, no K/V");
+            l.admit = [&](uint64_t, std::string& why) {
+                if (asked.size() == 3) { why = "no room for checkpoints"; return false; }
+                asked.push_back(0);
+                return true;
+            };
+            asked.assign(2, 0);
+            t = Target{&original};
+            check(!streamed(good, t, meta, st, l) && st.error == SessionError::memory && !st.target_written &&
+                  error.find("no room for checkpoints") != std::string::npos, "checkpoint admission can refuse");
+        }
+    }
+
     // the configuration fingerprint: every field counts, doubles by their exact bits
     {
         SessionConfig c;

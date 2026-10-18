@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <memory>
 
 namespace strata::core {
 namespace {
@@ -283,7 +284,7 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
     captured.geometry = geometry_key(g);
     captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
     captured.live.ids = view.ids; captured.live.imgs = view.images;
-    captured.cvec = view.cvec; captured.checkpoints = conversation_detail::copy_checkpoints_beating(view.checkpoints);
+    captured.cvec = view.cvec;   // the checkpoints stay in the view: the file is written from them where they are
     if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
     const int64_t upto = (int64_t) view.ids.size();
     const size_t layers = owned_qsa(ss);
@@ -356,6 +357,72 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
     if ((draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, error)) ||
         !conversation_checkpoint_restore(image.live, ss, g, error)) return ConversationRestore::transfer_failed;
     return ConversationRestore::restored;
+}
+
+namespace {
+// conversation_snapshot_validate without the K/V bytes: what a streamed restore can check before the first one
+bool meta_validate(const SavedConversation& meta, uint64_t layers, const SessionState& ss, const ModelGeometry& g,
+                   const QsaState* draft, std::string& error) {
+    if (!meta.stage_images.empty()) return fail(error, "a layer split's image restored as a single session");
+    if (!meta.live.stage_parts.empty())
+        return fail(error, "a running checkpoint's stage parts belong in the stage images, not in live.stage_parts");
+    if (meta.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
+    if (meta.layer_lo != ss.layer_lo || meta.layer_hi != ss.layer_hi)
+        return fail(error, "snapshot from another session layer range");
+    const ConversationView view{meta.live.ids, meta.live.imgs, meta.checkpoints, meta.cvec};
+    if (!view_validate(view, ss, g, error) || !conversation_checkpoint_validate(meta.live, ss, g, error)) return false;
+    if (layers != owned_qsa(ss) + (draft ? 1 : 0)) return fail(error, "invalid K/V layer count");
+    return true;
+}
+} // namespace
+
+bool conversation_snapshot_target(SessionKvTarget& target, SessionState& ss, const ModelGeometry& g,
+                                  const QsaState* draft, std::string& error) {
+    if (owned_qsa(ss) && !ss.qsa_states) return fail(error, "invalid session running-state targets");
+    auto upto = std::make_shared<int64_t>(-1);
+    SessionKvTarget t;
+    t.begin = [&ss, &g, draft, upto](const SavedConversation& meta, uint64_t layers, std::string& why) {
+        if (!meta_validate(meta, layers, ss, g, draft, why)) return false;
+        // the device is idle before the first K/V byte lands in the session's pools
+        if (!sync(why)) return false;
+        *upto = (int64_t) meta.live.ids.size();
+        return true;
+    };
+    t.layer = [&ss, &g, draft, upto](size_t j, const ConversationKv& header, std::array<uint64_t, 5>& sizes,
+                                     SessionKvSink& sink, std::string& why) {
+        if (*upto < 0) return fail(why, "K/V layer before the image was checked");
+        const size_t layers = owned_qsa(ss);
+        if (j < layers) return conversation_kv_sink(sink, sizes, header, owned(ss, j), g, *upto, true, why);
+        if (draft && j == layers) return conversation_kv_sink(sink, sizes, header, *draft, g, *upto, false, why);
+        return fail(why, "invalid K/V layer count");
+    };
+    target = std::move(t);
+    return true;
+}
+
+ConversationRestore conversation_snapshot_stream_finish(const SavedConversation& meta, SessionState& ss,
+                                                        const ModelGeometry& g, const QsaState* draft,
+                                                        std::string& error) {
+    if (!meta.kv.empty()) {
+        fail(error, "a streamed image holds no K/V");
+        return ConversationRestore::invalid;
+    }
+    if (!meta_validate(meta, owned_qsa(ss) + (draft ? 1 : 0), ss, g, draft, error)) return ConversationRestore::invalid;
+    if (!sync(error)) return ConversationRestore::transfer_failed;
+    const int64_t upto = (int64_t) meta.live.ids.size();
+    for (size_t j = 0; j < owned_qsa(ss); ++j)
+        if (!conversation_kv_settle(owned(ss, j), g, upto, error)) return ConversationRestore::transfer_failed;
+    if ((draft && !conversation_kv_settle(*draft, g, upto, error)) ||
+        !conversation_checkpoint_restore(meta.live, ss, g, error)) return ConversationRestore::transfer_failed;
+    return ConversationRestore::restored;
+}
+
+bool conversation_snapshot_stream_abandon(SessionState& ss, const ModelGeometry& g, const QsaState* draft,
+                                          std::string& error) {
+    if (!sync(error)) return false;
+    for (size_t j = 0; j < owned_qsa(ss); ++j)
+        if (!conversation_kv_settle(owned(ss, j), g, 0, error)) return false;
+    return !draft || conversation_kv_settle(*draft, g, 0, error);
 }
 
 // the draft layer's K/V included (the stage that owns the draft head, or no layer split)

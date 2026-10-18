@@ -210,6 +210,18 @@ inline SavedConversation conversation_skeleton(SavedConversation&& image) {
     image = {};
     return out;
 }
+/// The same for an image whose checkpoints were written from where they are (meta.checkpoints empty): their
+/// identities are copied from `checkpoints`, which stay as they are.
+inline SavedConversation conversation_skeleton(SavedConversation&& meta, const std::vector<ConversationCheckpoint>& checkpoints) {
+    SavedConversation out = conversation_skeleton(std::move(meta));
+    out.checkpoints.reserve(checkpoints.size());
+    for (const auto& c : checkpoints) {
+        ConversationCheckpoint k;
+        k.ids = c.ids; k.imgs = c.imgs; k.used = c.used; k.pinned = c.pinned;
+        out.checkpoints.push_back(std::move(k));
+    }
+    return out;
+}
 
 /// The parked conversations' file tier: the engine writes a file itself (put_file) and supplies how one is read back
 /// and removed.  `load` fills `out` from file `file` or says why not; `remove` deletes it (a missing file is fine).
@@ -317,15 +329,21 @@ public:
     SavedConversation load(Detached&& d) {
         if (d.file == 0) return std::move(d.image);
         SavedConversation out;
+        if (!load_with(std::move(d), out, disk_.load)) out = {};
+        return out;
+    }
+    /// A detached file entry read back by `read(file, out, why)` instead of disk.load - a read that may put the K/V
+    /// elsewhere (a streamed restore) - and removed, its pins carried over as load() does.  False with last_error().
+    template<class Read> bool load_with(Detached&& d, SavedConversation& out, Read&& read) {
         last_error_.clear();
-        if (!disk_.load(d.file, out, last_error_)) {
-            out = {};
+        const bool ok = read(d.file, out, last_error_);
+        if (!ok) {
             if (last_error_.empty()) last_error_ = "the parked conversation's file cannot be read";
         } else if (out.checkpoints.size() == d.image.checkpoints.size()) {
             for (size_t i = 0; i < out.checkpoints.size(); ++i) out.checkpoints[i].pinned = d.image.checkpoints[i].pinned;
         }
         disk_.remove(d.file);
-        return out;
+        return ok;
     }
     SavedConversation take(size_t index) { return load(detach(index)); }
 

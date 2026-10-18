@@ -25,6 +25,15 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& state
                               int64_t upto, bool include_index, std::string& error);
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                              int64_t upto, bool include_index, std::string& error);
+// Disk restore without a host copy: `header` (format, cells, geometry; no bytes) is checked as conversation_kv_validate
+// checks an image, `sizes` gets what each part must hold, and `sink` writes the parts into the authoritative pools.
+// No CUDA calls until the sink writes.  After every part is written, conversation_kv_settle.
+bool conversation_kv_sink(SessionKvSink& sink, std::array<uint64_t, 5>& sizes, const ConversationKv& header,
+                          const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
+                          std::string& error);
+// After the authoritative pools were written (restore or a sink): the streaming map or the draft ring's resident pages
+// are made to match them.
+bool conversation_kv_settle(const QsaState& state, const ModelGeometry& g, int64_t upto, std::string& error);
 // Diagnostic read-back after a synchronized restore. Uses 64 KiB of stack
 // workspace, compares authoritative bytes and resident draft-ring pages, and
 // fingerprints the authoritative payload only. Never changes model state.
@@ -81,9 +90,10 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 const SessionState& session, const ModelGeometry& g,
                                 const QsaState& draft, std::string& error,
                                 ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr);
-// Disk save without capturing the K/V on the host: `meta` gets everything but the K/V (running state copied,
-// checkpoints as given by the view), `sources` one streamed source per QSA layer then the draft.  Caller has
-// synchronized and must not run the session until the file is written.
+// Disk save without capturing the K/V on the host: `meta` gets the running state (copied) and the token and image
+// lists, but neither the K/V nor the checkpoints - the file is written with the view's checkpoints where they are
+// (session_file_write with them apart) - and `sources` one streamed source per QSA layer then the draft.  Caller has
+// synchronized and must not run the session or change the view's checkpoints until the file is written.
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& session,
                                    const ModelGeometry& g, const QsaState& draft, std::string& error);
@@ -112,5 +122,21 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState* draft, std::string& error);
+
+// Disk restore without a host image of the K/V (session_file_read_streamed): `target` refuses, before any K/V byte is
+// written, what conversation_snapshot_validate would refuse - at `begin` the geometry, layer range, live state,
+// checkpoints and layer count, at each layer its geometry and sizes - and writes each layer into this session.  After
+// the read succeeded, conversation_snapshot_stream_finish settles the K/V and restores the running state from `meta`
+// (no K/V: it went to the target).  A read that failed with target_written leaves partial state: the caller MUST NOT
+// continue inference from it.  `target` refers to `session`, `g` and `draft`; it must not outlive them.
+bool conversation_snapshot_target(SessionKvTarget& target, SessionState& session, const ModelGeometry& g,
+                                  const QsaState* draft, std::string& error);
+ConversationRestore conversation_snapshot_stream_finish(const SavedConversation& meta, SessionState& session,
+                                                        const ModelGeometry& g, const QsaState* draft,
+                                                        std::string& error);
+// After a streamed read that failed with target_written: no VRAM copy (streaming map slot) still claims a page the
+// read rewrote.  The session holds no conversation then; the caller reads its prompt from position 0.
+bool conversation_snapshot_stream_abandon(SessionState& session, const ModelGeometry& g, const QsaState* draft,
+                                          std::string& error);
 
 } // namespace strata::core

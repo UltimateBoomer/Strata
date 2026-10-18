@@ -446,6 +446,37 @@ int main() {
                   "and comes back without a file read");
         }
         check(files.size() == 1 && files.count(4), "the files outlive the cache (a restart finds them)");
+        {   // load_with: the engine's own read (a streamed restore) in place of disk.load; skeleton from a chain apart
+            ConversationCache cache(1000, 2);
+            disk_of(cache);
+            auto a = image({1,2,3});
+            std::vector<ConversationCheckpoint> chain(1);
+            chain[0].ids = {1,2};
+            chain[0].gdn.resize(32, 5);
+            chain[0].pinned = true;
+            chain[0].used = 9;
+            auto meta = a;
+            files[30] = a;
+            files[30].checkpoints = chain;
+            const auto skel = conversation_skeleton(std::move(meta), chain);
+            check(skel.checkpoints.size() == 1 && skel.checkpoints[0].ids == chain[0].ids && skel.checkpoints[0].pinned &&
+                  skel.checkpoints[0].used == 9 && skel.checkpoints[0].gdn.empty() && chain[0].gdn.size() == 32,
+                  "skeleton from a chain apart: identities copied, the chain untouched");
+            check(cache.put_file(SavedConversation(skel), 30, 100), "parked from a chain apart");
+            const size_t before = loads;
+            SavedConversation out;
+            size_t reads = 0;
+            check(cache.load_with(cache.detach(0), out, [&](uint64_t f, SavedConversation& o, std::string&) {
+                      ++reads; o = files.at(f); o.checkpoints[0].pinned = false; o.kv.clear(); return true; }) &&
+                  reads == 1 && loads == before && !files.count(30), "load_with reads through the caller, removes the file");
+            check(out.kv.empty() && out.checkpoints.size() == 1 && out.checkpoints[0].pinned,
+                  "the pin comes back from the skeleton");
+            files[31] = image({4});
+            check(cache.put_file(conversation_skeleton(image({4})), 31, 100), "another parked");
+            check(!cache.load_with(cache.detach(0), out, [](uint64_t, SavedConversation&, std::string& why) {
+                      why = "streamed read refused"; return false; }) &&
+                  cache.last_error() == "streamed read refused" && !files.count(31), "a failed read still removes the file");
+        }
         files.clear();
         {   // slots 0 with the file tier: no slot limit, the byte budget alone prunes the oldest
             ConversationCache cache(1000, SIZE_MAX);

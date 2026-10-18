@@ -180,24 +180,34 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     return true;
 }
 
-bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
-                              int64_t upto, bool index, std::string& error) {
+namespace {
+// the image's header fields against this state's layout; `sizes` gets what each part must hold
+bool validate_header(const ConversationKv& image, const QsaState& st, const ModelGeometry& g, int64_t upto,
+                     bool index, std::array<size_t, 5>& sizes, std::string& error) {
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
     if (!valid(st, l, upto, error)) return false;
-    const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
-    const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
+    sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     if (image.format != l.format || image.cells != l.cells || image.heads != g.n_head_kv ||
         image.head_dim != g.head_dim || image.page_size != l.page_size || image.pooled_rows != l.pooled_rows ||
         image.idx_dim != g.idx_key_dim) {
         error = "conversation snapshot: incompatible K/V geometry";
         return false;
     }
+    const auto dst = pools(st);
+    for (size_t i = 0; i < sizes.size(); ++i)
+        if (sizes[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
+    return true;
+}
+} // namespace
+
+bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                              int64_t upto, bool index, std::string& error) {
+    std::array<size_t, 5> sizes{};
+    if (!validate_header(image, st, g, upto, index, sizes, error)) return false;
+    const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     for (size_t i = 0; i < src.size(); ++i)
         if (src[i]->size() != sizes[i]) { error = "conversation snapshot: invalid K/V payload size"; return false; }
-    const auto dst = pools(st);
-    for (size_t i = 0; i < src.size(); ++i)
-        if (sizes[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
     return true;
 }
 
@@ -210,6 +220,27 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
             })) return false;
+    return conversation_kv_settle(st, g, upto, error);
+}
+
+bool conversation_kv_sink(SessionKvSink& out, std::array<uint64_t, 5>& sizes, const ConversationKv& header,
+                          const QsaState& st, const ModelGeometry& g, int64_t upto, bool index, std::string& error) {
+    std::array<size_t, 5> want{};
+    if (!validate_header(header, st, g, upto, index, want, error)) return false;
+    const auto dst = pools(st);
+    SessionKvSink s;
+    auto why = std::make_shared<std::string>();
+    s.write = [dst, want, why](size_t part, size_t offset, const void* src, size_t n) {
+        if (part >= 5 || offset > want[part] || n > want[part] - offset) { *why = "K/V write out of range"; return false; }
+        return transfer(static_cast<uint8_t*>(dst[part]) + offset, src, n, *why);
+    };
+    s.error = [why] { return *why; };
+    for (size_t i = 0; i < 5; ++i) sizes[i] = want[i];
+    out = std::move(s);
+    return true;
+}
+
+bool conversation_kv_settle(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
     // VRAM slots still contain the outgoing conversation. Resolve must refill
     // them from the restored authoritative pools before any attention reads.
     if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);

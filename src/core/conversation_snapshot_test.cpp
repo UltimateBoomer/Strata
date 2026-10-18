@@ -166,7 +166,8 @@ void full_session(int fmt, int mode, int experts) {
         auto slurp=[](const std::string& p){ std::ifstream f(p,std::ios::binary);
             return std::vector<char>((std::istreambuf_iterator<char>(f)),std::istreambuf_iterator<char>()); };
         size_t n1=0,n2=0;
-        check(session_file_write(p1,meta,sources,id,n1,err),"streamed session write");
+        check(meta.checkpoints.empty(),"checkpoints are not copied for the disk save");
+        check(session_file_write(p1,meta,view.checkpoints,sources,id,n1,err),"streamed session write");
         check(session_file_write(p2,b,id,n2,err),"captured session write");
         SavedConversation x,y;
         check(session_file_read(p1,id,x,n1,err) && session_file_read(p2,id,y,n2,err) && n1==n2,"both files read");
@@ -174,6 +175,38 @@ void full_session(int fmt, int mode, int experts) {
               x.checkpoints.size()==y.checkpoints.size() && equal(x.kv[0],y.kv[0]) && equal(x.kv.back(),y.kv.back()),
               "streamed file equals captured file");
         check(slurp(p1)==slurp(p2),"streamed file is byte-identical to the captured file");
+        {
+            // streamed restore: the file's K/V goes straight into the session's pools, no host image
+            fill(91);
+            SessionKvTarget target;
+            check(conversation_snapshot_target(target,ss,g,&draft.state,err),"streamed restore target");
+            SavedConversation m;
+            SessionStatus rs;
+            size_t nr=0;
+            check(session_file_read_streamed(p1,id,m,target,nr,err,{},&rs) && rs.target_written && m.kv.empty(),
+                  "streamed restore read");
+            check(conversation_snapshot_stream_finish(m,ss,g,&draft.state,err)==ConversationRestore::restored,
+                  "streamed restore finish");
+            SavedConversation back;
+            check(conversation_snapshot_save(back,view,ss,g,draft.state,err),"capture after streamed restore");
+            check(back.live.gdn==b.live.gdn && back.live.ple==b.live.ple && back.live.tails==b.live.tails &&
+                  back.live.dead==b.live.dead && back.live.block_pos==b.live.block_pos &&
+                  equal(back.kv[0],b.kv[0]) && equal(back.kv.back(),b.kv.back()),
+                  "streamed restore equals restoring the captured image");
+            check(m.checkpoints.size()==b.checkpoints.size() && m.checkpoints[0].gdn==b.checkpoints[0].gdn,
+                  "streamed restore reads the checkpoints");
+            // another layer range is refused at begin, before any K/V byte
+            SessionState other=ss; other.layer_hi=ss.layer_hi+1;
+            SessionKvTarget t2;
+            check(conversation_snapshot_target(t2,other,g,&draft.state,err),"target for a mismatched carve");
+            check(!session_file_read_streamed(p1,id,m,t2,nr,err,{},&rs) && !rs.target_written,
+                  "mismatched layer range refused before any K/V write");
+            // no draft target: the draft layer is one too many
+            SessionKvTarget t3;
+            check(conversation_snapshot_target(t3,ss,g,nullptr,err),"target without the draft");
+            check(!session_file_read_streamed(p1,id,m,t3,nr,err,{},&rs) && !rs.target_written,
+                  "layer count mismatch refused before any K/V write");
+        }
         std::error_code ec;
         fs::remove_all(dir,ec);
         auto empty_ids=std::vector<int32_t>{};
