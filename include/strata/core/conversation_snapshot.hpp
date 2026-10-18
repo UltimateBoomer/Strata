@@ -55,6 +55,11 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& state, 
 // conversation_kv_save).  Caller synchronizes the device first and keeps the state untouched while it is read.
 bool conversation_kv_source(SessionKvSource& source, const QsaState& state, const ModelGeometry& g,
                             int64_t upto, bool include_index, std::string& error);
+// The leading bytes of each K/V part a snapshot of `upto` tokens shares with one taken before, when the first
+// `unchanged` tokens' cells were not written since: the completed pages and indexer rows before the first rewritten
+// token, the rule conversation_kv_save reuses a retained image by.  No state read.
+bool conversation_kv_keep_bytes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
+                                int64_t unchanged, std::array<uint64_t, 5>& keep, std::string& error);
 // The bytes of each K/V part (k, v, k_scale, v_scale, pooled) a snapshot of `upto` tokens holds: no state read.
 bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
                                 std::array<uint64_t, 5>& sizes, std::string& error);
@@ -170,6 +175,11 @@ bool conversation_snapshot_stream_abandon(SessionState& session, const ModelGeom
 // rest of the file is still read, for its hash.  After the read succeeded, conversation_snapshot_stream_finish_prefix
 // settles the K/V up to `upto`; as after restore_prefix the running state is NOT restored - the caller mounts the
 // borrowed checkpoint from `meta`'s checkpoints.  A failure with target_written leaves partial state, as above.
+// conversation_kv_keep_bytes for every layer conversation_snapshot_sources writes, in its order (the draft last,
+// one token fewer: its final cell may not have been computed when the output cap was reached, as for a capture).
+bool conversation_snapshot_keep(std::vector<std::array<uint64_t, 5>>& keep, const SessionState& session,
+                                const ModelGeometry& g, const QsaState& draft, int64_t upto, int64_t unchanged,
+                                std::string& error);
 bool conversation_snapshot_target_prefix(SessionKvTarget& target, int64_t upto, SessionState& session,
                                          const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_stream_finish_prefix(const SavedConversation& meta, int64_t upto,

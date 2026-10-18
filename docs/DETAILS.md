@@ -1135,6 +1135,15 @@ conversations keep a slot.
 advanced N tokens past the copy it would supersede; a turn that grew by a few hundred tokens keeps the older copy
 instead of writing a whole snapshot that the next turn drops. The cost is that a resume from the older copy reads up
 to N tokens again (#2265).
+`--conversation-cache-dir DIR` (fork option; one GPU with `--mtp`, Linux) parks conversations in files in DIR instead
+of RAM, and the byte budget then caps what the files hold. Each is a park file, `park-<n>.park`: a 4 KiB superblock,
+every K/V part in its own region reserved for `--max-context` (a sparse file: only what is written takes space, at
+4 KiB-aligned offsets), the live running state and each checkpoint as a record, and a directory that names them, with
+a hash per MiB of K/V and per record. A conversation read back keeps its file, and when it is parked again the file
+is updated in place: only each K/V part's bytes past the pages the session has not written since (the rule a RAM
+park reuses a retained image by), the checkpoints the file does not hold, the running state and the directory are
+written, and the records it no longer names are punched out. The files live as long as the engine: every `park-*`
+file is removed at start. A sibling borrows a prefix from a file as from RAM, its K/V streamed into the session.
 `--conversation-cache-skip-tail N` (opt-in, default 0 = park it) does not park the outgoing state when a request goes
 on from one of the session's own checkpoints and at most N tokens past it are left behind: the tail its client
 rewrote, such as the last reply re-rendered without its reasoning. Parking it would write the whole conversation

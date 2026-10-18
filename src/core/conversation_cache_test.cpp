@@ -713,6 +713,44 @@ int main() {
                       !cache.borrow_with(ram.serial, out, [](uint64_t, SavedConversation&, std::string&) { return true; }),
                   "a RAM entry has no file and is borrowed in place, not through borrow_with");
         }
+        files.clear();
+        {   // the base: a file read back stays the session's, charged to the budget, until it is parked again or dropped
+            ConversationCache cache(1000, 4);
+            disk_of(cache);
+            check(park(cache, 50, image({1, 2, 3}), 300), "park a conversation to a file");
+            SavedConversation out;
+            const size_t before = removes;
+            check(cache.load_with(cache.detach(0), out, [&](uint64_t f, SavedConversation& o, std::string&) {
+                      o = files.at(f); return true; }, true) &&
+                  removes == before && files.count(50), "load_with(keep_file) leaves the file");
+            cache.retain_file(50, 3, 300);
+            check(cache.base() && cache.base()->file == 50 && cache.base()->unchanged == 3 && cache.bytes() == 300,
+                  "the kept file is the base, charged to the budget");
+            cache.limit_reuse(2);
+            check(cache.base()->unchanged == 2, "a request's first written token bounds the base's unchanged prefix");
+            cache.limit_reuse(5);
+            check(cache.base()->unchanged == 2, "a later write past it changes nothing");
+            check(park(cache, 51, image({7}), 300) && park(cache, 52, image({8}), 300) && park(cache, 53, image({9}), 300),
+                  "three others park beside the base");
+            check(!park(cache, 54, image({6}), 300) || cache.evictions() > 0, "the budget counts the base");
+            check(files.count(50) && cache.base(), "eviction never takes the base");
+            auto b = cache.take_base();
+            check(b && b->file == 50 && !cache.base() && files.count(50), "take_base hands the file on, uncharged");
+            cache.retain_file(50, 3, 300);
+            cache.retain_file(55, 4, 100);
+            check(!files.count(50) && cache.base()->file == 55, "a new base drops the old one's file");
+            files[55] = image({4});
+            cache.drop_base();
+            check(!cache.base() && !files.count(55), "drop_base removes the file");
+            files[56] = image({4});
+            cache.retain_file(56, 1, 10);
+            cache.clear();
+            check(!cache.base() && !files.count(56), "clear() drops the base too");
+            check(park(cache, 57, image({1, 2}), 100), "park again");
+            check(!cache.load_with(cache.detach(cache.size() - 1), out, [](uint64_t, SavedConversation&, std::string& why) {
+                      why = "torn"; return false; }, true) && !files.count(57),
+                  "a failed read removes the file even when it was to be kept");
+        }
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

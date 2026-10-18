@@ -1,4 +1,5 @@
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/conversation_park.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include <cuda_runtime.h>
@@ -328,6 +329,69 @@ void full_session(int fmt, int mode, int experts) {
         check(conversation_snapshot_restore(incremental,ss,g,draft.state,err)==ConversationRestore::restored,"restore segmented incremental snapshot");
         uint64_t fingerprint=0;
         check(conversation_kv_verify(incremental.kv.back(),draft.state,g,70,false,fingerprint,err),"incremental draft authoritative and ring read-back");
+        ids.resize(65);
+    }
+    for (int64_t dirty : {65, 3, 0}) {
+        // --conversation-cache-dir park files: written from the device, read back streamed (the checkpoints then name
+        // their records), the session grown or rewound as above, the file updated in place with the pages the
+        // session did not write since (conversation_snapshot_keep), and that file read back equal to a full capture
+        namespace fs=std::filesystem;
+        const fs::path dir=fs::temp_directory_path()/("strata-park-snap-"+std::to_string(experts)+"-"+std::to_string(dirty)+"-"+
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        fs::create_directories(dir);
+        const std::string p=(dir/"conv.park").string();
+        check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore A for its park file");
+        SessionReadLimits caps;
+        check(conversation_session_read_limits(caps,ss,g,draft.state,(uint64_t)ss.max_cells,8,err),"park regions");
+        SavedConversation pm;
+        std::vector<SessionKvSource> src;
+        ParkFileState pst;
+        ParkWriteStats pws;
+        check(conversation_snapshot_sources(pm,src,view,ss,g,draft.state,err) &&
+              park_file_write(p,5,nullptr,pm,view.checkpoints,src,caps.max_kv_bytes,{},0,{},pst,pws,err),"write a park file");
+        SessionKvTarget t;
+        SavedConversation back;
+        SessionStatus rs;
+        check(conversation_snapshot_target(t,ss,g,&draft.state,err) && park_file_read(p,5,back,t,caps,pst,err,&rs) &&
+              conversation_snapshot_stream_finish(back,ss,g,&draft.state,err)==ConversationRestore::restored,
+              "read the park file back into the session");
+        check(back.checkpoints.size()==1 && back.checkpoints[0].park_file==5 && back.checkpoints[0].gdn==a.checkpoints[0].gdn,
+              "its checkpoint comes back naming its record");
+        main.fill_after(91,dirty); draft.fill_after(91,std::max<int64_t>(0,dirty-1));
+        cuda_check(cudaMemset(ss.gdn_state,91,sizes.gdn));
+        ids.resize(70);
+        for (size_t i=65;i<ids.size();++i) ids[i]=int32_t(i+1);
+        cuda_check(cudaMemcpy(main.state.idx_pooled+(ids.size()/4)*g.idx_key_dim,
+                              main.state.idx_dead,sizes.dead,cudaMemcpyDeviceToDevice));
+        SavedConversation fresh;
+        check(conversation_snapshot_save(fresh,view,ss,g,draft.state,err),"full capture after growth or rewind");
+        std::vector<std::array<uint64_t,5>> keep;
+        check(conversation_snapshot_keep(keep,ss,g,draft.state,70,dirty,err) && keep.size()==src.size(),"the pages kept");
+        const std::vector<ConversationCheckpoint> chain=back.checkpoints;
+        const ConversationView grown{ids,images,chain,true};
+        SavedConversation um;
+        std::vector<SessionKvSource> usrc;
+        ParkFileState ust;
+        ParkWriteStats uws;
+        check(conversation_snapshot_sources(um,usrc,grown,ss,g,draft.state,err) &&
+              park_file_write(p,5,&pst,um,grown.checkpoints,usrc,caps.max_kv_bytes,keep,0,{},ust,uws,err),
+              "update the park file in place");
+        check(uws.kept_checkpoints==1 && (dirty>=4)==(uws.kept_kv>0),"the unchanged pages and the checkpoint are kept");
+        fill(222);   // another conversation in the session
+        SessionKvTarget t2;
+        SavedConversation again;
+        check(conversation_snapshot_target(t2,ss,g,&draft.state,err) && park_file_read(p,5,again,t2,caps,ust,err,&rs) &&
+              conversation_snapshot_stream_finish(again,ss,g,&draft.state,err)==ConversationRestore::restored,
+              "read the updated park file back");
+        SavedConversation got;
+        check(conversation_snapshot_save(got,view,ss,g,draft.state,err),"capture it");
+        check(got.live.gdn==fresh.live.gdn && got.live.ple==fresh.live.ple && got.live.tails==fresh.live.tails &&
+              got.live.dead==fresh.live.dead && got.live.block_pos==fresh.live.block_pos &&
+              equal(got.kv[0],fresh.kv[0]) && equal(got.kv.back(),fresh.kv.back()),
+              "the updated park file equals a full capture after growth or rewind");
+        check(again.checkpoints.size()==1 && again.checkpoints[0].gdn==a.checkpoints[0].gdn,"the kept checkpoint reads back");
+        std::error_code ec;
+        fs::remove_all(dir,ec);
         ids.resize(65);
     }
     {

@@ -24,6 +24,7 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/conversation_park.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -879,9 +880,10 @@ void usage() {
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
-                 "  --conversation-cache-dir DIR  --serve: park conversations in files in DIR, kept across restarts\n"
+                 "  --conversation-cache-dir DIR  --serve: park conversations in files in DIR for this engine's life\n"
+                 "                       (removed at start); one read back is updated in place when parked again\n"
                  "                       (the budget then caps the files, oldest pruned first; slots 0 = no slot\n"
-                 "                       limit; one GPU with --mtp, else they stay in RAM)\n"
+                 "                       limit; one GPU with --mtp on Linux, else they stay in RAM)\n"
                  "  --conversation-cache-min-free-mib N  --serve: RAM floor (under MemAvailable, the cgroup limits and\n"
                  "                       --memory-limit-mib) when parking, saving or restoring a session (default 2560)\n"
                  "  --memory-limit-mib N  --serve: the total RAM (MiB) this engine's container or cgroup may use, when\n"
@@ -1739,7 +1741,7 @@ public:
     }
 private:
     static void clear_marks(ConvCheckpoint& c) {
-        c.ids.clear(); c.imgs.clear(); c.used = 0; c.pinned = false;
+        c.ids.clear(); c.imgs.clear(); c.used = 0; c.pinned = false; c.park_file = c.park_record = 0;
         for (ConvCheckpoint& part : c.stage_parts) clear_marks(part);
     }
     bool on_;
@@ -8883,16 +8885,18 @@ int main(int argc, char** argv) {
             id.config = *config_fp;
             return true;
         };
-        // --conversation-cache-dir: the file tier.  Each parked conversation is park-<seq>.conv (the whole image, the
-        // session file format) and park-<seq>.meta (its skeleton: what matching reads), both bound to this model and
-        // configuration like a SAVE, so they survive a restart and a file from another model or setting is removed.
-        // Written without flushes (a cache, not a record); read back with RESTORE's bounds and RAM preflight.  The
-        // budget caps the .conv files' bytes: the oldest go first, also at start when the budget shrank.
-        strata::core::SessionFileIdentity park_id;
+        // --conversation-cache-dir: the file tier.  Each parked conversation is one park file, park-<seq>.park
+        // (conversation_park.hpp): its K/V in per-part regions, its running states as records.  A conversation read
+        // back keeps its file as the cache's base, so parking it again rewrites only what changed.  The files live as
+        // long as this engine: every park-* file is removed at start (no identity binds them to a model).  Written
+        // without flushes (a cache, not a record); read back with RESTORE's bounds and RAM preflight.  The budget caps
+        // what the files hold: the oldest go first.
         uint64_t park_seq = 0;
-        auto park_path = [dir = o.conversation_cache_dir](uint64_t file, const char* ext = ".conv") {
-            return dir + "/park-" + std::to_string(file) + ext;
+        auto park_path = [dir = o.conversation_cache_dir](uint64_t file) {
+            return dir + "/park-" + std::to_string(file) + ".park";
         };
+        // the base's directory (conversations.base()): what an update in place starts from
+        strata::core::ParkFileState park_base_state;
         if (!o.conversation_cache_dir.empty() && o.conversation_cache_mib > 0 && !park_disk)
             std::fprintf(stderr, "strata serve: conversation cache: --conversation-cache-dir needs --mtp and one GPU; "
                                  "parking in RAM\n");
@@ -8913,85 +8917,48 @@ int main(int argc, char** argv) {
         };
         // the same file read back with its K/V streamed into the session as it is read: RAM holds the running state
         // and the checkpoints, never the K/V.  `written`: K/V reached the session (then a failure leaves it partial).
-        // `kind` (optional): what kind of failure it was (memory: no RAM to read it now).
+        // `kind` (optional): what kind of failure it was (memory: no RAM to read it now).  `state` (optional): the
+        // file's directory, for an update in place.
         auto park_read_streamed = [&, park_path](uint64_t file, strata::core::SavedConversation& meta,
                                                  const strata::core::SessionKvTarget& target, std::string& why,
-                                                 bool& written, strata::core::SessionError* kind = nullptr) {
+                                                 bool& written, strata::core::SessionError* kind = nullptr,
+                                                 strata::core::ParkFileState* state = nullptr) {
             written = false;
             strata::core::SessionReadLimits limits;
             if (!park_limits(limits, why)) return false;
-            size_t bytes = 0;
             strata::core::SessionStatus st;
-            const bool ok = strata::core::session_file_read_streamed(park_path(file), park_id, meta, target, bytes, why,
-                                                                     limits, &st);
+            strata::core::ParkFileState fs;
+            const bool ok = strata::core::park_file_read(park_path(file), file, meta, target, limits, fs, why, &st);
             written = st.target_written;
             if (kind) *kind = st.error;
+            if (ok && state) *state = std::move(fs);
             return ok;
         };
         if (park_disk) {
             const auto t0 = Clock::now();
-            if (!session_identity(park_id, err, [] { strata::core::progress_beat(); })) {
-                std::fprintf(stderr, "strata serve: conversation cache: no model identity for the files (%s)\n",
-                             err.c_str());
-                return 1;
-            }
             conversations.use_disk({
                 [&, park_path](uint64_t file, strata::core::SavedConversation& out, std::string& why) {
                     strata::core::SessionReadLimits limits;
                     if (!park_limits(limits, why)) return false;
-                    size_t bytes = 0;
-                    strata::core::SessionStatus st;
-                    return strata::core::session_file_read(park_path(file), park_id, out, bytes, why, limits, &st);
+                    strata::core::ParkFileState fs;
+                    return strata::core::park_file_read_image(park_path(file), file, out, limits, fs, why);
                 },
                 [park_path](uint64_t file) {
                     std::error_code e;
                     std::filesystem::remove(park_path(file), e);
-                    std::filesystem::remove(park_path(file, ".meta"), e);
                 }});
-            // what an earlier run left: every skeleton that reads back under this identity, oldest park first
+            // what an earlier run left (park files, and the session files earlier builds parked in) goes
             std::error_code ec;
             std::filesystem::create_directories(o.conversation_cache_dir, ec);
-            std::vector<uint64_t> found;
-            std::vector<std::filesystem::path> strays;
-            for (const auto& f : std::filesystem::directory_iterator(o.conversation_cache_dir, ec)) {
-                const std::string n = f.path().filename().string(), ext = f.path().extension().string();
-                if (n.rfind("park-", 0) != 0) continue;
-                const std::string seq = f.path().stem().string().substr(5);
-                uint64_t v = 0;
-                const auto r = std::from_chars(seq.data(), seq.data() + seq.size(), v);
-                if (r.ec != std::errc{} || r.ptr != seq.data() + seq.size() || v == 0) { strays.push_back(f.path()); continue; }
-                park_seq = std::max(park_seq, v);
-                if (ext == ".meta") found.push_back(v);
-                else if (ext == ".conv") { if (!std::filesystem::exists(park_path(v, ".meta"), ec)) strays.push_back(f.path()); }
-                else strays.push_back(f.path());   // a temporary file a write left behind
-            }
-            for (const auto& f : strays) std::filesystem::remove(f, ec);
-            std::sort(found.begin(), found.end());
-            size_t loaded = 0, dropped = strays.size();
-            for (uint64_t v : found) {
-                strata::core::SavedConversation skel;
-                size_t meta_bytes = 0;
-                std::string why;
-                const auto conv_bytes = std::filesystem::file_size(park_path(v), ec);
-                if (ec || !strata::core::session_file_read(park_path(v, ".meta"), park_id, skel, meta_bytes, why) ||
-                    !skel.kv.empty() || skel.live.ids.empty()) {
-                    ec.clear();
-                    std::filesystem::remove(park_path(v), ec);
-                    std::filesystem::remove(park_path(v, ".meta"), ec);
-                    ++dropped;
-                    continue;
-                }
-                if (conversations.put_file(std::move(skel), v, (size_t) conv_bytes)) ++loaded;
-                else ++dropped;
-            }
+            std::vector<std::filesystem::path> old;
+            for (const auto& f : std::filesystem::directory_iterator(o.conversation_cache_dir, ec))
+                if (f.path().filename().string().rfind("park-", 0) == 0) old.push_back(f.path());
+            for (const auto& f : old) std::filesystem::remove(f, ec);
             std::fprintf(stderr, "strata serve: conversation cache: on disk in %s (budget %lld MiB, %s slots); "
-                                 "%zu parked conversations kept from before (%zu MiB), %zu files removed, %zu "
-                                 "evicted to fit, in %.1f ms\n",
+                                 "%zu files of an earlier run removed, in %.1f ms\n",
                          o.conversation_cache_dir.c_str(), (long long) o.conversation_cache_mib,
                          conversations.slots() == SIZE_MAX ? "unlimited" : std::to_string(conversations.slots()).c_str(),
-                         conversations.size(), conversations.bytes() >> 20, dropped, conversations.evictions(),
-                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
-            (void) loaded;
+                         old.size(), std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
         }
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
@@ -9080,9 +9047,18 @@ int main(int argc, char** argv) {
             }
             estimate += stage_estimate;
             // --conversation-cache-dir: the K/V goes from where it lives straight into the file (as SAVE does), so
-            // RAM only holds the running state and checkpoints the file also carries, never the whole image
+            // RAM only holds the running state and checkpoints the file also carries, never the whole image.  The file
+            // this conversation was read back from (the base) is updated in place: only the K/V past the pages the
+            // session has not written since, the new checkpoints and the running state are written.
             if (park_disk) {
+                std::optional<strata::core::ConversationCache::Base> base = conversations.take_base();
+                auto drop_file = [&](uint64_t f) { std::error_code e; std::filesystem::remove(park_path(f), e); };
+                if (base && park_base_state.file != base->file) { drop_file(base->file); base.reset(); }
+                // a park that does not happen leaves the session to the next request: the base would describe a state
+                // it no longer holds, so its file goes
+                auto give_up = [&] { if (base) drop_file(base->file); };
                 if (!conversations.make_room(estimate, held)) {
+                    give_up();
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds "
                                          "available budget)\n", estimate >> 20);
                     return true;
@@ -9103,52 +9079,67 @@ int main(int argc, char** argv) {
                 const auto mem = strata::core::sample_host_memory();
                 if (!strata::core::conversation_memory_admit(
                         mem ? std::optional<uint64_t>(mem->available) : std::nullopt, need, floor)) {
+                    give_up();
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need "
                                          "%llu MiB plus %lld MiB floor, %s)\n", (unsigned long long) (need >> 20),
                                  (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str());
                     return true;
                 }
-                if (cudaDeviceSynchronize() != cudaSuccess) { err = "sync before parking failed"; return false; }
+                if (cudaDeviceSynchronize() != cudaSuccess) { give_up(); err = "sync before parking failed"; return false; }
                 strata::core::SavedConversation meta;
                 std::vector<strata::core::SessionKvSource> sources;
-                if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(), err)) {
-                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n", err.c_str());
+                std::string why;
+                strata::core::SessionReadLimits caps;   // the regions a new file reserves: each part at --max-context
+                if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(), err) ||
+                    !park_limits(caps, why)) {
+                    give_up();
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n",
+                                 err.empty() ? why.c_str() : err.c_str());
                     err.clear();
                     return true;
                 }
-                const uint64_t file = ++park_seq;
-                strata::core::SessionWriteOptions wo;
-                wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
-                wo.durable = false;
-                wo.progress = [](uint64_t, uint64_t) { strata::core::progress_beat(); };
-                strata::core::SessionStatus st;
-                size_t bytes = 0;
-                std::string why;
-                if (!strata::core::session_file_write(park_path(file), meta, view.checkpoints, sources, park_id, bytes,
-                                                      why, wo, &st)) {
-                    std::error_code e;
-                    std::filesystem::remove(park_path(file), e);
+                // what each K/V part still shares with the base: the pages before the first token written since
+                std::vector<std::array<uint64_t, 5>> keep;
+                if (base && !strata::core::conversation_snapshot_keep(keep, ss, g, mtp.kv_state(), (int64_t) live.size(),
+                                                                      base->unchanged, why)) {
+                    keep.clear();   // (then every byte is written again)
+                    why.clear();
+                }
+                const uint64_t min_free = (uint64_t) o.session_min_free_mib << 20;
+                const std::function<void()> beat = [] { strata::core::progress_beat(); };
+                uint64_t file = base ? base->file : ++park_seq;
+                strata::core::ParkFileState fs;
+                strata::core::ParkWriteStats ws;
+                bool ok = strata::core::park_file_write(park_path(file), file, base ? &park_base_state : nullptr, meta,
+                                                        view.checkpoints, sources, caps.max_kv_bytes, keep, min_free,
+                                                        beat, fs, ws, why);
+                const bool in_place = ok && base;
+                if (!ok && base) {
+                    // the update failed part-way and the file is torn: a new one instead
+                    std::fprintf(stderr, "strata serve: conversation cache: updating the parked file in place failed "
+                                         "(%s); writing a new one\n", why.c_str());
+                    drop_file(file);
+                    base.reset();
+                    why.clear();
+                    file = ++park_seq;
+                    ok = strata::core::park_file_write(park_path(file), file, nullptr, meta, view.checkpoints, sources,
+                                                       caps.max_kv_bytes, {}, min_free, beat, fs, ws, why);
+                }
+                if (!ok) {
+                    drop_file(file);
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (file: %s)\n", why.c_str());
                     return true;
                 }
-                // the skeleton beside it, so a restart finds the conversation again
                 strata::core::SavedConversation skel = strata::core::conversation_skeleton(std::move(meta), view.checkpoints);
-                size_t skel_bytes = 0;
-                strata::core::SessionWriteOptions mo;
-                mo.durable = false;
-                if (!strata::core::session_file_write(park_path(file, ".meta"), skel, park_id, skel_bytes, why, mo)) {
-                    std::error_code e;
-                    std::filesystem::remove(park_path(file), e);
-                    std::filesystem::remove(park_path(file, ".meta"), e);
-                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (file: %s)\n", why.c_str());
-                    return true;
-                }
-                const bool stored = conversations.put_file(std::move(skel), file, bytes, held);
-                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms (disk); parked=%zu "
-                                     "bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=0\n",
+                const bool stored = conversations.put_file(std::move(skel), file, (size_t) fs.bytes(), held);
+                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms (disk%s); parked=%zu "
+                                     "bytes=%zu evictions=%zu snapshot_bytes=%llu written_bytes=%llu "
+                                     "reused_kv_bytes=%llu kept_checkpoints=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
-                             conversations.size(), conversations.bytes(), conversations.evictions(), bytes);
+                             in_place ? ", updated in place" : "", conversations.size(), conversations.bytes(),
+                             conversations.evictions(), (unsigned long long) fs.bytes(),
+                             (unsigned long long) ws.written, (unsigned long long) ws.kept_kv, ws.kept_checkpoints);
                 return true;
             }
             // A park carrying its own retained K/V replaces memory the cache
@@ -9307,6 +9298,7 @@ int main(int argc, char** argv) {
                     return true;
                 }
             ConvCheckpoint c = parts == nullptr ? ckpt_pool.take() : ConvCheckpoint{};   // (STRATA_CKPT_POOL)
+            c.park_file = c.park_record = 0;   // filled anew below, whichever way
             c.ids.assign(cur.begin(), cur.begin() + L);
             c.imgs = imgs_below(req_imgs, L);
             if (parts != nullptr) {
@@ -11786,6 +11778,7 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     conversations.take_reuse();   // retained K/V described the outgoing session
+                    conversations.drop_base();    // and so did a parked file kept for it
                     live_ok = false;
                     // host -> device in synchronous copies of the whole state: one bounded allowance
                     blocking("transfer", bytes);
@@ -12335,7 +12328,12 @@ int main(int argc, char** argv) {
             // a parked file's K/V is streamed into the session as it is read (no host image of it): checked before
             // its first byte lands, so a refused file still falls back to the existing prefix; one that fails after
             // (a read error, the payload hash) leaves the session partly overwritten and the prompt is read from 0
+            // --conversation-cache-dir: other state comes into the session (a parked conversation, a borrowed prefix, a
+            // batch slot's): a base the park above did not take describes what the session no longer holds
+            if (incoming || parked_file || borrow || slot_source >= 0) conversations.drop_base();
             bool streamed_in = false;
+            uint64_t streamed_file = 0;   // the file it came from, kept as the base once the restore is done
+            strata::core::ParkFileState streamed_state;
             if (parked_file) {
                 const auto t_load = Clock::now();
                 const size_t tokens = parked_file->image.live.ids.size();
@@ -12349,12 +12347,14 @@ int main(int argc, char** argv) {
                 strata::core::SavedConversation meta;
                 bool written = false;
                 const bool targeted = strata::core::conversation_snapshot_target(target, ss, g, draft_in, err);
+                const uint64_t taken = parked_file->file;
                 const bool ok = conversations.load_with(std::move(*parked_file), meta,
                     [&](uint64_t file, strata::core::SavedConversation& out, std::string& why) {
                         if (!targeted) { why = err; return false; }
-                        return park_read_streamed(file, out, target, why, written);
-                    });
+                        return park_read_streamed(file, out, target, why, written, nullptr, &streamed_state);
+                    }, true);
                 parked_file.reset();
+                if (ok) streamed_file = taken;
                 err.clear();
                 if (ok) {
                     std::fprintf(stderr, "strata serve: conversation cache: read %zu parked tokens from disk into the "
@@ -12592,6 +12592,11 @@ int main(int argc, char** argv) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
                     conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv));
+                }
+                if (streamed_file != 0) {
+                    // the file it was read from stays: its K/V is the session's, all of it, until a request writes
+                    conversations.retain_file(streamed_file, int64_t(live.size()), (size_t) streamed_state.bytes());
+                    park_base_state = std::move(streamed_state);
                 }
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
                 lent_slot = -1;   // (the main session holds the parked conversation now)

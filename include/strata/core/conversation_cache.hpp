@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -31,6 +32,10 @@ struct ConversationCheckpoint {
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
     // mark only: it is not in the session file, a request that pins the same prefix again sets it.
     bool pinned = false;
+    // --conversation-cache-dir: the park file (its cache id) and record this checkpoint's running state was read back
+    // from, so parking the conversation into that file again keeps the record instead of writing it (0: none).  Cleared
+    // whenever the running state is saved anew.  Run-time only.
+    uint64_t park_file = 0, park_record = 0;
     // --prefill-pipe on a layer split: the plan a prompt segment [from, to) is read in - its chunk (0: none), the loan
     // its buffers were laid out for (which experts the prompt reads in place and which it streams: that sets bits
     // too), the pipe value it was planned with, whether it is one chunk and whether the plan changed the buffers'
@@ -270,7 +275,7 @@ public:
     /// with one long conversation spends the cache on the side requests and evicts the long one (oldest first) -
     /// exactly the reuse it wanted.  0 parks every conversation, whatever its size.
     bool wants(int64_t tokens) const { return min_tokens_ <= 0 || tokens >= min_tokens_; }
-    size_t bytes() const { return bytes_ + reuse_.bytes(); }
+    size_t bytes() const { return bytes_ + reuse_.bytes() + base_bytes(); }
     size_t size() const { return entries_.size(); }
     size_t evictions() const { return evictions_; }
     // the longest parked conversation, in tokens (--kv-grow keeps the K/V that long while it could be restored)
@@ -293,11 +298,32 @@ public:
         if (enabled() && candidate.bytes() <= budget_ - bytes_) reuse_ = std::move(candidate);
     }
     void limit_reuse(int64_t first_dirty) {
+        if (base_) base_->unchanged = std::min(base_->unchanged, first_dirty);
         reuse_.unchanged_tokens = std::min(reuse_.unchanged_tokens, first_dirty);
         for (auto& s : reuse_.stages) s.unchanged_tokens = std::min(s.unchanged_tokens, first_dirty);
         if (reuse_.unchanged_tokens <= 0) reuse_ = {};
     }
     ConversationKvReuse take_reuse() { return std::exchange(reuse_, {}); }
+    /// --conversation-cache-dir: the file the session's conversation was read back from, kept so that parking it again
+    /// updates that file in place (conversation_park.hpp) instead of writing a new one.  `unchanged`: how many leading
+    /// tokens of the session's K/V are still the file's (limit_reuse bounds it at each request's first written
+    /// token); `bytes`: what the file holds, charged to the budget.  The cache owns the file until take_base() hands
+    /// it on; drop_base() removes it, as must the caller whenever the session takes other state in.
+    struct Base {
+        uint64_t file = 0;
+        int64_t unchanged = 0;
+        size_t bytes = 0;
+    };
+    void retain_file(uint64_t file, int64_t tokens, size_t bytes) {
+        drop_base();
+        base_ = Base{file, tokens, bytes};
+    }
+    const std::optional<Base>& base() const { return base_; }
+    std::optional<Base> take_base() { return std::exchange(base_, std::nullopt); }
+    void drop_base() {
+        if (base_ && disk_.remove) disk_.remove(base_->file);
+        base_.reset();
+    }
     size_t retained_bytes() const { return reuse_.bytes(); }
     bool can_fit(size_t incoming, size_t held = 0) const {
         return enabled() && held <= budget_ && incoming <= budget_ - held &&
@@ -345,7 +371,8 @@ public:
     }
     /// A detached file entry read back by `read(file, out, why)` instead of disk.load - a read that may put the K/V
     /// elsewhere (a streamed restore) - and removed, its pins carried over as load() does.  False with last_error().
-    template<class Read> bool load_with(Detached&& d, SavedConversation& out, Read&& read) {
+    /// `keep_file`: a file read back is not removed - the caller hands it to retain_file() (a failed read removes it).
+    template<class Read> bool load_with(Detached&& d, SavedConversation& out, Read&& read, bool keep_file = false) {
         last_error_.clear();
         const bool ok = read(d.file, out, last_error_);
         if (!ok) {
@@ -353,7 +380,7 @@ public:
         } else if (out.checkpoints.size() == d.image.checkpoints.size()) {
             for (size_t i = 0; i < out.checkpoints.size(); ++i) out.checkpoints[i].pinned = d.image.checkpoints[i].pinned;
         }
-        disk_.remove(d.file);
+        if (!ok || !keep_file) disk_.remove(d.file);
         return ok;
     }
     SavedConversation take(size_t index) { return load(detach(index)); }
@@ -444,7 +471,7 @@ public:
             if (kept >= slots_ || kept_bytes > budget_ - held - incoming) { guard_blocked_ = true; return false; }
         }
         if (bytes() > budget_ - held - incoming) reuse_ = {};
-        while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
+        while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ + base_bytes() > budget_ - held - incoming)) {
             // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
             // image does not fit (the caller skips parking it - the pinned prefix is what the queries come back to)
             if (!evict_oldest()) return false;
@@ -476,6 +503,7 @@ public:
     size_t clear() {
         const size_t n = entries_.size();
         for (auto& e : entries_) release(e);
+        drop_base();
         entries_.clear();
         serials_.clear();
         bytes_ = 0;
@@ -593,7 +621,9 @@ private:
     std::deque<uint64_t> serials_;          // entries_[i]'s identity, never reused
     uint64_t next_serial_ = 1, guarded_ = 0;
     bool guard_blocked_ = false;
+    size_t base_bytes() const { return base_ ? base_->bytes : 0; }
     ConversationKvReuse reuse_;
+    std::optional<Base> base_;
     ConversationDisk disk_;
     std::string last_error_;
 };

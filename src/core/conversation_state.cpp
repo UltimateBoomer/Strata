@@ -165,6 +165,7 @@ namespace strata::core {
 
 bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState& ss,
                                   const ModelGeometry& g, std::string& error) {
+    c.park_file = c.park_record = 0;   // a new running state: no park file holds it
 #if defined(STRATA_GPU_METAL)
     (void) ss; (void) g;
     return strata::metal_engine::window_checkpoint_save(c, error);
@@ -475,6 +476,19 @@ bool conversation_snapshot_stream_abandon(SessionState& ss, const ModelGeometry&
     for (size_t j = 0; j < owned_qsa(ss); ++j)
         if (!conversation_kv_settle(owned(ss, j), g, 0, error)) return false;
     return !draft || conversation_kv_settle(*draft, g, 0, error);
+}
+
+bool conversation_snapshot_keep(std::vector<std::array<uint64_t, 5>>& keep, const SessionState& ss,
+                                const ModelGeometry& g, const QsaState& draft, int64_t upto, int64_t unchanged,
+                                std::string& error) {
+    const size_t layers = owned_qsa(ss);
+    std::vector<std::array<uint64_t, 5>> out(layers + 1);
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_keep_bytes(owned(ss, j), g, upto, true, unchanged, out[j], error)) return false;
+    if (!conversation_kv_keep_bytes(draft, g, upto, false, std::max<int64_t>(0, unchanged - 1), out.back(), error))
+        return false;
+    keep = std::move(out);
+    return true;
 }
 
 bool conversation_snapshot_target_prefix(SessionKvTarget& target, int64_t upto, SessionState& ss,

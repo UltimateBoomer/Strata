@@ -4,6 +4,7 @@
 #include "conversation_copy.hpp"
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <limits>
@@ -307,6 +308,22 @@ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState&
                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
             })) return false;
     return conversation_kv_settle(st, g, upto, error);
+}
+
+bool conversation_kv_keep_bytes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
+                                int64_t unchanged, std::array<uint64_t, 5>& keep, std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error)) return false;
+    unchanged = std::clamp<int64_t>(unchanged, 0, upto);
+    const int64_t whole_cells = (unchanged / l.page_size) * l.page_size;
+    const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    for (size_t i = 0; i < 5; ++i) {
+        // as conversation_kv_save: the partial page and the indexer's moving spare row are copied again
+        keep[i] = i == 4 ? (index ? uint64_t(unchanged / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
+                         : l.cells ? uint64_t(sizes[i] / size_t(l.cells)) * uint64_t(whole_cells) : 0;
+        keep[i] = std::min<uint64_t>(keep[i], sizes[i]);
+    }
+    return true;
 }
 
 bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
