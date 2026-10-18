@@ -1135,6 +1135,13 @@ conversations keep a slot.
 advanced N tokens past the copy it would supersede; a turn that grew by a few hundred tokens keeps the older copy
 instead of writing a whole snapshot that the next turn drops. The cost is that a resume from the older copy reads up
 to N tokens again (#2265).
+`--conversation-cache-skip-tail N` (opt-in, default 0 = park it) does not park the outgoing state when a request goes
+on from one of the session's own checkpoints and at most N tokens past it are left behind: the tail its client
+rewrote, such as the last reply re-rendered without its reasoning. Parking it would write the whole conversation
+again to keep only that stale branch, which the next park drops as superseded. The cost is that a client that goes
+back to the old branch reads those N tokens again. The answers are unchanged: the session state is the same either
+way. The log line is `conversation cache: skip parking (goes on from its own checkpoint at R tokens; T tail tokens
+left behind, at most N; parked=P)`.
 `--conversation-cache-min-free-mib N` (default 2560) additionally requires that
 RAM headroom remain available: the engine checks before allocation (against the
 snapshot's estimated size, less the K/V it already retains) and again after capture.

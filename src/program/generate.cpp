@@ -725,6 +725,11 @@ struct Options {
     /// (drop_superseded) after writing the same bytes once more, so on a long single conversation every turn pays a
     /// whole-snapshot copy for nothing.  0 = park every turn, as before.
     int64_t conversation_cache_park_gain = 0;
+    /// --serve: a request that goes on from one of the session's own checkpoints does not park the outgoing state
+    /// when what it holds past that checkpoint is at most this many tokens: the client rewrote that tail (the last
+    /// reply as it was generated, re-rendered without its reasoning), and the copy would only keep the stale branch
+    /// until the next park drops it as superseded.  0 = park it, as before.
+    int64_t conversation_cache_skip_tail = 0;
     /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
     /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
     int64_t memory_limit_mib = -1;
@@ -887,6 +892,9 @@ void usage() {
                  "  --conversation-cache-park-gain N  --serve: park only after the conversation advanced N tokens past\n"
                  "                       the copy it would supersede, so a turn that grew by a few hundred tokens does not\n"
                  "                       write a whole snapshot that the next turn drops (default 0 = park every turn)\n"
+                 "  --conversation-cache-skip-tail N  --serve: a request that goes on from one of the session's own\n"
+                 "                       checkpoints does not park the outgoing state when at most N tokens past it are\n"
+                 "                       left behind (the tail its client rewrote) (default 0 = park it)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
@@ -2503,13 +2511,13 @@ int main(int argc, char** argv) {
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
-                 a == "--conversation-cache-park-gain" ||
+                 a == "--conversation-cache-park-gain" || a == "--conversation-cache-skip-tail" ||
                  a == "--session-min-free-mib" || a == "--memory-limit-mib") {
             const std::string value = next(a.c_str());
             int64_t number = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
             const int64_t limit = (a == "--conversation-cache-slots" || a == "--conversation-cache-min-tokens" ||
-                                   a == "--conversation-cache-park-gain")
+                                   a == "--conversation-cache-park-gain" || a == "--conversation-cache-skip-tail")
                                       ? INT32_MAX : INT64_MAX / (1024 * 1024);
             if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 || number > limit) {
                 std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
@@ -2519,6 +2527,7 @@ int main(int argc, char** argv) {
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
             else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = number;
             else if (a == "--conversation-cache-park-gain") o.conversation_cache_park_gain = number;
+            else if (a == "--conversation-cache-skip-tail") o.conversation_cache_skip_tail = number;
             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
             else if (a == "--memory-limit-mib") o.memory_limit_mib = number;
             else o.conversation_cache_slots = (int) number;
@@ -12281,8 +12290,22 @@ int main(int argc, char** argv) {
             const size_t park_held = o.conversation_cache_park_gain > 0
                                          ? conversations.parked_prefix_tokens(live, live_imgs, checks, cvec_cached)
                                          : 0;
-            const bool park_worth = o.conversation_cache_park_gain <= 0 || park_held == 0 ||
-                                    (int64_t) live.size() >= (int64_t) park_held + o.conversation_cache_park_gain;
+            bool park_worth = o.conversation_cache_park_gain <= 0 || park_held == 0 ||
+                              (int64_t) live.size() >= (int64_t) park_held + o.conversation_cache_park_gain;
+            // --conversation-cache-skip-tail N: this request goes on from one of the session's own checkpoints (the
+            // conversation the session holds, its client having rewritten the tail past it - the last reply re-rendered
+            // without its reasoning, say), and the outgoing state holds at most N tokens past it.  Parking would write
+            // the whole conversation again to keep only that stale branch, which the next park drops as superseded.
+            // 0 (the default) parks it, as before.
+            if (o.conversation_cache_skip_tail > 0 && park_worth && !borrow && !pin_sibling && !from_live && !incoming &&
+                !parked_file && slot_source < 0 && lent_slot < 0 && live_ok && resume > 0 &&
+                (int64_t) live.size() > resume && (int64_t) live.size() - resume <= o.conversation_cache_skip_tail) {
+                std::fprintf(stderr, "strata serve: conversation cache: skip parking (goes on from its own checkpoint "
+                                     "at %lld tokens; %lld tail tokens left behind, at most %lld; parked=%zu)\n",
+                             (long long) resume, (long long) ((int64_t) live.size() - resume),
+                             (long long) o.conversation_cache_skip_tail, conversations.size());
+                park_worth = false;
+            }
             if (borrow && !pin_sibling && park_worth) {
                 conversations.guard(parked.serial);   // parking the outgoing conversation must not evict the donor
                 const bool parked_ok = park_current(0);
