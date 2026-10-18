@@ -477,6 +477,61 @@ bool conversation_snapshot_stream_abandon(SessionState& ss, const ModelGeometry&
     return !draft || conversation_kv_settle(*draft, g, 0, error);
 }
 
+bool conversation_snapshot_target_prefix(SessionKvTarget& target, int64_t upto, SessionState& ss,
+                                         const ModelGeometry& g, const QsaState* draft, std::string& error) {
+    if (upto < 1) return fail(error, "the borrowed prefix is not inside the parked conversation");
+    SessionKvTarget whole;
+    if (!conversation_snapshot_target(whole, ss, g, draft, error)) return false;
+    SessionKvTarget t;
+    t.begin = [begin = whole.begin, upto](const SavedConversation& meta, uint64_t layers, std::string& why) {
+        if ((int64_t) meta.live.ids.size() < upto)
+            return fail(why, "the borrowed prefix is not inside the parked conversation");
+        return begin(meta, layers, why);
+    };
+    // each part's sink is the whole restore's, given only the bytes below the prefix's extent of that part
+    t.layer = [layer = whole.layer, &ss, &g, draft, upto](size_t j, const ConversationKv& header,
+                                                         std::array<uint64_t, 5>& sizes, SessionKvSink& sink,
+                                                         std::string& why) {
+        SessionKvSink all;
+        // (refuses a layer past the session's, and the draft's without a draft)
+        if (!layer(j, header, sizes, all, why)) return false;
+        const bool index = j < owned_qsa(ss);
+        std::array<uint64_t, 5> keep{};
+        if (!conversation_kv_part_sizes(index ? owned(ss, j) : *draft, g, upto, index, keep, why)) return false;
+        for (size_t i = 0; i < 5; ++i)
+            if (keep[i] > sizes[i]) return fail(why, "the borrowed prefix is beyond the K/V payload");
+        SessionKvSink s;
+        s.write = [write = all.write, keep](size_t part, size_t offset, const void* src, size_t n) {
+            if (part >= 5 || offset >= keep[part]) return true;
+            return write(part, offset, src, std::min<uint64_t>(n, keep[part] - offset));
+        };
+        s.error = all.error;
+        sink = std::move(s);
+        return true;
+    };
+    target = std::move(t);
+    return true;
+}
+
+ConversationRestore conversation_snapshot_stream_finish_prefix(const SavedConversation& meta, int64_t upto,
+                                                               SessionState& ss, const ModelGeometry& g,
+                                                               const QsaState* draft, std::string& error) {
+    if (!meta.kv.empty()) {
+        fail(error, "a streamed image holds no K/V");
+        return ConversationRestore::invalid;
+    }
+    if (!meta_validate(meta, owned_qsa(ss) + (draft ? 1 : 0), ss, g, draft, error)) return ConversationRestore::invalid;
+    if (upto < 1 || upto > (int64_t) meta.live.ids.size()) {
+        fail(error, "the borrowed prefix is not inside the parked conversation");
+        return ConversationRestore::invalid;
+    }
+    if (!sync(error)) return ConversationRestore::transfer_failed;
+    for (size_t j = 0; j < owned_qsa(ss); ++j)
+        if (!conversation_kv_settle(owned(ss, j), g, upto, error)) return ConversationRestore::transfer_failed;
+    if (draft && !conversation_kv_settle(*draft, g, upto, error)) return ConversationRestore::transfer_failed;
+    return ConversationRestore::restored;
+}
+
 // the draft layer's K/V included (the stage that owns the draft head, or no layer split)
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
                                  const QsaState& draft, size_t& bytes, std::string& error) {

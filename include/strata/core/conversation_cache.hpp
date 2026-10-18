@@ -382,7 +382,7 @@ public:
             if (serials_[i] == serial) return i;
         return SIZE_MAX;
     }
-    /// A file entry (file_of() != 0) is only its skeleton here.
+    /// A file entry (file_of() != 0) is only its skeleton here: borrow from it with borrow_with().
     const SavedConversation* find(uint64_t serial) const {
         const size_t i = index_of(serial);
         return i == SIZE_MAX ? nullptr : &entries_[i].image;
@@ -391,6 +391,34 @@ public:
     uint64_t file_of(uint64_t serial) const {
         const size_t i = index_of(serial);
         return i == SIZE_MAX ? 0 : entries_[i].file;
+    }
+    /// A borrow from a file entry: `read(file, out, why)` reads the file back (a streamed read puts the K/V wherever
+    /// its target does) and the entry stays parked with its file, its pins carried over as load_with() does.  False
+    /// with last_error() when the entry is gone or the read failed; the entry then stays too - drop() it unless the
+    /// failure says nothing about the file (no RAM to read it now).
+    template<class Read> bool borrow_with(uint64_t serial, SavedConversation& out, Read&& read) {
+        last_error_.clear();
+        const size_t i = index_of(serial);
+        if (i == SIZE_MAX || entries_[i].file == 0) {
+            last_error_ = "the parked conversation is no longer in a file";
+            return false;
+        }
+        if (!read(entries_[i].file, out, last_error_)) {
+            if (last_error_.empty()) last_error_ = "the parked conversation's file cannot be read";
+            return false;
+        }
+        const auto& skel = entries_[index_of(serial)].image;
+        if (out.checkpoints.size() == skel.checkpoints.size())
+            for (size_t k = 0; k < out.checkpoints.size(); ++k) out.checkpoints[k].pinned = skel.checkpoints[k].pinned;
+        return true;
+    }
+    /// The entry with this identity goes, and its file with it (an unreadable file a borrow met).
+    void drop(uint64_t serial) {
+        const size_t i = index_of(serial);
+        if (i == SIZE_MAX) return;
+        bytes_ -= entries_[i].bytes;
+        release(entries_[i]);
+        erase(i);
     }
     // While a borrowed entry (the donor) is being restored, parking the outgoing conversation must not evict or drop
     // it: guard() it.  When the outgoing image fits only without it, make_room refuses before evicting anything and

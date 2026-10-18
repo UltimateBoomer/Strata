@@ -8904,9 +8904,10 @@ int main(int argc, char** argv) {
         };
         // the same file read back with its K/V streamed into the session as it is read: RAM holds the running state
         // and the checkpoints, never the K/V.  `written`: K/V reached the session (then a failure leaves it partial).
+        // `kind` (optional): what kind of failure it was (memory: no RAM to read it now).
         auto park_read_streamed = [&, park_path](uint64_t file, strata::core::SavedConversation& meta,
                                                  const strata::core::SessionKvTarget& target, std::string& why,
-                                                 bool& written) {
+                                                 bool& written, strata::core::SessionError* kind = nullptr) {
             written = false;
             strata::core::SessionReadLimits limits;
             if (!park_limits(limits, why)) return false;
@@ -8915,6 +8916,7 @@ int main(int argc, char** argv) {
             const bool ok = strata::core::session_file_read_streamed(park_path(file), park_id, meta, target, bytes, why,
                                                                      limits, &st);
             written = st.target_written;
+            if (kind) *kind = st.error;
             return ok;
         };
         if (park_disk) {
@@ -12212,7 +12214,7 @@ int main(int argc, char** argv) {
             // --conversation-cache-dir: a file entry is read back only after the outgoing conversation is parked
             // (below), its K/V streamed into the session, so neither image's K/V is ever in RAM.  Parking leaves the
             // device state as it is, so a file refused before its first K/V byte still falls back to the existing
-            // prefix.  A file entry is not borrowed: the session's K/V cannot take a prefix of it without a host image.
+            // prefix.  A borrowed file entry is read the same way, only its prefix's K/V written, and keeps its file.
             std::optional<strata::core::ConversationCache::Detached> parked_file;
             auto take_parked = [&](size_t at) {
                 auto d = conversations.detach(at);
@@ -12220,7 +12222,7 @@ int main(int argc, char** argv) {
                 else incoming.emplace(conversations.load(std::move(d)));
             };
             bool borrow = stages.empty() && parked.tokens > std::max(resume, slot_tokens) &&
-                          conversations.borrows(parked) && conversations.file_of(parked.serial) == 0;
+                          conversations.borrows(parked);
             if (parked.tokens > std::max(resume, slot_tokens) && !borrow) take_parked(parked.index);
             if (incoming || parked_file || borrow) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
@@ -12249,7 +12251,8 @@ int main(int argc, char** argv) {
             }
             };
             validate_incoming();
-            if (borrow) {
+            // (a file donor is checked by its streamed read, before the first K/V byte lands)
+            if (borrow && conversations.file_of(parked.serial) == 0) {
                 const strata::core::SavedConversation* donor = conversations.find(parked.serial);
                 if (donor == nullptr ||
                     !strata::core::conversation_snapshot_validate(*donor, ss, g, use_mtp ? &mtp.kv_state() : nullptr,
@@ -12291,7 +12294,7 @@ int main(int argc, char** argv) {
                 }
                 if (blocked) {
                     // the outgoing conversation fits only in the donor's room: it keeps its place, the donor is
-                    // taken whole as before (it was validated above)
+                    // taken whole as before (it was validated above; a file is checked when it is read back)
                     std::fprintf(stderr, "strata serve: conversation cache: no room beside the parked conversation "
                                          "this request starts with; taking it instead of borrowing\n");
                     borrow = false;
@@ -12412,23 +12415,94 @@ int main(int argc, char** argv) {
                 std::printf("ERR the K/V cannot grow to the parked conversation: no VRAM is left\n");
                 return 1;
             }
+            // --conversation-cache-dir: a donor in a file is read back with only its prefix's K/V written into the
+            // session (no host image of it) and stays parked with its file; its checkpoints come back in RAM.  As for a
+            // file taken whole, one refused before its first K/V byte falls back to the existing prefix, and one that
+            // fails after leaves the session partly overwritten: the prompt is read from the start.
+            std::optional<strata::core::SavedConversation> donor_file;
+            bool borrow_streamed = false;
+            if (borrow && conversations.file_of(parked.serial) != 0) {
+                const strata::core::SavedConversation* skel = conversations.find(parked.serial);
+                // the bytes go straight into the K/V, which must hold the donor's whole file layout
+                if (!kvg_ensure((int64_t) skel->live.ids.size() + 256, kv_quiesce)) {
+                    std::printf("ERR the K/V cannot grow to the parked conversation: no VRAM is left\n");
+                    return 1;
+                }
+                const auto t_load = Clock::now();
+                const strata::core::QsaState* draft_in = use_mtp ? &mtp.kv_state() : nullptr;
+                strata::core::SessionKvTarget target;
+                strata::core::SavedConversation meta;
+                bool written = false;
+                strata::core::SessionError kind = strata::core::SessionError::none;
+                const bool targeted =
+                    strata::core::conversation_snapshot_target_prefix(target, parked.tokens, ss, g, draft_in, err);
+                const bool ok = conversations.borrow_with(parked.serial, meta,
+                    [&](uint64_t file, strata::core::SavedConversation& out, std::string& why) {
+                        if (!targeted) { why = err; return false; }
+                        return park_read_streamed(file, out, target, why, written, &kind);
+                    });
+                err.clear();
+                if (ok) {
+                    if (strata::core::conversation_snapshot_stream_finish_prefix(meta, parked.tokens, ss, g, draft_in,
+                                                                                 err) !=
+                        strata::core::ConversationRestore::restored) {
+                        // the read was checked whole: a failure here is fatal, as for a whole restore
+                        std::printf("ERR restoring a borrowed conversation prefix: %s\n", err.c_str());
+                        return 1;
+                    }
+                    std::fprintf(stderr, "strata serve: conversation cache: read %lld borrowed tokens from disk into "
+                                         "the session in %.1f ms\n", (long long) parked.tokens,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t_load).count());
+                    donor_file.emplace(std::move(meta));
+                    borrow_streamed = true;
+                } else {
+                    // no RAM to read it now says nothing about the file; anything else does, and it goes
+                    const bool keep = kind == strata::core::SessionError::memory;
+                    std::fprintf(stderr, "strata serve: conversation cache: cannot borrow from a parked file (%s)%s%s\n",
+                                 conversations.last_error().c_str(), keep ? "" : "; dropped it",
+                                 written ? "; the session was partly overwritten: reading the prompt from the start" : "");
+                    if (!keep) conversations.drop(parked.serial);
+                    borrow = false;
+                    if (written) {
+                        if (!strata::core::conversation_snapshot_stream_abandon(ss, g, draft_in, err)) {
+                            std::printf("ERR resetting the partly restored conversation: %s\n", err.c_str());
+                            return 1;
+                        }
+                        live.clear();
+                        live_imgs.clear();
+                        checks.clear();
+                        resume = 0;
+                        from_live = false;
+                    }
+                }
+            }
             if (borrow) {
                 const auto t0 = Clock::now();
-                const strata::core::SavedConversation* donor = conversations.find(parked.serial);   // still parked
+                const strata::core::SavedConversation* donor =
+                    donor_file ? &*donor_file : conversations.find(parked.serial);   // still parked
                 if (donor == nullptr ||
-                    strata::core::conversation_snapshot_restore_prefix(*donor, parked.tokens, ss, g,
-                                                                       use_mtp ? &mtp.kv_state() : nullptr, err) !=
-                        strata::core::ConversationRestore::restored) {
+                    (!borrow_streamed &&
+                     strata::core::conversation_snapshot_restore_prefix(*donor, parked.tokens, ss, g,
+                                                                        use_mtp ? &mtp.kv_state() : nullptr, err) !=
+                         strata::core::ConversationRestore::restored)) {
                     // validated above and guarded while parking: a failure here is fatal, as for a whole restore
                     std::printf("ERR restoring a borrowed conversation prefix: %s\n",
                                 err.empty() ? "gone" : err.c_str());
                     return 1;
                 }
                 // the donor's checkpoints on this prompt's path, copied: the donor keeps its own (the one at
-                // parked.tokens is mounted below, as for any checkpoint resume)
+                // parked.tokens is mounted below, as for any checkpoint resume); a file donor's read-back copies move
                 checks.clear();
-                for (const ConvCheckpoint& c : donor->checkpoints)
-                    if ((int64_t) c.ids.size() <= parked.tokens && starts_with(c.ids, c.imgs)) checks.push_back(c);
+                auto on_path = [&](const ConvCheckpoint& c) {
+                    return (int64_t) c.ids.size() <= parked.tokens && starts_with(c.ids, c.imgs);
+                };
+                if (donor_file) {
+                    for (ConvCheckpoint& c : donor_file->checkpoints)
+                        if (on_path(c)) checks.push_back(std::move(c));
+                } else {
+                    for (const ConvCheckpoint& c : donor->checkpoints)
+                        if (on_path(c)) checks.push_back(c);
+                }
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == parked.tokens) { live = c.ids; live_imgs = c.imgs; }
                 cvec_cached = donor->cvec;
@@ -12439,6 +12513,7 @@ int main(int argc, char** argv) {
                              "conversation, which stays parked, in %.1f ms; parked=%zu bytes=%zu borrowed=%zu\n",
                              (long long) resume, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes(), conversations.borrowed());
+                donor_file.reset();   // a file donor's read-back checkpoints off this prompt's path
             }
             if (incoming) {
                 const auto t0 = Clock::now();

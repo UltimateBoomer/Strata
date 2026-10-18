@@ -164,5 +164,16 @@ ConversationRestore conversation_snapshot_stream_finish(const SavedConversation&
 // read rewrote.  The session holds no conversation then; the caller reads its prompt from position 0.
 bool conversation_snapshot_stream_abandon(SessionState& session, const ModelGeometry& g, const QsaState* draft,
                                           std::string& error);
+// A borrow from a parked file (conversation_snapshot_restore_prefix without a host image): the target refuses what
+// conversation_snapshot_target refuses and a file whose live state is shorter than `upto`, and writes only the
+// leading bytes of each part that the first `upto` tokens hold (the bytes conversation_kv_restore_prefix copies); the
+// rest of the file is still read, for its hash.  After the read succeeded, conversation_snapshot_stream_finish_prefix
+// settles the K/V up to `upto`; as after restore_prefix the running state is NOT restored - the caller mounts the
+// borrowed checkpoint from `meta`'s checkpoints.  A failure with target_written leaves partial state, as above.
+bool conversation_snapshot_target_prefix(SessionKvTarget& target, int64_t upto, SessionState& session,
+                                         const ModelGeometry& g, const QsaState* draft, std::string& error);
+ConversationRestore conversation_snapshot_stream_finish_prefix(const SavedConversation& meta, int64_t upto,
+                                                               SessionState& session, const ModelGeometry& g,
+                                                               const QsaState* draft, std::string& error);
 
 } // namespace strata::core

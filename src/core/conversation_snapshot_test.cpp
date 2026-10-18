@@ -256,6 +256,50 @@ void full_session(int fmt, int mode, int experts) {
               got_state.dead==want_state.dead && got_state.block_pos==want_state.block_pos,"the same running state");
         check(untouched.live.ids==a.live.ids && equal(untouched.kv[0],a.kv[0]) && equal(untouched.kv[1],a.kv[1]),
               "the parked image is unchanged");
+        {
+            // --conversation-cache-dir: the same borrow from A's file, its prefix's K/V streamed into the session
+            namespace fs=std::filesystem;
+            const fs::path dir=fs::temp_directory_path()/("strata-borrow-test-"+std::to_string(experts)+"-"+
+                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+            fs::create_directories(dir);
+            const std::string p=(dir/"donor.conv").string();
+            const SessionFileIdentity id{3,4};
+            size_t n=0;
+            check(session_file_write(p,a,id,n,err),"write the donor's file");
+            fill(203);   // another conversation in the session
+            SessionKvTarget too_far;
+            SavedConversation m;
+            SessionStatus rs;
+            check(conversation_snapshot_target_prefix(too_far,(int64_t)a.live.ids.size()+1,ss,g,&draft.state,err) &&
+                  !session_file_read_streamed(p,id,m,too_far,n,err,{},&rs) && !rs.target_written,
+                  "a prefix past the file's live state is refused before any K/V write");
+            SessionKvTarget none;
+            check(!conversation_snapshot_target_prefix(none,0,ss,g,&draft.state,err),"an empty prefix is refused");
+            SessionKvTarget target;
+            check(conversation_snapshot_target_prefix(target,at,ss,g,&draft.state,err),"prefix target");
+            check(session_file_read_streamed(p,id,m,target,n,err,{},&rs) && rs.target_written && m.kv.empty(),
+                  "streamed prefix read");
+            check(conversation_snapshot_stream_finish_prefix(m,(int64_t)a.live.ids.size()+1,ss,g,&draft.state,err)==
+                      ConversationRestore::invalid,"finish refuses a prefix past the live state");
+            check(conversation_snapshot_stream_finish_prefix(m,at,ss,g,&draft.state,err)==ConversationRestore::restored,
+                  "streamed prefix finish");
+            check(m.checkpoints.size()==a.checkpoints.size() && m.checkpoints[0].gdn==a.checkpoints[0].gdn,
+                  "the file's checkpoints come back with their running state");
+            check(conversation_checkpoint_restore(m.checkpoints[0],ss,g,err),"mount the read-back checkpoint");
+            ConversationKv file_main,file_draft;
+            ConversationCheckpoint file_state;
+            file_state.ids=a.checkpoints[0].ids;
+            check(conversation_kv_save(file_main,main.state,g,at,true,err) &&
+                  conversation_kv_save(file_draft,draft.state,g,at,false,err) &&
+                  conversation_checkpoint_save(file_state,ss,g,err),"capture the prefix borrowed from the file");
+            check(equal(file_main,want_main) && equal(file_draft,want_draft),
+                  "file-borrowed K/V equals the whole restore's prefix");
+            check(file_state.gdn==want_state.gdn && file_state.ple==want_state.ple &&
+                  file_state.tails==want_state.tails && file_state.dead==want_state.dead &&
+                  file_state.block_pos==want_state.block_pos,"the same running state from the file");
+            std::error_code ec;
+            fs::remove_all(dir,ec);
+        }
     }
     for (int64_t dirty : {65, 3, 0}) {
         check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore growth fixture base");

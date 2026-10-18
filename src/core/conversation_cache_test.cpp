@@ -667,6 +667,52 @@ int main() {
             check(park(cache, 20, image({20}), 100) && cache.clear() == 1 && files.size() == 8 && !files.count(20),
                   "clear() (a non-finite-logits flush) removes the files it holds");
         }
+        files.clear();
+        {   // borrowing from a file entry: the sibling reads the file through the caller, the entry and file stay
+            auto cp = [](std::vector<int32_t> ids) {
+                ConversationCheckpoint c; c.ids = std::move(ids); c.gdn.resize(32, 5); return c;
+            };
+            ConversationCache cache(1000, 3);
+            disk_of(cache);
+            SavedConversation a = image({1, 2, 3, 4, 10, 11, 12, 13});
+            a.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10, 11})};
+            check(park(cache, 40, a, 300), "park subagent A to a file");
+            const auto sib = cache.best(std::vector<int32_t>{1, 2, 3, 4, 20, 21}, {}, true);
+            check(sib.tokens == 4 && cache.borrows(sib), "a sibling on A's root borrows from the file entry");
+            check(cache.file_of(sib.serial) == 40 && cache.find(sib.serial)->checkpoints[0].gdn.empty(),
+                  "file_of names the file; find() is the skeleton only");
+            check(cache.file_of(sib.serial + 100) == 0, "a gone entry has no file");
+            const size_t before = removes;
+            SavedConversation out;
+            check(cache.borrow_with(sib.serial, out, [&](uint64_t f, SavedConversation& o, std::string&) {
+                      o = files.at(f); return true; }) &&
+                  out.checkpoints.size() == 2 && out.checkpoints[0].gdn.size() == 32,
+                  "borrow_with reads the checkpoints back through the caller");
+            check(removes == before && files.count(40) && cache.size() == 1 && cache.bytes() == 300 &&
+                  cache.file_of(sib.serial) == 40, "the donor stays parked with its file");
+            // the guarded file donor survives the outgoing park's eviction; the other entry goes with its file
+            check(park(cache, 41, image({7, 7}), 300), "another parked");
+            cache.guard(sib.serial);
+            check(park(cache, 42, image({8, 8}), 300) && park(cache, 43, image({9, 9}), 300) &&
+                  cache.file_of(sib.serial) == 40 && files.count(40) && !files.count(41) && !cache.guard_blocked(),
+                  "eviction skips the guarded file donor and removes the other's file");
+            cache.unguard();
+            check(!cache.borrow_with(sib.serial, out, [](uint64_t, SavedConversation&, std::string& why) {
+                      why = "payload hash"; return false; }) &&
+                  cache.last_error() == "payload hash" && cache.file_of(sib.serial) == 40 && files.count(40),
+                  "a failed borrow read leaves the entry for the caller to judge");
+            const size_t n = cache.size(), b = cache.bytes();
+            cache.drop(sib.serial);
+            check(cache.size() == n - 1 && cache.bytes() == b - 300 && !files.count(40) &&
+                  cache.file_of(sib.serial) == 0, "drop() removes the entry and its file");
+            check(!cache.borrow_with(sib.serial, out, [](uint64_t, SavedConversation&, std::string&) { return true; }),
+                  "nothing to borrow from a dropped entry");
+            check(cache.put(image({5, 5, 5})), "a RAM entry beside the files");
+            const auto ram = cache.best(std::vector<int32_t>{5, 5, 5, 1}, {}, true);
+            check(cache.file_of(ram.serial) == 0 &&
+                      !cache.borrow_with(ram.serial, out, [](uint64_t, SavedConversation&, std::string&) { return true; }),
+                  "a RAM entry has no file and is borrowed in place, not through borrow_with");
+        }
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
