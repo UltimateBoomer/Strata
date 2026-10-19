@@ -669,7 +669,8 @@ class ConvCacheLog:
     DISK_ON = re.compile(r"conversation cache: on disk in (.+?) \(budget")
     # (a "skipped" one wrote its file too, which the cache then refused)
     DISK_PARK = re.compile(r"conversation cache: (parked|skipped) \d+ tokens in [\d.]+ ms "
-                           r"\(disk(, updated in place)?\).*?snapshot_bytes=(\d+) written_bytes=(\d+) reused_kv_bytes=(\d+)")
+                           r"\(disk(, updated in place)?(, live at its checkpoint)?[^)]*\).*?"
+                           r"snapshot_bytes=(\d+) written_bytes=(\d+) reused_kv_bytes=(\d+)")
     DISK_READ = re.compile(r"conversation cache: read (\d+) (parked|borrowed) tokens from disk into the session in "
                            r"([\d.]+) ms")
     DISK_FAIL = ("discard parked file", "cannot borrow from a parked file", "updating the parked file in place failed",
@@ -685,7 +686,8 @@ class ConvCacheLog:
     def reset(self):
         self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": None,
                       "last_tokens": None, "last_at": None, "skipped_tail": 0,
-                      "disk": {"enabled": False, "dir": None, "parks": 0, "in_place": 0, "snapshot_bytes": 0,
+                      "disk": {"enabled": False, "dir": None, "parks": 0, "in_place": 0, "live_at_checkpoint": 0,
+                               "snapshot_bytes": 0,
                                "written_bytes": 0, "reused_kv_bytes": 0, "reads": 0, "read_tokens": 0, "read_ms": 0.0,
                                "borrows": 0, "borrowed_tokens": 0, "failures": 0}}
 
@@ -747,9 +749,10 @@ class ConvCacheLog:
             if m.group(1) == "parked":
                 d["parks"] += 1
                 d["in_place"] += m.group(2) is not None
-            d["snapshot_bytes"] += int(m.group(3))
-            d["written_bytes"] += int(m.group(4))
-            d["reused_kv_bytes"] += int(m.group(5))
+                d["live_at_checkpoint"] += m.group(3) is not None
+            d["snapshot_bytes"] += int(m.group(4))
+            d["written_bytes"] += int(m.group(5))
+            d["reused_kv_bytes"] += int(m.group(6))
         elif m := self.DISK_READ.search(line):
             if m.group(2) == "parked":
                 d["reads"] += 1
@@ -3879,6 +3882,9 @@ class Service:
                 ("strata:conversation_disk_parks_total", "counter", "Conversations parked to a file", d["parks"]),
                 ("strata:conversation_disk_parks_in_place_total", "counter",
                  "Parks that updated the file the conversation was read back from", d["in_place"]),
+                ("strata:conversation_disk_parks_live_at_checkpoint_total", "counter",
+                 "Parks that kept the live state as its checkpoint's (--conversation-cache-live-tail)",
+                 d["live_at_checkpoint"]),
                 ("strata:conversation_disk_snapshot_bytes_total", "counter", "Bytes the parked snapshots hold",
                  d["snapshot_bytes"]),
                 ("strata:conversation_disk_written_bytes_total", "counter", "Bytes the parks wrote", d["written_bytes"]),

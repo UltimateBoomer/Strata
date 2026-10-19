@@ -21,8 +21,14 @@
 
 namespace strata::core {
 
+bool ParkFileState::live_is_checkpoint() const {
+    for (const auto& c : checkpoints)
+        if (c.length && c.offset == live.offset) return true;
+    return false;
+}
+
 uint64_t ParkFileState::bytes() const {
-    uint64_t n = 4096 + directory.length + live.length;
+    uint64_t n = 4096 + directory.length + (live_is_checkpoint() ? 0 : live.length);
     for (const auto& c : checkpoints) n += c.length;
     for (const auto& l : layers)
         for (const auto& p : l.parts) n += p.size;
@@ -34,7 +40,7 @@ uint64_t ParkFileState::bytes() const {
 bool park_file_write(const std::string&, uint64_t, const ParkFileState*, const SavedConversation&,
                      const std::vector<ConversationCheckpoint>&, const std::vector<SessionKvSource>&,
                      const std::vector<std::array<uint64_t, 5>>&, const std::vector<std::array<uint64_t, 5>>&, uint64_t,
-                     const std::function<void()>&, ParkFileState&, ParkWriteStats&, std::string& error) {
+                     const std::function<void()>&, ParkFileState&, ParkWriteStats&, std::string& error, int) {
     error = "park files need a POSIX system";
     return false;
 }
@@ -345,7 +351,7 @@ bool park_file_write(const std::string& path, uint64_t file, const ParkFileState
                      const std::vector<ConversationCheckpoint>& checkpoints, const std::vector<SessionKvSource>& kv,
                      const std::vector<std::array<uint64_t, 5>>& caps, const std::vector<std::array<uint64_t, 5>>& keep,
                      uint64_t min_free_bytes, const std::function<void()>& beat, ParkFileState& state,
-                     ParkWriteStats& stats, std::string& error) {
+                     ParkWriteStats& stats, std::string& error, int live_checkpoint) {
     stats = {};
     error.clear();
     auto fail = [&](const std::string& m) { if (error.empty()) error = "park file: " + m; return false; };
@@ -356,6 +362,10 @@ bool park_file_write(const std::string& path, uint64_t file, const ParkFileState
         return fail("the file to update does not have this conversation's layers");
     for (const auto& c : checkpoints)
         if (!c.stage_parts.empty()) return fail("a park file holds one session's checkpoints");
+    if (live_checkpoint >= (int) checkpoints.size() ||
+        (live_checkpoint >= 0 && (checkpoints[(size_t) live_checkpoint].ids != meta.live.ids ||
+                                  checkpoints[(size_t) live_checkpoint].imgs != meta.live.imgs)))
+        return fail("the live state is not that checkpoint's");
     File f;
     if (!f.open(path, base ? O_RDWR : (O_RDWR | O_CREAT | O_EXCL), error)) return false;
 
@@ -385,7 +395,8 @@ bool park_file_write(const std::string& path, uint64_t file, const ParkFileState
     }
     st.end = base ? base->end : at;
     for (const auto& c : checkpoints) adds += c.bytes();
-    adds += meta.live.bytes() + (4u << 20);
+    if (live_checkpoint < 0) adds += meta.live.bytes();
+    adds += 4u << 20;
     if (min_free_bytes) {
         struct statvfs fs{};
         if (::statvfs(folder_of(path).c_str(), &fs) == 0 &&
@@ -454,7 +465,8 @@ bool park_file_write(const std::string& path, uint64_t file, const ParkFileState
                 }
         if (!reused && !append(c, st.checkpoints[i])) return false;
     }
-    if (!append(meta.live, st.live)) return false;
+    if (live_checkpoint >= 0) st.live = st.checkpoints[(size_t) live_checkpoint];   // the same bytes, once
+    else if (!append(meta.live, st.live)) return false;
 
     // ---- the directory, then the superblock that names it; the records the old directory alone named go
     st.directory.offset = st.end;
@@ -472,10 +484,17 @@ bool park_file_write(const std::string& path, uint64_t file, const ParkFileState
     if (!f.write(buf.get(), kSuper, 0, error)) return false;
     stats.written += dir.size() + kSuper;
     if (base) {
-        auto gone = [&](const ParkRecord& r) { if (r.length) f.punch(r.offset, align_up(r.length)); };
+        // the records the old directory named and the new one does not: a live record that was a checkpoint's, or a
+        // checkpoint kept as the new live record, stays
+        auto named = [&](const ParkRecord& r) {
+            if (r.offset == st.live.offset || r.offset == st.directory.offset) return true;
+            for (const auto& c : st.checkpoints) if (c.offset == r.offset) return true;
+            return false;
+        };
+        auto gone = [&](const ParkRecord& r) { if (r.length && !named(r)) f.punch(r.offset, align_up(r.length)); };
         gone(base->live);
         gone(base->directory);
-        for (size_t k = 0; k < base->checkpoints.size(); ++k) if (!kept[k]) gone(base->checkpoints[k]);
+        for (const auto& c : base->checkpoints) gone(c);
     }
     state = std::move(st);
     return true;
@@ -565,7 +584,7 @@ bool park_file_read(const std::string& path, uint64_t file, SavedConversation& m
     if (in.at != dir.size()) return fail("directory holds more than it says");
     auto record_in_file = [&](const ParkRecord& r) { return r.offset >= kSuper && r.offset <= size && r.length <= size - r.offset; };
     if (!record_in_file(st.live)) return fail("a record is out of the file");
-    uint64_t need = kChunk + (1u << 20) + st.live.length;
+    uint64_t need = kChunk + (1u << 20) + st.live.length;   // (a live record that is a checkpoint's: its copy)
     for (const auto& r : st.checkpoints) {
         if (!record_in_file(r)) return fail("a record is out of the file");
         need += r.length;
@@ -573,18 +592,24 @@ bool park_file_read(const std::string& path, uint64_t file, SavedConversation& m
     std::string why;
     if (limits.admit && !limits.admit(need, why)) { stt.error = SessionError::memory; return fail(why); }
 
-    // ---- the running states, before any K/V byte is handed on
-    {
-        RecordIn r(f, buf.get(), st.live, error);
-        if (!get_state(r, m.live, limits)) { stt.error = f.kind; return false; }
-    }
+    // ---- the running states, before any K/V byte is handed on (a live record that is a checkpoint's is read once)
     m.checkpoints.resize(st.checkpoints.size());
+    int live_at = -1;
     for (size_t i = 0; i < st.checkpoints.size(); ++i) {
         RecordIn r(f, buf.get(), st.checkpoints[i], error);
         if (!get_state(r, m.checkpoints[i], limits)) { stt.error = f.kind; return false; }
         m.checkpoints[i].used = used[i];
         m.checkpoints[i].park_file = file;
         m.checkpoints[i].park_record = st.checkpoints[i].offset;
+        if (st.checkpoints[i].offset == st.live.offset && st.checkpoints[i].length == st.live.length) live_at = (int) i;
+    }
+    if (live_at >= 0) {
+        m.live = m.checkpoints[(size_t) live_at];
+        m.live.used = 0;
+        m.live.park_file = m.live.park_record = 0;
+    } else {
+        RecordIn r(f, buf.get(), st.live, error);
+        if (!get_state(r, m.live, limits)) { stt.error = f.kind; return false; }
     }
     if (target.begin && !target.begin(m, st.layers.size(), why)) return fail(why);
 

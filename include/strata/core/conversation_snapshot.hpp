@@ -116,9 +116,13 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
 // lists, but neither the K/V nor the checkpoints - the file is written with the view's checkpoints where they are
 // (session_file_write with them apart) - and `sources` one streamed source per QSA layer then the draft.  Caller has
 // synchronized and must not run the session or change the view's checkpoints until the file is written.
+// `at` (one of the view's checkpoints, on its path): the conversation as of that checkpoint instead - `meta.live`
+// gets its token and image lists but no running state (the caller writes the checkpoint's as the live one) and the
+// sources hold the K/V of its tokens only, the prefix a borrow restores.
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& session,
-                                   const ModelGeometry& g, const QsaState& draft, std::string& error);
+                                   const ModelGeometry& g, const QsaState& draft, std::string& error,
+                                   const ConversationCheckpoint* at = nullptr);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
 enum class ConversationRestore { restored, invalid, transfer_failed };

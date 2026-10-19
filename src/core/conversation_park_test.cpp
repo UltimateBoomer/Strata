@@ -322,6 +322,79 @@ int main(int argc, char** argv) {
         check(park_file_read(p, 7, out, take_all, {}, rs, err, &ss) && ss.error == SessionError::none, "the untouched file still reads");
     }
     std::error_code ec;
+    {
+        // --conversation-cache-live-tail: the live state parked as one of the checkpoints', its record shared
+        const std::string p = (dir / "live-at.park").string();
+        const SavedConversation a = image(sz);
+        SavedConversation m = meta_of(a);
+        m.live = ConversationCheckpoint{};
+        m.live.ids = a.checkpoints[1].ids;
+        m.live.imgs = a.checkpoints[1].imgs;
+        ParkFileState st, s0;
+        ParkWriteStats ws, w0;
+        check(!park_file_write(p, 60, nullptr, m, a.checkpoints, sources(a), caps(3, cap), {}, 0, beat, s0, w0, err, 0),
+              "a live state that is not that checkpoint's is refused");
+        std::filesystem::remove(p);
+        check(!park_file_write(p, 60, nullptr, m, a.checkpoints, sources(a), caps(3, cap), {}, 0, beat, s0, w0, err, 2),
+              "a checkpoint index past the chain is refused");
+        std::filesystem::remove(p);
+        check(park_file_write(p, 60, nullptr, m, a.checkpoints, sources(a), caps(3, cap), {}, 0, beat, st, ws, err, 1),
+              "park as of checkpoint 1");
+        check(st.live.offset == st.checkpoints[1].offset && st.live_is_checkpoint(), "the live record is checkpoint 1's");
+        uint64_t kv = 0;
+        for (const auto& l : sz) for (size_t n : l) kv += n;
+        check(st.bytes() == 4096 + st.directory.length + st.checkpoints[0].length + st.checkpoints[1].length + kv,
+              "the shared record is charged once");
+        {   // the same conversation with its own live state writes that record too
+            const std::string q = (dir / "live-own.park").string();
+            ParkFileState so;
+            ParkWriteStats wo;
+            check(park_file_write(q, 61, nullptr, meta_of(a), a.checkpoints, sources(a), caps(3, cap), {}, 0, beat, so, wo,
+                                  err) && wo.written > ws.written, "with its own live state it writes more");
+            check(wo.written - ws.written >= a.live.bytes(), "by the live record's size");
+        }
+        SavedConversation back;
+        ParkFileState rs;
+        check(park_file_read_image(p, 60, back, {}, rs, err), "read the file back");
+        check(same_state(back.live, a.checkpoints[1]) && back.live.park_file == 0 && back.live.used == 0,
+              "the live state read back is checkpoint 1's");
+        check(back.checkpoints.size() == 2 && same_state(back.checkpoints[1], a.checkpoints[1]) &&
+              back.checkpoints[1].park_file == 60, "and checkpoint 1 is still itself, naming its record");
+        // an update in place with a live state of its own: the shared record stays (checkpoint 1 still names it)
+        SavedConversation b = a;
+        b.live = state({1, 2, 3, 4, 5, 6, 7}, 3000, 70);
+        std::vector<ConversationCheckpoint> chain = back.checkpoints;
+        chain.push_back(state({1, 2, 3, 4, 5}, 3000, 80));
+        ParkFileState su;
+        ParkWriteStats wu;
+        check(park_file_write(p, 60, &rs, meta_of(b), chain, sources(b), caps(3, cap), {}, 0, beat, su, wu, err),
+              "update in place with its own live state");
+        check(wu.kept_checkpoints == 2 && !su.live_is_checkpoint() && su.checkpoints[1].offset == st.checkpoints[1].offset,
+              "both checkpoints kept, the live state its own record");
+        SavedConversation back2;
+        ParkFileState rs2;
+        check(park_file_read_image(p, 60, back2, {}, rs2, err) && same_state(back2.checkpoints[1], a.checkpoints[1]) &&
+              same_state(back2.live, b.live) && same_state(back2.checkpoints[2], chain[2]),
+              "the record the old live state shared was not punched out");
+        // and again, as of the newest (kept) checkpoint: the live record punched, its checkpoint's shared
+        SavedConversation m3 = meta_of(b);
+        m3.live = ConversationCheckpoint{};
+        m3.live.ids = chain[2].ids;
+        m3.live.imgs = chain[2].imgs;
+        ParkFileState s3;
+        ParkWriteStats w3;
+        check(park_file_write(p, 60, &rs2, m3, back2.checkpoints, sources(b), caps(3, cap), {}, 0, beat, s3, w3, err, 2),
+              "update in place as of the kept checkpoint 2");
+        check(w3.kept_checkpoints == 3 && s3.live.offset == s3.checkpoints[2].offset &&
+              s3.bytes() == 4096 + s3.directory.length + s3.checkpoints[0].length + s3.checkpoints[1].length +
+                                s3.checkpoints[2].length + kv, "nothing written for the live state, charged once");
+        SavedConversation back3;
+        ParkFileState rs3;
+        check(park_file_read_image(p, 60, back3, {}, rs3, err) && same_state(back3.live, chain[2]) &&
+              same_state(back3.checkpoints[2], chain[2]) && same_state(back3.checkpoints[0], a.checkpoints[0]),
+              "it reads back as of checkpoint 2");
+    }
+
     fs::remove_all(dir, ec);
     std::printf("conversation_park_test: %d checks passed\n", checks);
 }

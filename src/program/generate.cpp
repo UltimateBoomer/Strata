@@ -731,6 +731,11 @@ struct Options {
     /// reply as it was generated, re-rendered without its reasoning), and the copy would only keep the stale branch
     /// until the next park drops it as superseded.  0 = park it, as before.
     int64_t conversation_cache_skip_tail = 0;
+    /// --conversation-cache-dir: park a conversation as of its deepest checkpoint when its live state is at most this
+    /// many tokens past it, the file's live record then being that checkpoint's (a running state is ~118 MB: half of
+    /// what an update in place writes).  A client that goes on from the exact live state reads those tokens again;
+    /// one that re-sends its last reply edited (its reasoning dropped) goes on from the checkpoint anyway.  0 = off.
+    int64_t conversation_cache_live_tail = 0;
     /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
     /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
     int64_t memory_limit_mib = -1;
@@ -897,6 +902,9 @@ void usage() {
                  "  --conversation-cache-skip-tail N  --serve: a request that goes on from one of the session's own\n"
                  "                       checkpoints does not park the outgoing state when at most N tokens past it are\n"
                  "                       left behind (the tail its client rewrote) (default 0 = park it)\n"
+                 "  --conversation-cache-live-tail N  --serve, with --conversation-cache-dir: park a conversation as of\n"
+                 "                       its deepest checkpoint when its live state is at most N tokens past it, so the\n"
+                 "                       file stores that running state once (default 0 = park the live state)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
@@ -2514,12 +2522,13 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
                  a == "--conversation-cache-park-gain" || a == "--conversation-cache-skip-tail" ||
-                 a == "--session-min-free-mib" || a == "--memory-limit-mib") {
+                 a == "--conversation-cache-live-tail" || a == "--session-min-free-mib" || a == "--memory-limit-mib") {
             const std::string value = next(a.c_str());
             int64_t number = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
             const int64_t limit = (a == "--conversation-cache-slots" || a == "--conversation-cache-min-tokens" ||
-                                   a == "--conversation-cache-park-gain" || a == "--conversation-cache-skip-tail")
+                                   a == "--conversation-cache-park-gain" || a == "--conversation-cache-skip-tail" ||
+                                   a == "--conversation-cache-live-tail")
                                       ? INT32_MAX : INT64_MAX / (1024 * 1024);
             if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 || number > limit) {
                 std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
@@ -2530,6 +2539,7 @@ int main(int argc, char** argv) {
             else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = number;
             else if (a == "--conversation-cache-park-gain") o.conversation_cache_park_gain = number;
             else if (a == "--conversation-cache-skip-tail") o.conversation_cache_skip_tail = number;
+            else if (a == "--conversation-cache-live-tail") o.conversation_cache_live_tail = number;
             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
             else if (a == "--memory-limit-mib") o.memory_limit_mib = number;
             else o.conversation_cache_slots = (int) number;
@@ -9082,8 +9092,31 @@ int main(int argc, char** argv) {
                 strata::core::SavedConversation meta;
                 std::vector<strata::core::SessionKvSource> sources;
                 std::string why;
+                // --conversation-cache-live-tail N: the deepest checkpoint on the live path, at most N tokens behind
+                // it, is what the file keeps as the live state (its record serves both)
+                int live_at = -1;
+                if (o.conversation_cache_live_tail > 0) {
+                    auto on_path = [&](const ConvCheckpoint& c) {
+                        if (c.ids.empty() || c.ids.size() > live.size() ||
+                            !std::equal(c.ids.begin(), c.ids.end(), live.begin())) return false;
+                        size_t k = 0;   // its images: those of the live path that start before its end
+                        for (const auto& im : live_imgs)
+                            if (im.start < (int64_t) c.ids.size() && (k >= c.imgs.size() || !(c.imgs[k++] == im)))
+                                return false;
+                        return k == c.imgs.size();
+                    };
+                    for (size_t i = 0; i < view.checkpoints.size(); ++i)
+                        if (on_path(view.checkpoints[i]) &&
+                            (live_at < 0 || view.checkpoints[i].ids.size() > view.checkpoints[(size_t) live_at].ids.size()))
+                            live_at = (int) i;
+                    if (live_at >= 0 && (int64_t) (live.size() - view.checkpoints[(size_t) live_at].ids.size()) >
+                                            o.conversation_cache_live_tail)
+                        live_at = -1;
+                }
+                const ConvCheckpoint* at = live_at >= 0 ? &view.checkpoints[(size_t) live_at] : nullptr;
+                const int64_t park_tokens = at ? (int64_t) at->ids.size() : (int64_t) live.size();
                 strata::core::SessionReadLimits caps;   // the regions a new file reserves: each part at --max-context
-                if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(), err) ||
+                if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(), err, at) ||
                     !park_limits(caps, why)) {
                     give_up();
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n",
@@ -9093,7 +9126,7 @@ int main(int argc, char** argv) {
                 }
                 // what each K/V part still shares with the base: the pages before the first token written since
                 std::vector<std::array<uint64_t, 5>> keep;
-                if (base && !strata::core::conversation_snapshot_keep(keep, ss, g, mtp.kv_state(), (int64_t) live.size(),
+                if (base && !strata::core::conversation_snapshot_keep(keep, ss, g, mtp.kv_state(), park_tokens,
                                                                       base->unchanged, why)) {
                     keep.clear();   // (then every byte is written again)
                     why.clear();
@@ -9105,7 +9138,7 @@ int main(int argc, char** argv) {
                 strata::core::ParkWriteStats ws;
                 bool ok = strata::core::park_file_write(park_path(file), file, base ? &park_base_state : nullptr, meta,
                                                         view.checkpoints, sources, caps.max_kv_bytes, keep, min_free,
-                                                        beat, fs, ws, why);
+                                                        beat, fs, ws, why, live_at);
                 const bool in_place = ok && base;
                 if (!ok && base) {
                     // the update failed part-way and the file is torn: a new one instead
@@ -9116,7 +9149,7 @@ int main(int argc, char** argv) {
                     why.clear();
                     file = ++park_seq;
                     ok = strata::core::park_file_write(park_path(file), file, nullptr, meta, view.checkpoints, sources,
-                                                       caps.max_kv_bytes, {}, min_free, beat, fs, ws, why);
+                                                       caps.max_kv_bytes, {}, min_free, beat, fs, ws, why, live_at);
                 }
                 if (!ok) {
                     drop_file(file);
@@ -9125,12 +9158,15 @@ int main(int argc, char** argv) {
                 }
                 const bool stored = conversations.put_file(strata::core::conversation_skeleton(meta, view.checkpoints),
                                                            file, (size_t) fs.bytes(), held);
-                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms (disk%s); parked=%zu "
+                const std::string at_note = at ? ", live at its checkpoint, " +
+                                                     std::to_string((int64_t) live.size() - park_tokens) + " tail tokens"
+                                               : std::string();
+                std::fprintf(stderr, "strata serve: conversation cache: %s %lld tokens in %.1f ms (disk%s%s); parked=%zu "
                                      "bytes=%zu evictions=%zu snapshot_bytes=%llu written_bytes=%llu "
                                      "reused_kv_bytes=%llu kept_checkpoints=%zu\n",
-                             stored ? "parked" : "skipped", live.size(),
+                             stored ? "parked" : "skipped", (long long) park_tokens,
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
-                             in_place ? ", updated in place" : "", conversations.size(), conversations.bytes(),
+                             in_place ? ", updated in place" : "", at_note.c_str(), conversations.size(), conversations.bytes(),
                              conversations.evictions(), (unsigned long long) fs.bytes(),
                              (unsigned long long) ws.written, (unsigned long long) ws.kept_kv, ws.kept_checkpoints);
                 return true;

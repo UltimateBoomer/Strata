@@ -315,6 +315,55 @@ void full_session(int fmt, int mode, int experts) {
             std::error_code ec;
             fs::remove_all(dir,ec);
         }
+        {
+            // --conversation-cache-live-tail: A parked as of its checkpoint - no live state copied, its K/V up to the
+            // checkpoint, the live record the checkpoint's - reads back as restoring A whole and rewinding there
+            namespace fs=std::filesystem;
+            const fs::path dir=fs::temp_directory_path()/("strata-live-at-test-"+std::to_string(experts)+"-"+
+                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+            fs::create_directories(dir);
+            const std::string p=(dir/"at.park").string();
+            check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,
+                  "restore A to park it as of its checkpoint");
+            SavedConversation pm;
+            std::vector<SessionKvSource> src;
+            ConversationCheckpoint off_path=a.checkpoints[0]; off_path.ids.back()+=1;
+            check(!conversation_snapshot_sources(pm,src,view,ss,g,draft.state,err,&off_path),
+                  "a checkpoint off the session's path is refused");
+            SessionReadLimits caps;
+            ParkFileState pst;
+            ParkWriteStats pws;
+            check(conversation_session_read_limits(caps,ss,g,draft.state,(uint64_t)ss.max_cells,8,err) &&
+                  conversation_snapshot_sources(pm,src,view,ss,g,draft.state,err,&view.checkpoints[0]),
+                  "sources as of the checkpoint");
+            check(pm.live.ids==a.checkpoints[0].ids && pm.live.gdn.empty() && src.size()==a.kv.size(),
+                  "its token list, no running state copied");
+            std::array<uint64_t,5> at_sizes{};
+            check(conversation_kv_part_sizes(main.state,g,at,true,at_sizes,err) && src[0].sizes==at_sizes,
+                  "the K/V of the checkpoint's tokens only");
+            check(park_file_write(p,9,nullptr,pm,view.checkpoints,src,caps.max_kv_bytes,{},0,{},pst,pws,err,0) &&
+                  pst.live_is_checkpoint(),"park file with the checkpoint's record as the live one");
+            fill(205);   // another conversation in the session
+            SessionKvTarget t;
+            SavedConversation m;
+            SessionStatus rs;
+            check(conversation_snapshot_target(t,ss,g,&draft.state,err) && park_file_read(p,9,m,t,caps,pst,err,&rs) &&
+                  conversation_snapshot_stream_finish(m,ss,g,&draft.state,err)==ConversationRestore::restored,
+                  "read it back into the session");
+            ConversationKv at_main,at_draft;
+            ConversationCheckpoint at_state;
+            at_state.ids=a.checkpoints[0].ids;
+            check(conversation_kv_save(at_main,main.state,g,at,true,err) &&
+                  conversation_kv_save(at_draft,draft.state,g,at,false,err) &&
+                  conversation_checkpoint_save(at_state,ss,g,err),"capture what it restored");
+            check(equal(at_main,want_main) && equal(at_draft,want_draft),
+                  "its K/V equals restoring A whole and rewinding to the checkpoint");
+            check(at_state.gdn==want_state.gdn && at_state.ple==want_state.ple && at_state.tails==want_state.tails &&
+                  at_state.dead==want_state.dead && at_state.block_pos==want_state.block_pos,
+                  "and so does its running state");
+            std::error_code ec;
+            fs::remove_all(dir,ec);
+        }
     }
     for (int64_t dirty : {65, 3, 0}) {
         check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore growth fixture base");

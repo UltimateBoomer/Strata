@@ -9,7 +9,8 @@
 //
 //   [0, 4096)      superblock: magic STRPARK\x01, version, generation, the directory's offset, length and hash
 //   regions        layer j's part p (k, v, k_scale, v_scale, pooled) at a 4 KiB-aligned offset, a hash per MiB
-//   records        the live running state and each checkpoint, appended at 4 KiB-aligned offsets, each hashed
+//   records        the live running state and each checkpoint, appended at 4 KiB-aligned offsets, each hashed;
+//                  the live record may be one of the checkpoints' (a conversation parked at its checkpoint)
 //   directory      geometry, layer range, cvec, the records in chain order, each layer's header and regions
 //
 // An update writes only what changed: each part's bytes past the prefix the caller says is unchanged (`keep`, the rule
@@ -50,8 +51,10 @@ struct ParkFileState {
     ParkRecord live, directory;
     std::vector<ParkRecord> checkpoints;   // in the order of the conversation's checkpoints
     std::vector<ParkLayer> layers;
-    // what the file holds that is in use: the budget charges this (regions' used bytes, records, directory)
+    // what the file holds that is in use: the budget charges this (regions' used bytes, records, directory; a live
+    // record that is a checkpoint's counts once)
     uint64_t bytes() const;
+    bool live_is_checkpoint() const;
 };
 struct ParkWriteStats {
     uint64_t written = 0;        // bytes written to the file (K/V, records, directory, superblock)
@@ -65,13 +68,15 @@ inline constexpr uint64_t kParkHashBlock = 1ull << 20;
 // (its K/V empty: `kv` supplies it, one source per layer); `checkpoints`: the chain to keep.  `caps[j][p]`: the most
 // layer j's part p can hold, the region a new file reserves.  `keep[j][p]`: the leading bytes of that part unchanged
 // since `base` was written or read (ignored without a base).  `min_free_bytes`: the free-space preflight, as a SAVE's.
-// `beat`: called after every block moved.  On success `state` describes the file; on failure the file may be torn and
-// the caller removes it.
+// `beat`: called after every block moved.  `live_checkpoint` (>= 0): the live running state IS checkpoints[i]'s (the
+// conversation parked as of that checkpoint: meta.live has its token and image lists and no state), so the live record
+// is that checkpoint's and nothing more is written for it.  On success `state` describes the file; on failure the file
+// may be torn and the caller removes it.
 bool park_file_write(const std::string& path, uint64_t file, const ParkFileState* base, const SavedConversation& meta,
                      const std::vector<ConversationCheckpoint>& checkpoints, const std::vector<SessionKvSource>& kv,
                      const std::vector<std::array<uint64_t, 5>>& caps, const std::vector<std::array<uint64_t, 5>>& keep,
                      uint64_t min_free_bytes, const std::function<void()>& beat, ParkFileState& state,
-                     ParkWriteStats& stats, std::string& error);
+                     ParkWriteStats& stats, std::string& error, int live_checkpoint = -1);
 
 // Reads the file back with its K/V streamed: `meta` gets the running state and the checkpoints (each marked with this
 // file and its record, so an update keeps them), the K/V goes to `target`, layer by layer, each block checked against

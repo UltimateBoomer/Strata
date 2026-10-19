@@ -331,15 +331,18 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
 
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
-                                   const QsaState& draft, std::string& error) {
+                                   const QsaState& draft, std::string& error, const ConversationCheckpoint* at) {
     if (!view_validate(view, ss, g, error) || !sync(error)) return false;
+    if (at && (at->ids.size() > view.ids.size() || !std::equal(at->ids.begin(), at->ids.end(), view.ids.begin())))
+        return fail(error, "the checkpoint to save at is not on the session's path");
     SavedConversation captured;
     captured.geometry = geometry_key(g);
     captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
-    captured.live.ids = view.ids; captured.live.imgs = view.images;
+    captured.live.ids = at ? at->ids : view.ids; captured.live.imgs = at ? at->imgs : view.images;
     captured.cvec = view.cvec;   // the checkpoints stay in the view: the file is written from them where they are
-    if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
-    const int64_t upto = (int64_t) view.ids.size();
+    // `at`: the live running state is that checkpoint's (the caller writes it from there), none is copied
+    if (!at && !conversation_checkpoint_save(captured.live, ss, g, error)) return false;
+    const int64_t upto = (int64_t) captured.live.ids.size();
     const size_t layers = owned_qsa(ss);
     std::vector<SessionKvSource> out(layers + 1);
     for (size_t j = 0; j < layers; ++j)

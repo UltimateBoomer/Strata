@@ -229,7 +229,8 @@ class ConversationCacheCard(unittest.TestCase):
             "evictions=0 snapshot_bytes=1000000000 written_bytes=1000000000 reused_kv_bytes=0 kept_checkpoints=0\n"
             "strata serve: conversation cache: read 18000 parked tokens from disk into the session in 571.8 ms\n"
             "strata serve: conversation cache: restored 18000 tokens (checkpoint) in 26.0 ms; parked=0 bytes=1000000000\n"
-            "strata serve: conversation cache: parked 18542 tokens in 153.6 ms (disk, updated in place); parked=1 "
+            "strata serve: conversation cache: parked 18542 tokens in 153.6 ms (disk, updated in place, live at its "
+            "checkpoint, 31 tail tokens); parked=1 "
             "bytes=1110012576 evictions=0 snapshot_bytes=1110012576 written_bytes=240618592 "
             "reused_kv_bytes=278720640 kept_checkpoints=5\n"
             "strata serve: conversation cache: skip parking (goes on from its own checkpoint at 18300 tokens; "
@@ -252,7 +253,7 @@ class ConversationCacheCard(unittest.TestCase):
             st = c.poll(str(log), 0)
             disk = st["disk"]
             self.assertEqual((disk["enabled"], disk["dir"]), (True, "/data/convcache"))
-            self.assertEqual((disk["parks"], disk["in_place"]), (2, 1))
+            self.assertEqual((disk["parks"], disk["in_place"], disk["live_at_checkpoint"]), (2, 1, 1))
             self.assertEqual((disk["snapshot_bytes"], disk["written_bytes"], disk["reused_kv_bytes"]),
                              (2110012676, 1240618692, 278720640))
             self.assertEqual((disk["reads"], disk["read_tokens"], disk["borrows"], disk["borrowed_tokens"]),
