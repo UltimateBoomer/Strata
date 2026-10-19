@@ -210,9 +210,11 @@ function renderConvCache(c) {
   if (!c) return;                                  // an older server
   const pct = (a, b) => (b ? `${Math.min(100, (100 * a) / b)}%` : "0%");
   $("cc-bars").hidden = !c.enabled;
+  const d = c.disk && c.disk.enabled ? c.disk : null;   // --conversation-cache-dir: parked in files
   if (c.enabled) {
-    $("cc-slots-text").textContent = `${fmt(c.parked)} / ${fmt(c.slots)}`;
-    $("cc-slots-bar").style.width = pct(c.parked, c.slots);
+    $("cc-slots-text").textContent = c.slots != null ? `${fmt(c.parked)} / ${fmt(c.slots)}` : `${fmt(c.parked)} (no slot limit)`;
+    $("cc-slots-bar").style.width = c.slots != null ? pct(c.parked, c.slots) : "0%";
+    $("cc-mem-label").textContent = d ? "Their files (disk)" : "Their memory (RAM)";
     const budget = c.budget_mib * 1048576;
     $("cc-mem-text").textContent = `${gb(c.bytes)} / ${gb(budget)} GB`;
     $("cc-mem-bar").style.width = pct(c.bytes, budget);
@@ -225,6 +227,10 @@ function renderConvCache(c) {
     ["Reused since start", c.requests ? `${fmt(c.reused_tokens)} tokens${share}` : null],
     ["Parked / restored", c.enabled ? `${fmt(c.parks)} / ${fmt(c.restores)}${c.evictions ? ` · ${fmt(c.evictions)} evicted` : ""}` : null],
     ["Last switch", c.enabled ? event : null],
+    ["Disk writes", d && d.parks ? `${gb(d.written_bytes)} of ${gb(d.snapshot_bytes)} GB written (${fmt((100 * d.written_bytes) / Math.max(1, d.snapshot_bytes))}%) · ${fmt(d.in_place)} of ${fmt(d.parks)} parks in place` : null],
+    ["Disk reads", d && (d.reads || d.borrows) ? `${fmt(d.reads)} read back (${fmt(d.read_tokens)} tokens${d.reads ? `, ${fmt(d.read_ms / d.reads)} ms each` : ""}) · ${fmt(d.borrows)} borrowed` : null],
+    ["Tail skips", c.skipped_tail ? `${fmt(c.skipped_tail)} parks skipped (rewritten tail)` : null],
+    ["Disk failures", d && d.failures ? fmt(d.failures) : null],
   ]);
   $("cc-note").textContent = c.enabled
     ? "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full."

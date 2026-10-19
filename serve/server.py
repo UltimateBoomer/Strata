@@ -665,20 +665,38 @@ class ConvCacheLog:
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
+    # --conversation-cache-dir: the file tier's own lines (a park's bytes, a read back, a borrow, a file refused)
+    DISK_ON = re.compile(r"conversation cache: on disk in (.+?) \(budget")
+    # (a "skipped" one wrote its file too, which the cache then refused)
+    DISK_PARK = re.compile(r"conversation cache: (parked|skipped) \d+ tokens in [\d.]+ ms "
+                           r"\(disk(, updated in place)?\).*?snapshot_bytes=(\d+) written_bytes=(\d+) reused_kv_bytes=(\d+)")
+    DISK_READ = re.compile(r"conversation cache: read (\d+) (parked|borrowed) tokens from disk into the session in "
+                           r"([\d.]+) ms")
+    DISK_FAIL = ("discard parked file", "cannot borrow from a parked file", "updating the parked file in place failed",
+                 "skip parking (file:")
+    SKIP_TAIL = "skip parking (goes on from its own checkpoint"
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
 
     def __init__(self):
         self.key, self.pos = None, 0
+        self.lock = threading.Lock()                    # /metrics and /metrics/prometheus both read on
         self.reset()
 
     def reset(self):
         self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": None,
-                      "last_tokens": None, "last_at": None}
+                      "last_tokens": None, "last_at": None, "skipped_tail": 0,
+                      "disk": {"enabled": False, "dir": None, "parks": 0, "in_place": 0, "snapshot_bytes": 0,
+                               "written_bytes": 0, "reused_kv_bytes": 0, "reads": 0, "read_tokens": 0, "read_ms": 0.0,
+                               "borrows": 0, "borrowed_tokens": 0, "failures": 0}}
 
     def poll(self, path, start) -> dict:
         """The state after the log's new lines; `start` is where the engine's current run began in it."""
+        with self.lock:
+            return self.poll_locked(path, start)
+
+    def poll_locked(self, path, start) -> dict:
         if not path or start is None:
-            return dict(self.state)
+            return {**self.state, "disk": dict(self.state["disk"])}
         if self.key != (path, start):                   # another start of the engine: its cache starts empty
             self.key, self.pos = (path, start), start
             self.reset()
@@ -692,13 +710,14 @@ class ConvCacheLog:
                 f.seek(self.pos)
                 data = f.read(size - self.pos)
         except OSError:
-            return dict(self.state)
+            return {**self.state, "disk": dict(self.state["disk"])}
         end = data.rfind(b"\n") + 1                     # whole lines only: the rest is read next time
         self.pos += end
         now = time.time()
         for line in data[:end].decode("utf-8", "replace").splitlines():
             if "conversation cache:" not in line:
                 continue
+            self.disk_line(line)
             m = self.EVENT.search(line)
             if m:
                 st = self.state
@@ -712,7 +731,33 @@ class ConvCacheLog:
             m = self.DROPPED.search(line)
             if m:
                 self.state["parked"] = int(m.group(1))
-        return dict(self.state)
+        return {**self.state, "disk": dict(self.state["disk"])}
+
+    def disk_line(self, line: str):
+        """The file tier's counters: what its parks wrote against their snapshots' size (an update in place writes
+        only what changed), what was read back or borrowed from it, and the files refused."""
+        d = self.state["disk"]
+        if self.SKIP_TAIL in line:
+            self.state["skipped_tail"] += 1
+        if any(f in line for f in self.DISK_FAIL):
+            d["failures"] += 1
+        if m := self.DISK_ON.search(line):
+            d["enabled"], d["dir"] = True, m.group(1)
+        elif m := self.DISK_PARK.search(line):
+            if m.group(1) == "parked":
+                d["parks"] += 1
+                d["in_place"] += m.group(2) is not None
+            d["snapshot_bytes"] += int(m.group(3))
+            d["written_bytes"] += int(m.group(4))
+            d["reused_kv_bytes"] += int(m.group(5))
+        elif m := self.DISK_READ.search(line):
+            if m.group(2) == "parked":
+                d["reads"] += 1
+                d["read_tokens"] += int(m.group(1))
+                d["read_ms"] += float(m.group(3))
+            else:
+                d["borrows"] += 1
+                d["borrowed_tokens"] += int(m.group(1))
 
 
 def conversation_slots(engine) -> int | None:
@@ -733,8 +778,11 @@ def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict) 
     --conversation-cache-mib: budget, slots, what its log says) and how much of the prompts the cache gave back."""
     mib = info.get("conversation_cache_mib")
     last = hist[-1] if hist else None
+    slots = info.get("conversation_cache_slots")
+    if slots == 0 and (parked.get("disk") or {}).get("enabled"):
+        slots = None                                    # --conversation-cache-dir with slots 0: no slot limit
     return {"enabled": isinstance(mib, int) and mib > 0, "budget_mib": mib if isinstance(mib, int) else None,
-            "slots": info.get("conversation_cache_slots"), **parked,
+            "slots": slots, **parked,
             "requests": len(hist), "requests_reused": sum(1 for r in hist if (r.get("reused") or 0) > 0),
             "reused_tokens": totals.get("reused", 0), "prompt_tokens": totals.get("prompt_tokens", 0),
             "last_reused": last.get("reused") if last else None,
@@ -3822,6 +3870,36 @@ class Service:
             ("strata:drafts_accepted_total", "counter", "Speculative draft tokens accepted", t["drafts_accepted"]),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
         ]
+        cc = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+        d = cc["disk"]
+        if d["enabled"]:                                # --conversation-cache-dir: the file tier
+            rows += [
+                ("strata:conversation_disk_parked", "gauge", "Conversations parked in files", cc["parked"]),
+                ("strata:conversation_disk_bytes", "gauge", "Bytes the parked files hold", cc["bytes"]),
+                ("strata:conversation_disk_parks_total", "counter", "Conversations parked to a file", d["parks"]),
+                ("strata:conversation_disk_parks_in_place_total", "counter",
+                 "Parks that updated the file the conversation was read back from", d["in_place"]),
+                ("strata:conversation_disk_snapshot_bytes_total", "counter", "Bytes the parked snapshots hold",
+                 d["snapshot_bytes"]),
+                ("strata:conversation_disk_written_bytes_total", "counter", "Bytes the parks wrote", d["written_bytes"]),
+                ("strata:conversation_disk_reused_kv_bytes_total", "counter",
+                 "K/V bytes an update in place left as they were", d["reused_kv_bytes"]),
+                ("strata:conversation_disk_reads_total", "counter", "Parked files read back into the session",
+                 d["reads"]),
+                ("strata:conversation_disk_read_tokens_total", "counter", "Tokens read back from parked files",
+                 d["read_tokens"]),
+                ("strata:conversation_disk_read_seconds_total", "counter", "Time spent reading parked files back",
+                 d["read_ms"] / 1000),
+                ("strata:conversation_disk_borrows_total", "counter",
+                 "Prefixes a new conversation borrowed from a parked file", d["borrows"]),
+                ("strata:conversation_disk_failures_total", "counter",
+                 "Parked files refused, unreadable or not written", d["failures"]),
+                ("strata:conversation_cache_skipped_tail_total", "counter",
+                 "Parks skipped because the client rewrote only the tail (--conversation-cache-skip-tail)",
+                 cc["skipped_tail"]),
+                ("strata:conversation_disk_evictions_total", "counter", "Parked files evicted for the budget",
+                 cc["evictions"]),
+            ]
         return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
                        for name, kind, help_, value in rows)
 

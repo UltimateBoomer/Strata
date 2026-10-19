@@ -222,6 +222,77 @@ class ConversationCacheCard(unittest.TestCase):
             self.assertEqual(c.poll(str(log), log.stat().st_size)["parked"], 0)   # the engine started again
             self.assertEqual(c.poll(None, None)["parked"], 0)
 
+    # --conversation-cache-dir: the file tier's lines, as an engine writes them
+    DISK = ("strata serve: conversation cache: on disk in /data/convcache (budget 16384 MiB, unlimited slots); "
+            "0 files of an earlier run removed, in 0.1 ms\n"
+            "strata serve: conversation cache: parked 18000 tokens in 400.0 ms (disk); parked=1 bytes=1000000000 "
+            "evictions=0 snapshot_bytes=1000000000 written_bytes=1000000000 reused_kv_bytes=0 kept_checkpoints=0\n"
+            "strata serve: conversation cache: read 18000 parked tokens from disk into the session in 571.8 ms\n"
+            "strata serve: conversation cache: restored 18000 tokens (checkpoint) in 26.0 ms; parked=0 bytes=1000000000\n"
+            "strata serve: conversation cache: parked 18542 tokens in 153.6 ms (disk, updated in place); parked=1 "
+            "bytes=1110012576 evictions=0 snapshot_bytes=1110012576 written_bytes=240618592 "
+            "reused_kv_bytes=278720640 kept_checkpoints=5\n"
+            "strata serve: conversation cache: skip parking (goes on from its own checkpoint at 18300 tokens; "
+            "242 tail tokens left behind, at most 4096; parked=1)\n"
+            "strata serve: conversation cache: read 9000 borrowed tokens from disk into the session in 210.0 ms\n"
+            "strata serve: conversation cache: discard parked file (park file: K/V block hash mismatch)\n"
+            "strata serve: conversation cache: skipped 500 tokens in 9.0 ms (disk); parked=1 bytes=1110012576 "
+            "evictions=0 snapshot_bytes=100 written_bytes=100 reused_kv_bytes=0 kept_checkpoints=0\n")
+
+    def test_the_disk_tier(self):
+        from serve.server import ConvCacheLog
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "strata.log"
+            log.write_text("", encoding="utf-8")
+            c = ConvCacheLog()
+            self.assertFalse(c.poll(str(log), 0)["disk"]["enabled"])
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(self.DISK)
+            st = c.poll(str(log), 0)
+            disk = st["disk"]
+            self.assertEqual((disk["enabled"], disk["dir"]), (True, "/data/convcache"))
+            self.assertEqual((disk["parks"], disk["in_place"]), (2, 1))
+            self.assertEqual((disk["snapshot_bytes"], disk["written_bytes"], disk["reused_kv_bytes"]),
+                             (2110012676, 1240618692, 278720640))
+            self.assertEqual((disk["reads"], disk["read_tokens"], disk["borrows"], disk["borrowed_tokens"]),
+                             (1, 18000, 1, 9000))
+            self.assertAlmostEqual(disk["read_ms"], 571.8)
+            self.assertEqual((disk["failures"], st["skipped_tail"]), (1, 1))
+            self.assertEqual((st["parked"], st["bytes"], st["parks"], st["restores"]), (1, 1110012576, 2, 1))
+            st["disk"]["parks"] = 99                    # a copy: the caller cannot change the parser's state
+            self.assertEqual(c.poll(str(log), 0)["disk"]["parks"], 2)
+
+    def test_disk_metrics(self):
+        import tempfile
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, "Thought.</think>\nHello.", max_context=4096)
+        engine.info = {"conversation_cache_mib": 16384, "conversation_cache_slots": 0}
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "strata.log"
+            log.write_text(self.DISK, encoding="utf-8")
+            engine.log_path, engine.log_start = str(log), 0
+            svc = Service(engine, tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+            httpd = serve(svc, port=0)
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            try:
+                with urllib.request.urlopen(base + "/metrics", timeout=10) as r:
+                    c = json.loads(r.read())["conversation_cache"]
+                with urllib.request.urlopen(base + "/metrics/prometheus", timeout=10) as r:
+                    text = r.read().decode()
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+        self.assertEqual((c["slots"], c["disk"]["enabled"], c["disk"]["in_place"]), (None, True, 1))
+        m = {line.split()[0]: float(line.split()[1]) for line in text.splitlines() if not line.startswith("#")}
+        self.assertEqual(m["strata:conversation_disk_parks_total"], 2)
+        self.assertEqual(m["strata:conversation_disk_parks_in_place_total"], 1)
+        self.assertEqual(m["strata:conversation_disk_written_bytes_total"], 1240618692)
+        self.assertEqual(m["strata:conversation_disk_bytes"], 1110012576)
+        self.assertEqual(m["strata:conversation_disk_borrows_total"], 1)
+        self.assertEqual(m["strata:conversation_cache_skipped_tail_total"], 1)
+        self.assertAlmostEqual(m["strata:conversation_disk_read_seconds_total"], 0.5718)
+
     def test_metrics(self):
         tok = ByteTokenizer()
         engine = MockEngine(tok, "Thought.</think>\nHello.", max_context=4096)
@@ -252,7 +323,7 @@ class ConversationCacheCard(unittest.TestCase):
     def test_the_card_is_on_the_page(self):
         web = Path(__file__).parent / "web"
         html, js = (web / "index.html").read_text(encoding="utf-8"), (web / "app.js").read_text(encoding="utf-8")
-        for el in ("cc-card", "cc-slots-text", "cc-mem-text", "cc-facts", "cc-note"):
+        for el in ("cc-card", "cc-slots-text", "cc-mem-label", "cc-mem-text", "cc-facts", "cc-note"):
             self.assertIn(f'id="{el}"', html)
             self.assertIn(f'"{el}"', js)
 
