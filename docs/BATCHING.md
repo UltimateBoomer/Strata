@@ -156,6 +156,33 @@ card, 4 from 32 GB or on a split such as 2 x 16 GB; IQ3_S needs 32 GB or a split
 card alone) it stays at one at a time and setup says: "parallel N reduces waiting for several users but costs
 about 10-25% speed per request on this card". `--parallel N` is honoured as asked either way.
 
+## Keeping a conversation on the engine for a time slice (`"turn_slice_s"`, opt-in)
+
+Several clients taking turns (an agent and its subagents, two harnesses) interleave their requests, and every switch
+to another conversation has a cost: one request at a time, the engine parks the outgoing conversation and reads the
+incoming one back (with `--conversation-cache-dir`, a file written and a file read); with `"parallel"`, a new
+conversation in a slot pushes out the one the slot held. `"turn_slice_s": S` in the run config lets the conversation
+the engine holds keep its place for S seconds of engine time: a waiting request that continues it (its prompt shares
+most of what the engine holds) goes before one that would push it out, even one that arrived earlier.
+
+- **One request at a time** (no `"parallel"`): the lane is the engine's session; the slice counts the time each of the
+  conversation's requests held the turn since it took over. Without a slice the turn goes to whichever request takes
+  the lock first; with one, waiting requests also go in arrival order otherwise.
+- **`"parallel": N`**: the lanes are the batch slots. A new request goes in arrival order when it pushes nobody out
+  (it continues a slot's conversation, or a slot is empty); when every slot holds a conversation, the next turn of a
+  slot's conversation within its slice is admitted first. The slice counts each admission's time, from `BGEN` to
+  `BDONE`. It replaces `STRATA_ADMIT_SHORT_FIRST`'s order while set.
+- **Never stopped for it**: a turn changes hands between requests only; a long request runs to its end.
+- **Nobody starves**: a request that has waited `"turn_max_wait_s"` (default 120; 0 = no limit) goes next.
+- Time, not tokens: what the other clients wait is time, and a switch costs about a fixed time (a park and a
+  read-back), so a slice of S seconds bounds the switching overhead to that cost over S. A prompt read (~1-2K
+  tokens/s) and a generated token (~30/s) would weigh the same in a token count.
+- `/metrics` shows the single turn's state under `"turns"` (slice, time used, waiting, switches, turns kept).
+
+```json
+"turn_slice_s": 30
+```
+
 ## How the server uses the slots
 
 - **One request alone** runs on the usual solo path (verify windows with MTP drafts): the fastest single stream.
