@@ -1151,6 +1151,12 @@ again to keep only that stale branch, which the next park drops as superseded. T
 back to the old branch reads those N tokens again. The answers are unchanged: the session state is the same either
 way. The log line is `conversation cache: skip parking (goes on from its own checkpoint at R tokens; T tail tokens
 left behind, at most N; parked=P)`.
+`--conversation-cache-live-tail N` (opt-in, default 0 = park the live state) parks a conversation as of its deepest
+checkpoint when its live state is at most N tokens past it: the file's live record is that checkpoint's, so the running
+state (~118 MB here) is written once, not twice. An update in place then writes about half as much (130 MB instead of
+248 MB per park on a 12-15K-token agent conversation). A client that goes on from the exact live state reads those N
+tokens again; one that re-sends its last reply edited (its reasoning dropped) goes on from that checkpoint anyway. The
+park line then says `live at its checkpoint, T tail tokens`.
 `--conversation-cache-min-free-mib N` (default 2560) additionally requires that
 RAM headroom remain available: the engine checks before allocation (against the
 snapshot's estimated size, less the K/V it already retains) and again after capture.
