@@ -77,6 +77,7 @@ from serve import launch_identity  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import lifeline  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
+from serve.turns import Turn, TurnPolicy, call_timeout_s, cited_calls, timeout_units, turns_from_config  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
@@ -1034,6 +1035,8 @@ class StrataEngine:
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
         self.progress_ms = 0             # PP's own milliseconds since the prompt started (its third field)
         self.reused = 0                  # RESUME: prompt tokens not read again (a client takes them out of the work)
+        # "turn_slice_s" with "parallel" (serve/turns.py): orders the new requests' admissions; None = off
+        self.turn_policy = None
         self.silent_note = None
         self.last_err = None
         try:                            # a ready-made engine's BUILD.json says its version
@@ -1194,6 +1197,10 @@ class StrataEngine:
         # the slot that has its start (the engine checks it again); when the slot was last used
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
         self.slot_used = [0.0] * self.batch
+        # "turn_slice_s" (serve/turns.py): the engine time each slot's conversation has used since it took the slot,
+        # and the response (Turn) last admitted to it
+        self.slot_turn_used = [0.0] * self.batch
+        self.slot_turn: list[Turn | None] = [None] * self.batch
         self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
         # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
         # while requests still wait on it (they hold these very objects), so it is made once and kept: new ones
@@ -1706,11 +1713,14 @@ class StrataEngine:
 
     YIELDS_MAX = 2   # #656: how often one request's prompt read gives way to a shorter waiting one
 
-    def _take_control(self, cancel, plen: int, after_epoch: int | None = None, new: bool = False):
+    def _take_control(self, cancel, plen: int, after_epoch: int | None = None, new: bool = False, turn=None):
         """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
         `after_epoch`: a request whose read gave way lets the requests waiting then go first.
-        `new`: the request's first admission (STRATA_ADMIT_SHORT_FIRST orders only these)."""
-        entry = [plen, time.monotonic(), new]           # (length, arrival, ordered: STRATA_ADMIT_SHORT_FIRST)
+        `new`: the request's first admission (STRATA_ADMIT_SHORT_FIRST and the turn slice order only these); `turn`:
+        its response (serve/turns.py's Turn: which slot's conversation it continues)."""
+        # (length, arrival, ordered: STRATA_ADMIT_SHORT_FIRST / turn slice, Turn)
+        entry = [plen, time.monotonic(), new, turn]
+        ordered = new and (ADMIT_SHORT_FIRST > 0 or self.turn_policy is not None)
         with self.slot_cv:
             self.waiting += 1
             self.wait_lens.append(entry)
@@ -1727,11 +1737,11 @@ class StrataEngine:
                     raise EngineDied("the engine stopped while this request waited; it was not sent")
                 with self.slot_cv:
                     turn = after_epoch is None or self.ctl_epoch > after_epoch or self.waiting <= 1
-                    if turn and new and ADMIT_SHORT_FIRST > 0:
+                    if turn and ordered:
                         turn = self._admit_next() is entry
                 left = deadline - time.monotonic() if deadline is not None else 0.5
                 if turn and left > 0 and self.ctl.acquire(timeout=min(0.5, left)):
-                    if new and ADMIT_SHORT_FIRST > 0:
+                    if ordered:
                         with self.slot_cv:              # a shorter one came while this one waited in acquire()
                             first = self._admit_next() is entry
                         if not first:
@@ -1773,6 +1783,13 @@ class StrataEngine:
         ordered = [e for e in self.wait_lens if len(e) > 2 and e[2]]
         if not ordered:
             return None
+        if self.turn_policy is not None:
+            # "turn_slice_s": a slot's conversation keeps its slot for its slice (serve/turns.py); the lanes are the
+            # slots' held conversations (the response last admitted to each), room is a free slot that holds none
+            waiting = [(e, e[3] if len(e) > 3 else None, e[1]) for e in sorted(ordered, key=lambda e: e[1])]
+            lanes = [(self.slot_turn[b], self.slot_turn_used[b]) for b in range(self.batch) if self.slot_held[b]]
+            room = any(not self.slot_busy[b] and not self.slot_held[b] for b in range(self.batch))
+            return self.turn_policy.pick(waiting, lanes, room)
         return min(ordered, key=lambda e: (0 if e[0] <= ADMIT_SHORT_FIRST or now - e[1] >= ADMIT_MAX_WAIT_S else 1,
                                            e[1]))
 
@@ -1794,7 +1811,7 @@ class StrataEngine:
         with self.slot_cv:
             return any(e[0] * 2 <= plen for e in self.wait_lens)
 
-    def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None, turn=None):
         """--batch.  Alone (no slot busy, nobody waiting): the solo path (GEN, with drafts: the fastest stream)
         - and when another request arrives meanwhile, this one is STOPped and continues in a batch slot (BGEN with
         its prompt + what it generated: the engine reuses that prefix).  Otherwise: BGEN into a free slot, then the
@@ -1813,7 +1830,7 @@ class StrataEngine:
         prompt, left = list(ids), int(max_new)
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
-        ok = yield from self._take_control(cancel, len(prompt), new=True)
+        ok = yield from self._take_control(cancel, len(prompt), new=True, turn=turn)
         if not ok:
             return
         holding, born = True, self.gen                  # (the engine it now has the control lines of)
@@ -1972,6 +1989,11 @@ class StrataEngine:
                     started = getattr(cancel, "_strata_queue_started", None)
                     if started is not None:
                         started()
+                    if self.turn_policy is not None:        # the turn slice: a new conversation starts the slot's count
+                        if not TurnPolicy.continues(turn, self.slot_turn[slot]):
+                            self.slot_turn_used[slot] = 0.0
+                        self.slot_turn[slot] = turn
+                        admit_at = time.monotonic()
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
                     phase = "admit"
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
@@ -2068,6 +2090,8 @@ class StrataEngine:
                         self._apply_bdone(f)
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
+                        if self.turn_policy is not None:    # what this admission used of the slot's slice
+                            self.slot_turn_used[slot] += time.monotonic() - admit_at
                         if f[3:4] == ["nonfinite"]:              # #879: the engine dropped the slot's state
                             self.slot_held[slot] = []
                             raise EngineNonFinite("the engine's logits became non-finite (#879)")
@@ -2212,7 +2236,7 @@ class StrataEngine:
                          "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
         return view
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, turn=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
@@ -2220,7 +2244,7 @@ class StrataEngine:
             raise EngineDied("the engine is unavailable; this request was not sent")
         bias_api.validate_request(sampling or {}, self, None)
         if getattr(self, "batch", 0):
-            yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
+            yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings, turn)
             return
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
@@ -3736,6 +3760,12 @@ class Service:
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
+        # the config's "turn_slice_s" (opt-in, one request at a time): the conversation in the engine keeps the turn
+        # for that much engine time before another takes it (serve/turns.py); None = whoever takes self.fifo first
+        self.turns = None
+        # the turn slice: this request's response (serve/turns.py's Turn: the call IDs its tool results answer, set by
+        # the handler; the calls it makes, added as they are written)
+        self.request_turn = threading.local()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -4520,6 +4550,7 @@ class Service:
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
+                **({"turns": self.turns.view()} if self.turns is not None else {}),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
@@ -4952,20 +4983,31 @@ class Service:
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
             declared_only=False) -> Iterator[tuple[str, object]]:
-        """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits."""
+        """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits.
+        With "turn_slice_s", the IDs of the calls it writes are its Turn's (all runs of one HTTP request share it)."""
         ka = self.keep_awake
         if ka is not None:
             ka.acquire()
+        call, units = None, {}
+        if self.turns is not None or getattr(self.engine, "turn_policy", None) is not None:
+            call = getattr(self.request_turn, "turn", None) or Turn()
+            units = timeout_units(tools)                # each tool's timeout argument and its unit
         try:
-            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only)
+            for kind, x in self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only, call):
+                if call is not None and kind == "event" and getattr(x, "call", None) is not None:  # a call written
+                    call.issued.add(x.call.id)
+                    call.tools.add(x.call.name)
+                    call.timeout_s = max(call.timeout_s, call_timeout_s(x.call.arguments, units.get(x.call.name)))
+                yield kind, x
         finally:
             if ka is not None:
                 ka.release()
 
     def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
-             declared_only=False) -> Iterator[tuple[str, object]]:
+             declared_only=False, call=None) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
-        `force` (forced_call): the opening of the call the reply must make - see prepare()."""
+        `force` (forced_call): the opening of the call the reply must make - see prepare().  `call`: the request's
+        Turn with "turn_slice_s" (serve/turns.py), else None."""
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
         defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
@@ -5078,23 +5120,32 @@ class Service:
                 # a stream idle timeout does not abort a healthy queued request (and its retry read the prompt again);
                 # a client that left while queued gives its place up instead of taking the turn only to cancel there
                 got = False
-                while not got:
-                    if cancel.is_set():
-                        raise QueueCancelled("the client disconnected while waiting for the engine")
-                    left = deadline - time.monotonic() if deadline is not None else QUEUE_BEAT_S
-                    if left <= 0:
-                        raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                    got = self.fifo.acquire(timeout=min(QUEUE_BEAT_S, left))
-                    if got:
+                turns = self.turns
+                ticket = turns.enter(call) if turns is not None else None
+                try:
+                    while not got:
                         if cancel.is_set():
-                            self.fifo.release()
                             raise QueueCancelled("the client disconnected while waiting for the engine")
-                        if deadline is not None and time.monotonic() >= deadline:
-                            self.fifo.release()
+                        left = deadline - time.monotonic() if deadline is not None else QUEUE_BEAT_S
+                        if left <= 0:
                             raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                        turn.callback(self.fifo.release)
-                    else:
-                        yield "ping", None
+                        wait = min(QUEUE_BEAT_S, left)
+                        got = turns.acquire(ticket, wait) if turns is not None else self.fifo.acquire(timeout=wait)
+                        if got:
+                            # with the turn slice, the time it held the turn counts against its slice
+                            release = turns.release if turns is not None else self.fifo.release
+                            if cancel.is_set():
+                                release()
+                                raise QueueCancelled("the client disconnected while waiting for the engine")
+                            if deadline is not None and time.monotonic() >= deadline:
+                                release()
+                                raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                            turn.callback(release)
+                        else:
+                            yield "ping", None
+                finally:
+                    if ticket is not None and not got:  # it gave its place up (cancelled, expired, its client gone)
+                        turns.leave(ticket)
             with turn:
                 try:
                     with self.status_lock:
@@ -5138,8 +5189,10 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
-                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                        extra = {"embeddings": emb} if emb else {}
+                        if getattr(self.engine, "turn_policy", None) is not None:
+                            extra["turn"] = call            # the batch admissions' turn slice
+                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, **extra)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
@@ -6691,6 +6744,8 @@ def make_handler(svc: Service):
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
+                    # the turn slice: the calls this request's tool results answer (serve/turns.py)
+                    svc.request_turn.turn = Turn(cited_calls(path, req))
                 if path == "/v1/responses":
                     self._responses(req)
                 elif path.startswith("/slots/"):
@@ -6762,6 +6817,7 @@ def make_handler(svc: Service):
                 if reserved:
                     svc.release_inference()
                 svc.drop_embeddings()                        # the images' file of a request that never got to run()
+                svc.request_turn.turn = None
                 if self.watch_done is not None:
                     self.watch_done.set()
                 if self.cancel_event is not None:
@@ -8313,6 +8369,17 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         per_replica = requested if isinstance(requested, int) and not isinstance(requested, bool) and requested > 0 else 1
         svc.requested_slots = per_replica * len(groups) if groups else per_replica
     svc.answer_room = cfg.get("answer_room") is not False
+    turns, note = turns_from_config(cfg, svc.fifo)
+    from serve.replicas import ReplicaEngine
+    if turns is not None and isinstance(engine, ReplicaEngine):
+        # the turn slice keeps one engine's conversation; replicas each hold their own and route by prompt
+        turns, note = None, '"turn_slice_s" is ignored with replicas: each replica keeps its own conversations'
+    if isinstance(turns, TurnPolicy):                   # "parallel": the engine orders its batch admissions
+        engine.turn_policy = turns
+    else:
+        svc.turns = turns
+    if note:
+        print(f"[strata] {note}", flush=True)
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
         icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))

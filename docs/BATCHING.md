@@ -156,6 +156,58 @@ card, 4 from 32 GB or on a split such as 2 x 16 GB; IQ3_S needs 32 GB or a split
 card alone) it stays at one at a time and setup says: "parallel N reduces waiting for several users but costs
 about 10-25% speed per request on this card". `--parallel N` is honoured as asked either way.
 
+## Keeping a conversation on the engine for a time slice (`"turn_slice_s"`, opt-in)
+
+Several clients taking turns (an agent and its subagents, two harnesses) interleave their requests, and every switch
+to another conversation has a cost: one request at a time, the engine parks the outgoing conversation and reads the
+incoming one back (with `--conversation-cache-dir`, a file written and a file read); with `"parallel"`, a new
+conversation in a slot pushes out the one the slot held. `"turn_slice_s": S` in the run config lets the conversation
+the engine holds keep its place for S seconds of engine time: a waiting request that continues it goes before one that
+would push it out, even one that arrived earlier.
+
+- **What continues a conversation**: the next step of the response the engine last ran for it, the request whose tool
+  results answer a call that response made. The server mints every call's ID and the client sends it back with the
+  result (`tool_call_id`, Anthropic's `tool_use_id`, the Responses API's `call_id`), so the match is exact: no prompt
+  comparison, and an agent and a subagent with the same system prompt are never taken for one conversation. A new
+  user message starts a turn of its own (a switch), and so does a retry.
+
+- **One request at a time** (no `"parallel"`): the lane is the engine's session; the slice counts the time each of the
+  conversation's requests held the turn since it took over. Without a slice the turn goes to whichever request takes
+  the lock first; with one, waiting requests also go in arrival order otherwise.
+- **`"parallel": N`**: the lanes are the batch slots. A new request goes in arrival order when it pushes nobody out
+  (it continues a slot's conversation, or a slot is empty); when every slot holds a conversation, the next turn of a
+  slot's conversation within its slice is admitted first. The slice counts each admission's time, from `BGEN` to
+  `BDONE`. It replaces `STRATA_ADMIT_SHORT_FIRST`'s order while set.
+- **Held for the follow-up** (`"turn_hold_s"`, default 3; one request at a time only): a response's follow-up can only
+  arrive after the response has ended, and a request already waiting would take the turn at once. So when a response
+  that made tool calls ends within its slice, the turn waits up to `turn_hold_s` for the request that answers them;
+  nothing else takes it meanwhile. Most tools return within that (in Claude Code transcripts, 9 in 10 Bash calls
+  without a timeout came back within 3 s), and a switch costs seconds. A longer tool outlasts the hold and the turn
+  moves on. Not held for:
+  - calls to `"turn_hold_skip_tools"`, by default Claude Code's `Agent`, `Task`, `AskUserQuestion`, `ExitPlanMode`,
+    `WebFetch`, `WebSearch` and Hermes Agent's `delegate_task`, `clarify`, `kanban_block`: a subagent's requests are
+    what its call waits on, a question waits for a person, and Claude Code's web calls rarely return in time (pi's
+    `web_search` and `fetch_content` mostly do, so they are held for);
+  - a call whose timeout argument is above `"turn_hold_skip_timeout_s"` (default 120): the model asks for a long
+    timeout when it expects a long command. The unit is read from the tool's schema in the request (Claude Code's
+    `Bash`: milliseconds; pi's `bash` and Hermes Agent's `terminal`: seconds), and a call in the background
+    (`run_in_background`, `background`) returns at once whatever its timeout. Hermes Agent tells its model to set the
+    timeout generously (default 180), so a Hermes `terminal` call with one is seldom held for.
+
+  Alone, the hold costs nothing: the follow-up takes the turn as it arrives.
+- **Never stopped for it**: a turn changes hands between requests only; a long request runs to its end.
+- **Nobody starves**: a request that has waited `"turn_max_wait_s"` (default 120; 0 = no limit) goes next.
+- Time, not tokens: what the other clients wait is time, and a switch costs about a fixed time (a park and a
+  read-back), so a slice of S seconds bounds the switching overhead to that cost over S. A prompt read (~1-2K
+  tokens/s) and a generated token (~30/s) would weigh the same in a token count.
+- `/metrics` shows the single turn's state under `"turns"`: slice, time used, waiting, switches, turns kept, and the
+  hold's `holding`, `hold_hits` (the follow-up took a held turn while another request waited), `hold_misses` (a hold
+  ran out on a request waiting behind it) and `hold_idle_s` (the engine idle in a hold while a request waited).
+
+```json
+"turn_slice_s": 30
+```
+
 ## How the server uses the slots
 
 - **One request alone** runs on the usual solo path (verify windows with MTP drafts): the fastest single stream.

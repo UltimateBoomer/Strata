@@ -486,6 +486,24 @@ class ParallelService(FakeEngineCase):
         self.assertEqual(self.chat("next turn")["choices"][0]["message"]["content"], "ok, done.")
         self.assertEqual(self.get("/v1/telemetry")["work"]["admission_reserved"], 0)
 
+    def test_queue_timeout_with_the_turn_slice_leaves_no_ticket(self):
+        """"turn_slice_s": the single turn's wait goes through serve/turns.py; an expired wait gives its place up."""
+        from serve.turns import turns_from_config
+        self.start(1)
+        self.svc.turns, _ = turns_from_config({"turn_slice_s": 600}, self.svc.fifo)
+        self.svc.queue_timeout_s = 0.12
+        self.svc.max_queue = 1
+        self.svc.fifo.acquire()
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                self.chat("waiting for serial turn")
+            self.assertEqual(caught.exception.code, 429)
+            self.assertEqual(self.svc.turns.view()["waiting"], 0, "the expired request left the turn queue")
+        finally:
+            self.svc.fifo.release()
+        self.assertEqual(self.chat("next turn")["choices"][0]["message"]["content"], "ok, done.")
+        self.assertEqual(self.svc.turns.view()["waiting"], 0)
+
     def test_queue_timeout_parallel_control_and_stream_formats(self):
         self.start(2)
         self.svc.queue_timeout_s = 0.12
