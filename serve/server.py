@@ -77,7 +77,8 @@ from serve import launch_identity  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import lifeline  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
-from serve.turns import Turn, TurnPolicy, call_timeout_s, cited_calls, timeout_units, turns_from_config  # noqa: E402
+from serve.turns import (Turn, TurnPolicy, call_timeout_s, cited_calls, request_priority,  # noqa: E402
+                         request_session, timeout_units, turns_from_config)
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
@@ -2235,6 +2236,20 @@ class StrataEngine:
                          "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
                          "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
         return view
+
+    def stop_now(self) -> bool:
+        """STOPs the running request (one at a time) without closing its stream: the engine ends it at its next step,
+        the tokens it writes until then still come, then its DONE.  The turn's priorities preempt with it
+        (serve/turns.py), so the next pass's prompt holds every token the engine wrote and continues its live
+        conversation exactly.  False: this engine cannot (it does not honour STOP, or it runs batch slots)."""
+        if not self.can_stop or getattr(self, "batch", 0) or not self.alive():
+            return False
+        try:
+            self.proc.stdin.write("STOP\n")
+            self.proc.stdin.flush()
+        except OSError:
+            return False
+        return True
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None, turn=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
@@ -4588,6 +4603,19 @@ class Service:
             ("strata:drafts_accepted_total", "counter", "Speculative draft tokens accepted", t["drafts_accepted"]),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
         ]
+        tv = self.turns.view() if self.turns is not None else {}
+        if tv:                                          # the turn slice and its priorities (serve/turns.py)
+            rows += [("strata:turn_switches_total", "counter", "Turns that went to another conversation",
+                      tv["switches"]),
+                     ("strata:turn_hold_idle_seconds_total", "counter",
+                      "Seconds the engine stood idle holding the turn for a follow-up", tv["hold_idle_s"])]
+            pv = tv.get("priority")
+            if pv:
+                rows += [("strata:priority_preemptions_total", "counter",
+                          "Running requests stopped for a request of a better priority", pv["preemptions"]),
+                         ("strata:priority_reserve_idle_seconds_total", "counter",
+                          "Seconds the engine stood idle while a session's reservation kept worse bands out",
+                          pv["reserve_idle_s"])]
         cc = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         d = cc["disk"]
         if d["enabled"]:                                # --conversation-cache-dir: the file tier
@@ -5003,6 +5031,13 @@ class Service:
             if ka is not None:
                 ka.release()
 
+    def _preempt_stop(self) -> bool:
+        """A better-priority request waits (serve/turns.py): STOP the engine and read on to its DONE (True), or, with
+        an engine that cannot be told so, False: the caller leaves the stream, which STOPs it and drops what it wrote
+        meanwhile (the next pass reads those tokens again)."""
+        stop = getattr(self.engine, "stop_now", None)
+        return bool(stop is not None and stop())
+
     def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
              declared_only=False, call=None) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
@@ -5115,13 +5150,16 @@ class Service:
         try:
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
             turn = contextlib.ExitStack()
+            ticket, held = None, [False]       # the turn slice's ticket; the turn is this request's (not preempted)
             if not par:
                 # #1619: a request waiting for the single turn sends a keep-alive every QUEUE_BEAT_S, so a client with
                 # a stream idle timeout does not abort a healthy queued request (and its retry read the prompt again);
                 # a client that left while queued gives its place up instead of taking the turn only to cancel there
                 got = False
                 turns = self.turns
-                ticket = turns.enter(call) if turns is not None else None
+                # a one-shot call ("strata_checkpoint": false) keeps no state to go on from: never preempted
+                ticket = turns.enter(call, preemptible=(sampling or {}).get("strata_checkpoint") is not False) \
+                    if turns is not None else None
                 try:
                     while not got:
                         if cancel.is_set():
@@ -5140,7 +5178,8 @@ class Service:
                             if deadline is not None and time.monotonic() >= deadline:
                                 release()
                                 raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                            turn.callback(release)
+                            held[0] = True
+                            turn.callback(lambda: held[0] and release())
                         else:
                             yield "ping", None
                 finally:
@@ -5195,6 +5234,7 @@ class Service:
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, **extra)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
+                        preempted = False               # a better-priority request waits: give the turn back
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
                         opens = False                   # the thinking is over: write the forced call's opening
                         try:
@@ -5208,6 +5248,10 @@ class Service:
                                     last_print = self._progress(last_print, st=st)
                                     last_out = time.perf_counter()
                                     yield "ping", None
+                                    if ticket is not None and ticket.preempt.is_set() and not preempted:
+                                        preempted = True    # while reading the prompt: at its next chunk
+                                        if not self._preempt_stop():
+                                            break
                                     continue
                                 n += 1
                                 if first_engine_token_s is None:
@@ -5278,6 +5322,10 @@ class Service:
                                         force = None    # the model is writing a call of its own
                                     elif parser.state == "content" and not parser.buf and not detok.pending():
                                         opens = True
+                                        break
+                                if ticket is not None and ticket.preempt.is_set() and not preempted and n < max_new:
+                                    preempted = True
+                                    if not self._preempt_stop():
                                         break
                         except EngineNonFinite:
                             nonfinite = True
@@ -5350,6 +5398,37 @@ class Service:
                             print(f"[strata] repeated reasoning detected at {n} tokens "
                                   f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
                                   "instruction (reasoning_loop_recovery)", flush=True)
+                            continue
+                        if preempted and not cancel.is_set() and finish != "stop" and n < max_new and \
+                                not (repeated or looped or wrap or opens):
+                            # serve/turns.py's priorities: a request a band better waits.  The engine stopped where it
+                            # was and keeps what it read and wrote as its live conversation (parked once the other
+                            # one starts): give the turn back, wait for it again, and go on from the same tokens.
+                            # The parser and the stream go on as they were: the client sees a pause.
+                            print(f"[strata] preempted after {n} tokens: a request of a better priority waits; this "
+                                  "one goes on once it gets the turn back", flush=True)
+                            with self.status_lock:
+                                st = dict(st)   # the status is the next holder's meanwhile: this one keeps its own
+                            held[0] = False
+                            turns.release(preempted=True)
+                            turns.requeue(ticket)
+                            got = False
+                            try:
+                                while not cancel.is_set():
+                                    got = turns.acquire(ticket, QUEUE_BEAT_S)
+                                    if got:
+                                        break
+                                    yield "ping", None
+                            finally:
+                                if not got:
+                                    turns.leave(ticket)
+                            if not got:
+                                break                   # its client left while it waited: "cancel"
+                            held[0] = True
+                            with self.status_lock:
+                                self.status.update(st)
+                                st = self.status
+                            prompt = prompt + seg
                             continue
                         if (self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
                                 and not answered and not wrap and not opens and parser.state == "reasoning"
@@ -6744,8 +6823,10 @@ def make_handler(svc: Service):
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
-                    # the turn slice: the calls this request's tool results answer (serve/turns.py)
-                    svc.request_turn.turn = Turn(cited_calls(path, req))
+                    # the turn slice: the calls this request's tool results answer, and its priority and session
+                    # (serve/turns.py)
+                    svc.request_turn.turn = Turn(cited_calls(path, req), priority=request_priority(req, self.headers),
+                                                 session_key=request_session(req, self.headers))
                 if path == "/v1/responses":
                     self._responses(req)
                 elif path.startswith("/slots/"):

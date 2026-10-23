@@ -40,9 +40,35 @@ runs in the background returns at once whatever its timeout.
 Time, not tokens: what the other clients wait is time, and a switch costs about a fixed time (a park and a read-back),
 so a slice of T seconds bounds the switching overhead to that cost over T.  A token count would weigh a prompt read
 (~1-2K tokens/s) and a generated token (~30/s) alike.
+
+Priorities (one request at a time; "priority": false turns them off).  A request may say how urgent it is:
+"strata_priority" in its body or an X-Strata-Priority header, -20 to 19 like Unix nice, lower first (default
+"priority_default", 0; a claim better than "priority_floor" is raised to it).  Its conversation is a session: the
+one "strata_session" (or X-Strata-Session, or Anthropic's metadata.user_id) names, else the one whose calls its tool
+results answer, else a new one; the session's priority is its latest request's.  The scheduler is a fair one in the
+manner of CFS, in bands:
+- each session's virtual time grows by the engine time it uses times 1.25^priority (a session 3 better gets about
+  twice the share), and a session that comes back after a pause starts no lower than the least of those waiting, so a
+  pause banks no credit;
+- the band is every request less than "priority_preempt_delta" (default 5) worse than the best one waiting (aged, see
+  below) or the session the turn is reserved for: the rest wait.  Within the band, a request that continues the lane
+  within its slice goes first (as above), else the least virtual time;
+- once a response of a session made tool calls, the turn is reserved for its follow-up: the requests outside its band
+  wait until it ends a response with no calls (its turn is over), its calls are ones it does not hold for (the skipped
+  tools, a long timeout: it is yielding), or "priority_reserve_s" (default 60) runs out.  A request of the band waits
+  for the follow-up only as long as the hold (turn_hold_s) says;
+- a request that is a band better than the running one stops it ("priority_preempt"): "full" once the running one has
+  had the turn for "priority_min_run_s" (default 2), "timeout" once the better one has waited
+  "priority_preempt_timeout_s" (default 10), "off" never (it waits for the request to end).  The stopped request
+  gives the turn back and waits again; when it gets it back the engine goes on from what it had read and written (its
+  conversation parked meanwhile), and its client sees only a pause;
+- a waiting request gains a step of priority for every "priority_aging_s" (default 30; 0: off) it waits, so a
+  session in a worse band still gets the turn in the end; it is not stopped by one less than a band better than the
+  priority it took the turn with.  turn_max_wait_s applies within the band.
 """
 from __future__ import annotations
 
+import collections
 import itertools
 import re
 import threading
@@ -63,6 +89,18 @@ HOLD_SKIP_TOOLS = (
 TIMEOUT_KEYS = (("timeout", None), ("timeout_ms", 0.001), ("timeout_s", 1.0), ("timeout_sec", 1.0),
                 ("timeout_seconds", 1.0))
 BACKGROUND_KEYS = ("run_in_background", "background")   # Claude Code's Bash; Hermes Agent's terminal
+PRIORITY_MIN, PRIORITY_MAX = -20, 19
+PREEMPT_MODES = ("full", "timeout", "off")
+SESSION_IDLE_S = 3600.0         # a named session not seen for this long is forgotten
+
+
+@dataclass(eq=False)
+class Session:
+    """A conversation as the priorities see it: its priority (its latest request's) and its virtual engine time."""
+    key: object = None
+    priority: int = 0
+    vruntime: float = 0.0
+    seen: float = 0.0
 
 
 @dataclass(eq=False)
@@ -73,6 +111,73 @@ class Turn:
     issued: set = field(default_factory=set)
     tools: set = field(default_factory=set)       # the names of the tools it called
     timeout_s: float = 0.0                        # the longest "timeout" one of its calls asked for (call_timeout_s)
+    priority: int | None = None                   # the request's strata_priority (None: its session's, or the default)
+    session_key: str | None = None                # the request's strata_session (None: found by its tool results)
+    session: Session | None = None                # set by the scheduler as the request enters
+
+
+def _header(headers, name):
+    try:
+        return headers.get(name) if headers is not None else None
+    except Exception:
+        return None
+
+
+def request_priority(req: dict, headers=None) -> int | None:
+    """The request's "strata_priority" (or its X-Strata-Priority header): an integer, lower first.  None when it gives
+    none; ValueError for one that is not a whole number."""
+    v = req.get("strata_priority") if isinstance(req, dict) else None
+    if v is None:
+        v = _header(headers, "X-Strata-Priority")
+        if v is None:
+            return None
+        try:
+            v = int(str(v).strip())
+        except ValueError:
+            raise ValueError(f"X-Strata-Priority must be a whole number (lower first), not {v!r}") from None
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    if not isinstance(v, int) or isinstance(v, bool):
+        raise ValueError(f"strata_priority must be a whole number (lower first), not {v!r}")
+    return v
+
+
+def request_session(req: dict, headers=None) -> str | None:
+    """The session the request names: "strata_session", the X-Strata-Session header, or Anthropic's metadata.user_id
+    (Claude Code puts its session's ID in it).  None: the scheduler finds it by the request's tool results."""
+    if not isinstance(req, dict):
+        return None
+    v = req.get("strata_session")
+    if v is None:
+        v = _header(headers, "X-Strata-Session")
+    if v is None and isinstance(req.get("metadata"), dict):
+        v = req["metadata"].get("user_id")
+    if v is None:
+        return None
+    if not isinstance(v, str) or not v.strip():
+        raise ValueError(f"strata_session must be a non-empty string, not {v!r}")
+    return v.strip()[:256]
+
+
+@dataclass
+class Priorities:
+    """The config's "priority_*" settings (turns_from_config)."""
+    delta: int = 5                  # priority_preempt_delta: how much better a band is
+    preempt: str = "full"           # priority_preempt: "full", "timeout" or "off"
+    preempt_timeout_s: float = 10.0  # priority_preempt_timeout_s: "timeout" stops the running request after this wait
+    min_run_s: float = 2.0          # priority_min_run_s: "full" leaves a request the turn at least this long
+    reserve_s: float = 60.0         # priority_reserve_s: the longest a session's reservation keeps other bands out
+    aging_s: float = 30.0           # priority_aging_s: one step better per this long waiting (0: no aging)
+    default: int = 0                # priority_default: a request that gives none, in a session that gave none
+    floor: int = PRIORITY_MIN       # priority_floor: the best priority a request may claim
+
+    def clamp(self, p: int) -> int:
+        return max(self.floor, min(PRIORITY_MAX, int(p)))
+
+    @staticmethod
+    def share(p: int) -> float:
+        """Virtual seconds per engine second at priority `p` (CFS's weights: 1.25 per step)."""
+        return 1.25 ** p
 
 
 def _unit_from_text(text) -> float | None:
@@ -189,25 +294,39 @@ class TurnPolicy:
         return key
 
 
-@dataclass
+@dataclass(eq=False)
 class Ticket:
     turn: Turn
     arrived: float = field(default_factory=time.monotonic)
     seq: int = 0
+    preempt: threading.Event = field(default_factory=threading.Event)    # set: a better band waits, give the turn back
+    preemptible: bool = True        # False: never stopped for a better band (its state would not be kept)
+    run_p: int = 0                  # the priority (aged) it took the turn with
 
 
 class TurnScheduler:
     """One request at a time: orders the requests that wait for the engine's single turn (`lock`, which other work -
     an image encode, a VRAM resize - may also take directly).  One lane, the engine's session.  acquire() returns True
-    once the ticket holds `lock`; release() gives it back and charges the time it was held."""
+    once the ticket holds `lock`; release() gives it back and charges the time it was held.  With `prio`
+    (Priorities), the bands, the fair order, the reservations and the preemption of the module's docstring; a
+    preempted ticket gives the turn back with release(preempted=True) and waits again with requeue()."""
 
     def __init__(self, lock, slice_s: float = 0.0, max_wait_s: float = 120.0, hold_s: float = 0.0,
-                 skip_tools=(), skip_timeout_s: float = 0.0, clock=time.monotonic):
+                 skip_tools=(), skip_timeout_s: float = 0.0, clock=time.monotonic, prio: Priorities | None = None):
         self.lock = lock
         self.policy = TurnPolicy(slice_s, max_wait_s, clock)
         self.slice_s, self.max_wait_s, self.clock = self.policy.slice_s, self.policy.max_wait_s, clock
         self.hold_s, self.skip_tools = max(0.0, float(hold_s or 0)), frozenset(skip_tools)
         self.skip_timeout_s = max(0.0, float(skip_timeout_s or 0))     # 0: a call's timeout is not looked at
+        self.prio = prio
+        self.sessions: dict = {}            # the named sessions, by key
+        self.recent: collections.deque = collections.deque(maxlen=256)  # recent turns: a follow-up finds its session
+        self.min_v = 0.0                    # the least virtual time of the sessions waiting (never goes back)
+        self.running: Ticket | None = None  # the ticket that holds the turn
+        self.no_hold = False                # the last holder was preempted: nothing is held or reserved for it
+        self.preemptions = 0                # running requests stopped for a better band
+        self.reserve_idle_s = 0.0           # the engine stood idle in a reservation while a request waited
+        self.reserve_idle_since: float | None = None
         self.released: float | None = None  # when the last holder gave the turn back (the hold counts from it)
         self.cv = threading.Condition()
         self.waiting: list[Ticket] = []
@@ -224,11 +343,93 @@ class TurnScheduler:
     def continues(self, turn: Turn) -> bool:
         return TurnPolicy.continues(turn, self.lane)
 
-    def enter(self, turn: Turn) -> Ticket:
-        t = Ticket(turn, self.clock(), next(self.seq))
+    def enter(self, turn: Turn, preemptible: bool = True) -> Ticket:
+        t = Ticket(turn, self.clock(), next(self.seq), preemptible=preemptible)
         with self.cv:
+            if self.prio is not None:
+                self._attach(turn)
             self.waiting.append(t)
+            self._check_preempt()
         return t
+
+    def requeue(self, t: Ticket):
+        """A ticket that was preempted (and gave the turn back with release(preempted=True)) waits again: its aging and
+        its turn_max_wait_s count from now, its place among equals stays its arrival's."""
+        with self.cv:
+            t.preempt.clear()
+            t.arrived = self.clock()
+            if t not in self.waiting:
+                self.waiting.append(t)
+            self._check_preempt()
+            self.cv.notify_all()
+
+    def _attach(self, turn: Turn) -> Session:
+        """The session of a request entering (the caller holds self.cv): the one it names, else the one whose calls
+        its tool results answer, else a new one.  Its priority becomes the request's; one that waits for nothing and
+        holds nothing starts no lower than the least virtual time of those waiting."""
+        p, now = self.prio, self.clock()
+        s = turn.session
+        if s is None and turn.session_key is not None:
+            s = self.sessions.get(turn.session_key)
+        if s is None:
+            s = next((x.session for x in reversed(self.recent)
+                      if x.session is not None and TurnPolicy.continues(turn, x)), None)
+        if s is None:
+            s = Session(turn.session_key, p.clamp(p.default))
+        if turn.session_key is not None and s.key is None:
+            s.key = turn.session_key
+        if s.key is not None:
+            self.sessions[s.key] = s
+        if turn.priority is not None:
+            s.priority = p.clamp(turn.priority)
+        busy = (self.running is not None and self.running.turn.session is s) or \
+            any(w.turn.session is s for w in self.waiting)
+        if not busy:
+            s.vruntime = max(s.vruntime, self.min_v)
+        s.seen = now
+        turn.session = s
+        self.recent.append(turn)
+        if len(self.sessions) > 64:                     # forget the named sessions long gone
+            for k in [k for k, x in self.sessions.items() if now - x.seen > SESSION_IDLE_S]:
+                del self.sessions[k]
+        return s
+
+    def effective(self, t: Ticket, now: float | None = None) -> int:
+        """A waiting ticket's priority: its session's, a step better for every priority_aging_s it has waited."""
+        p = t.turn.session.priority if t.turn.session is not None else self.prio.default
+        if self.prio.aging_s > 0:
+            now = self.clock() if now is None else now
+            p -= int(max(0.0, now - t.arrived) // self.prio.aging_s)
+        return max(PRIORITY_MIN, p)
+
+    def reserved(self, now: float | None = None) -> Session | None:
+        """The session the free turn is reserved for (the caller holds self.cv): the last response made tool calls it
+        is not yielding on (none to a skipped tool, none with a long timeout), it was not preempted, and
+        priority_reserve_s has not run out since it gave the turn back."""
+        p, lane = self.prio, self.lane
+        if p is None or p.reserve_s <= 0 or self.released is None or self.no_hold or lane is None or \
+                lane.session is None or not lane.issued or lane.tools & self.skip_tools or \
+                (self.skip_timeout_s and lane.timeout_s > self.skip_timeout_s):
+            return None
+        now = self.clock() if now is None else now
+        return lane.session if now - self.released < p.reserve_s else None
+
+    def _check_preempt(self):
+        """Asks the running ticket to give the turn back when a request a band better waits (the caller holds
+        self.cv): at once ("full", after priority_min_run_s), once that one has waited priority_preempt_timeout_s
+        ("timeout"), or never ("off")."""
+        p, r = self.prio, self.running
+        if p is None or p.preempt == "off" or r is None or not r.preemptible or r.preempt.is_set() or not self.waiting:
+            return
+        now = self.clock()
+        if p.preempt == "full" and self.since is not None and now - self.since < p.min_run_s:
+            return
+        for t in self.waiting:
+            if self.effective(t, now) <= r.run_p - p.delta and \
+                    (p.preempt == "full" or now - t.arrived >= p.preempt_timeout_s):
+                r.preempt.set()
+                self.preemptions += 1
+                return
 
     def leave(self, t: Ticket):
         """A ticket that gave up waiting (its client left)."""
@@ -247,11 +448,14 @@ class TurnScheduler:
 
     def holds(self) -> bool:
         """The turn is free but held for the follow-up of the response that gave it back (the caller holds self.cv)."""
-        return self.released is not None and self.hold_wanted() and self.clock() - self.released < self.hold_s
+        return self.released is not None and not self.no_hold and self.hold_wanted() and \
+            self.clock() - self.released < self.hold_s
 
     def next_ticket(self) -> Ticket | None:
         """The ticket whose turn it is (the caller holds self.cv)."""
         order = sorted(self.waiting, key=lambda t: t.seq)
+        if self.prio is not None:
+            return self._next_by_priority(order)
         if order and self.holds():
             # only the follow-up takes a held turn - or a request that has waited turn_max_wait_s
             if self.max_wait_s > 0 and self.clock() - order[0].arrived >= self.max_wait_s:
@@ -260,6 +464,33 @@ class TurnScheduler:
         lanes = [(self.lane, self.used)] if self.lane is not None else []
         return self.policy.pick([(t, t.turn, t.arrived) for t in order], lanes, room=not lanes)
 
+    def _next_by_priority(self, order) -> Ticket | None:
+        """next_ticket with priorities: the band (those less than priority_preempt_delta worse than the best waiting,
+        or than the session the turn is reserved for), then within it the hold, turn_max_wait_s, the lane within its
+        slice, and the least virtual time."""
+        if not order:
+            return None
+        now, delta = self.clock(), self.prio.delta
+        eff = [(t, self.effective(t, now)) for t in order]
+        res = self.reserved(now)
+        best = min([e for _, e in eff] + ([res.priority] if res is not None else []))
+        band = [t for t, e in eff if e < best + delta]
+        if not band:
+            return None                                 # the turn is reserved for a better band
+        lane_p = self.lane.session.priority if self.lane is not None and self.lane.session is not None else None
+        if self.holds() and (lane_p is None or lane_p < best + delta):
+            # the lane's own band waits for its follow-up for the hold (a better band does not)
+            if self.max_wait_s > 0 and now - band[0].arrived >= self.max_wait_s:
+                return band[0]
+            return next((t for t in band if self.continues(t.turn)), None)
+        if self.max_wait_s > 0 and now - band[0].arrived >= self.max_wait_s:
+            return band[0]
+        if self.slice_s > 0 and self.lane is not None and self.used < self.slice_s:
+            follow = next((t for t in band if self.continues(t.turn)), None)
+            if follow is not None:
+                return follow
+        return min(band, key=lambda t: (t.turn.session.vruntime if t.turn.session is not None else 0.0, t.seq))
+
     def acquire(self, t: Ticket, timeout: float) -> bool:
         """Waits up to `timeout` seconds for `t`'s turn and the lock; False on timeout (the caller beats and retries)."""
         end = self.clock() + timeout
@@ -267,9 +498,23 @@ class TurnScheduler:
             while True:
                 left = end - self.clock()
                 held = self.holds()
-                if self.next_ticket() is t and self.lock.acquire(blocking=False):
+                nxt = self.next_ticket()
+                if self.prio is not None:
+                    self._check_preempt()                   # a wait (priority_preempt_timeout_s, aging) has grown
+                    if nxt is None and self.waiting and self.reserve_idle_since is None and \
+                            self.reserved() is not None and not self.lock.locked():
+                        self.reserve_idle_since = self.clock()  # everyone waiting is kept out by a reservation
+                if nxt is t and self.lock.acquire(blocking=False):
                     self.waiting.remove(t)
                     self._count_hold(t, held)
+                    if self.prio is not None:
+                        now = self.clock()
+                        if self.reserve_idle_since is not None:
+                            self.reserve_idle_s += now - self.reserve_idle_since
+                            self.reserve_idle_since = None
+                        t.run_p = self.effective(t, now)
+                        t.preempt.clear()
+                        self.running, self.no_hold = t, False
                     if self.continues(t.turn):
                         if self.waiting and t.seq > min(x.seq for x in self.waiting):
                             self.kept += 1
@@ -286,12 +531,22 @@ class TurnScheduler:
                 # the lock may be held by work outside this scheduler, which does not notify: look again soon
                 self.cv.wait(min(left, 0.05))
 
-    def release(self, used_s: float | None = None):
-        """The turn is over: the time it was held (or `used_s`) counts against the conversation's slice."""
+    def release(self, used_s: float | None = None, preempted: bool = False):
+        """The turn is over: the time it was held (or `used_s`) counts against the conversation's slice, and with
+        priorities against its session's virtual time.  `preempted`: it gave the turn back for a better band (it will
+        requeue()): no hold and no reservation for it."""
         with self.cv:
             if used_s is None:
                 used_s = self.clock() - self.since if self.since is not None else 0.0
-            self.used += max(0.0, float(used_s))
+            used_s = max(0.0, float(used_s))
+            self.used += used_s
+            r = self.running
+            if self.prio is not None and r is not None and r.turn.session is not None:
+                s = r.turn.session
+                s.vruntime += used_s * self.prio.share(s.priority)
+                waiting = [w.turn.session.vruntime for w in self.waiting if w.turn.session is not None]
+                self.min_v = max(self.min_v, min(waiting + [s.vruntime]))
+            self.running, self.no_hold = None, bool(preempted)
             self.since, self.released = None, self.clock()
             self.lock.release()
             self.cv.notify_all()
@@ -317,15 +572,36 @@ class TurnScheduler:
             return {"slice_s": self.slice_s, "used_s": round(self.used, 1), "waiting": len(self.waiting),
                     "switches": self.switches, "kept": self.kept, "hold_s": self.hold_s, "holding": self.holds(),
                     "hold_hits": self.hold_hits, "hold_misses": self.hold_misses,
-                    "hold_idle_s": round(self.hold_idle_s, 1)}
+                    "hold_idle_s": round(self.hold_idle_s, 1),
+                    **({"priority": self._priority_view()} if self.prio is not None else {})}
+
+    def _priority_view(self) -> dict:
+        """view()'s priorities (the caller holds self.cv)."""
+        p, now = self.prio, self.clock()
+        res = self.reserved(now)
+        bands: dict = {}
+        for t in self.waiting:
+            e = self.effective(t, now)
+            bands[e] = bands.get(e, 0) + 1
+        return {"preempt": p.preempt, "delta": p.delta, "min_run_s": p.min_run_s,
+                "preempt_timeout_s": p.preempt_timeout_s, "reserve_s": p.reserve_s, "aging_s": p.aging_s,
+                "running": self.running.run_p if self.running is not None else None,
+                "reserved_for": res.priority if res is not None else None,
+                "waiting": {str(k): v for k, v in sorted(bands.items())},
+                "preemptions": self.preemptions, "reserve_idle_s": round(self.reserve_idle_s, 1),
+                "sessions": len({id(t.session) for t in self.recent if t.session is not None})}
 
 
 def turns_from_config(cfg: dict, lock) -> tuple[TurnScheduler | TurnPolicy | None, str | None]:
     """The config's "turn_slice_s" (0 or absent: off), "turn_max_wait_s" (default 120; 0: no limit), "turn_hold_s"
     (default 3; 0: off; one request at a time only), "turn_hold_skip_tools" (default HOLD_SKIP_TOOLS) and
-    "turn_hold_skip_timeout_s" (default 120; 0: a call's timeout is not looked at) -> (the
-    single turn's TurnScheduler, or with "parallel" the batch admissions' TurnPolicy, or None; a line to print or
-    None).  ValueError for a value of the wrong kind."""
+    "turn_hold_skip_timeout_s" (default 120; 0: a call's timeout is not looked at), and the priorities (the module's
+    docstring): "priority" (default true with a turn slice; true without one turns the scheduler on for them alone),
+    "priority_preempt" ("full", "timeout" or "off"), "priority_preempt_delta", "priority_min_run_s",
+    "priority_preempt_timeout_s", "priority_reserve_s" (0: no reservations), "priority_aging_s" (0: no aging),
+    "priority_default" and "priority_floor" -> (the single turn's TurnScheduler, or with "parallel" the batch
+    admissions' TurnPolicy (no priorities), or None; a line to print or None).  ValueError for a value of the wrong
+    kind."""
     def seconds(key, default, what):
         v = cfg.get(key, default)
         if v is None:
@@ -342,7 +618,11 @@ def turns_from_config(cfg: dict, lock) -> tuple[TurnScheduler | TurnPolicy | Non
         skip = HOLD_SKIP_TOOLS
     if not isinstance(skip, (list, tuple)) or not all(isinstance(x, str) for x in skip):
         raise ValueError(f'"turn_hold_skip_tools" must be a list of tool names, not {skip!r}')
-    if not slice_s:
+    prio_on = cfg.get("priority")
+    if prio_on is not None and not isinstance(prio_on, bool):
+        raise ValueError(f'"priority" must be true or false, not {prio_on!r}')
+    prio = priorities_from_config(cfg) if prio_on is not False else None
+    if not slice_s and prio_on is not True:
         return None, None
     limit = f"; a request waits at most {wait:g} s" if wait else ""
     if cfg.get("parallel", 1) not in (None, 1):
@@ -351,6 +631,51 @@ def turns_from_config(cfg: dict, lock) -> tuple[TurnScheduler | TurnPolicy | Non
                 f"a batch slot's conversation keeps its slot for {slice_s:g} s of engine time before a new one may "
                 f"push it out (turn_slice_s{limit})")
     held = f"; after tool calls the turn waits up to {hold:g} s for the follow-up (turn_hold_s)" if hold else ""
-    return (TurnScheduler(lock, slice_s, wait, hold, skip, skip_timeout),
-            f"the conversation in the engine keeps the turn for {slice_s:g} s of engine time before another waiting "
-            f"one takes it (turn_slice_s{limit}){held}")
+    if slice_s:
+        note = (f"the conversation in the engine keeps the turn for {slice_s:g} s of engine time before another "
+                f"waiting one takes it (turn_slice_s{limit}){held}")
+    else:
+        note = f"the waiting requests take the turn by priority (no turn slice{limit})"
+    if prio is not None:
+        stop = {"full": f"stops a running one {prio.delta} worse (after it has had {prio.min_run_s:g} s)",
+                "timeout": f"stops a running one {prio.delta} worse once it has waited {prio.preempt_timeout_s:g} s",
+                "off": f"goes before those {prio.delta} worse once the running request ends"}[prio.preempt]
+        aging = f", a step better per {prio.aging_s:g} s waited" if prio.aging_s else ", no aging"
+        reserve = f"; a session's tool calls keep worse bands out for up to {prio.reserve_s:g} s" \
+            if prio.reserve_s else ""
+        note += (f"; priorities: a request {stop} (priority_preempt: {prio.preempt}){reserve}{aging}")
+    return TurnScheduler(lock, slice_s, wait, hold, skip, skip_timeout, prio=prio), note
+
+
+def priorities_from_config(cfg: dict) -> Priorities:
+    """The config's "priority_*" keys -> Priorities.  ValueError for a value of the wrong kind."""
+    d = Priorities()
+
+    def number(key, default, what, whole=False, low=0):
+        v = cfg.get(key, default)
+        if v is None:
+            v = default
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or v < low or (whole and v != int(v)):
+            raise ValueError(f'"{key}" must be {what}, not {v!r}')
+        return int(v) if whole else float(v)
+    mode = cfg.get("priority_preempt", d.preempt)
+    if mode is True:
+        mode = "full"
+    elif mode is False:
+        mode = "off"
+    if mode not in PREEMPT_MODES:
+        raise ValueError(f'"priority_preempt" must be one of {", ".join(PREEMPT_MODES)}, not {mode!r}')
+    floor = number("priority_floor", d.floor, f"a whole number from {PRIORITY_MIN} to {PRIORITY_MAX}", True,
+                   PRIORITY_MIN)
+    default = number("priority_default", d.default, f"a whole number from {PRIORITY_MIN} to {PRIORITY_MAX}", True,
+                     PRIORITY_MIN)
+    if floor > PRIORITY_MAX or default > PRIORITY_MAX:
+        raise ValueError(f'"priority_floor" and "priority_default" go from {PRIORITY_MIN} to {PRIORITY_MAX}')
+    return Priorities(
+        delta=number("priority_preempt_delta", d.delta, "a whole number of steps, 1 or more", True, 1),
+        preempt=mode,
+        preempt_timeout_s=number("priority_preempt_timeout_s", d.preempt_timeout_s, "a number of seconds"),
+        min_run_s=number("priority_min_run_s", d.min_run_s, "a number of seconds"),
+        reserve_s=number("priority_reserve_s", d.reserve_s, "a number of seconds (0 = no reservations)"),
+        aging_s=number("priority_aging_s", d.aging_s, "a number of seconds (0 = no aging)"),
+        default=max(floor, default), floor=floor)

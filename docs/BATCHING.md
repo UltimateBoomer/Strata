@@ -195,8 +195,10 @@ would push it out, even one that arrived earlier.
     timeout generously (default 180), so a Hermes `terminal` call with one is seldom held for.
 
   Alone, the hold costs nothing: the follow-up takes the turn as it arrives.
-- **Never stopped for it**: a turn changes hands between requests only; a long request runs to its end.
-- **Nobody starves**: a request that has waited `"turn_max_wait_s"` (default 120; 0 = no limit) goes next.
+- **Never stopped for it**: a turn changes hands between requests only; a long request runs to its end (except for
+  a request of a better priority, below).
+- **Nobody starves**: a request that has waited `"turn_max_wait_s"` (default 120; 0 = no limit) goes next (within
+  its priority band, below).
 - Time, not tokens: what the other clients wait is time, and a switch costs about a fixed time (a park and a
   read-back), so a slice of S seconds bounds the switching overhead to that cost over S. A prompt read (~1-2K
   tokens/s) and a generated token (~30/s) would weigh the same in a token count.
@@ -206,6 +208,64 @@ would push it out, even one that arrived earlier.
 
 ```json
 "turn_slice_s": 30
+```
+
+## Priorities (one request at a time; on with a turn slice, `"priority": false` turns them off)
+
+A request may say how urgent it is: `"strata_priority"` in its body, or an `X-Strata-Priority` header, an integer
+from -20 to 19 like Unix nice, lower first. A client that sends nothing gets `"priority_default"` (0); a claim better
+than `"priority_floor"` (default -20) is raised to it. Each request belongs to a session: the one `"strata_session"`
+(or `X-Strata-Session`, or Anthropic's `metadata.user_id`, where Claude Code puts its session ID) names, else the one
+whose calls its tool results answer, else a new one. A session's priority is that of its latest request.
+`"priority": true` without `turn_slice_s` turns the scheduler on for the priorities alone.
+
+The scheduler is fair in the manner of Linux's CFS, in bands:
+
+- **Fair share within a band.** Each session's virtual time grows by the engine time it uses times 1.25^priority,
+  and the one with the least goes next (after a conversation continuing within its slice, as above). A session 3 better
+  gets about twice the engine time. A session that comes back after a pause starts no lower than the least of those
+  waiting, so a pause banks no credit.
+- **Bands.** The band is every request less than `"priority_preempt_delta"` (default 5) worse than the best one
+  waiting, or than the session the turn is reserved for. Requests further down wait, and
+  `turn_max_wait_s` applies within the band only.
+- **Reservations.** Once a session's response makes tool calls, the turn is reserved for its follow-up: requests
+  outside its band wait until it ends a response with no calls (its turn is over), its calls are ones the hold skips
+  (the skipped tools, a timeout above `turn_hold_skip_timeout_s`: the session is yielding), or
+  `"priority_reserve_s"` (default 60; 0 = none) runs out. A reservation spares the urgent session the read-back a
+  worse request in the gap would cost it; the engine may stand idle meanwhile. Requests of the session's own band
+  wait only as long as the hold says.
+- **Preemption** (`"priority_preempt"`): a request a band better than the running one stops it.
+  - `"full"` (default): at once, once the running request has had the turn for `"priority_min_run_s"` (default 2).
+  - `"timeout"`: once the better request has waited `"priority_preempt_timeout_s"` (default 10).
+  - `"off"`: never; the better request goes first when the running one ends.
+
+  The stopped request gives the turn back and waits again. The engine ends it at its next step (decoding) or chunk
+  (reading the prompt), keeps what it read and wrote as its live conversation, and parks it when the other one starts.
+  When the request gets the turn back, the server sends its prompt plus what it wrote, and the engine goes on from
+  there. Its client sees only a pause in the stream (keep-alives meanwhile). A one-shot call
+  (`"strata_checkpoint": false`) keeps no state to go on from and is never stopped.
+- **Aging** (`"priority_aging_s"`, default 30; 0 = off): a waiting request gains a step for every period it waits,
+  so a session in a worse band still gets the turn in the end (a priority-5 request behind a priority-0 session joins
+  its band after 30 s). A request that aged into the turn is stopped only by one a band better than the priority it
+  took the turn with. A preempted request's aging starts again when it goes back to waiting.
+
+| Lower latency for the urgent session | More throughput |
+|---|---|
+| `"priority_preempt": "full"`, a small `priority_min_run_s` | `"timeout"` or `"off"`: fewer park and read-back cycles |
+| a long `priority_reserve_s` | a short one (the engine is not idle in an urgent session's tool calls) |
+| `priority_aging_s` 0, or long | a short `priority_aging_s` |
+
+`/metrics` shows the settings under `"turns"` -> `"priority"`, with the priority of the running request, the one the
+turn is reserved for, the waiting requests by priority, `preemptions` and `reserve_idle_s` (the engine idle while a
+reservation kept a waiting request out). The Prometheus endpoint has `strata:priority_preemptions_total` and
+`strata:priority_reserve_idle_seconds_total`.
+
+```json
+"turn_slice_s": 30,
+"priority_preempt": "full",
+"priority_preempt_delta": 5,
+"priority_reserve_s": 60,
+"priority_aging_s": 30
 ```
 
 ## How the server uses the slots
