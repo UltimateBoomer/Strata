@@ -80,6 +80,7 @@ from serve import owner_guard  # noqa: E402
 from serve import launch_identity  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import lifeline  # noqa: E402
+from serve import models as serve_models  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve.turns import (Turn, TurnPolicy, call_timeout_s, cited_calls, request_priority,  # noqa: E402
                          request_session, timeout_units, turns_from_config)
@@ -3930,6 +3931,8 @@ class Service:
         # the config's "turn_slice_s" (opt-in, one request at a time): the conversation in the engine keeps the turn
         # for that much engine time before another takes it (serve/turns.py); None = whoever takes self.fifo first
         self.turns = None
+        # the config's "models" (serve/models.py's Models): the variants the engine switches between; None: one model
+        self.models = None
         # the turn slice: this request's response (serve/turns.py's Turn: the call IDs its tool results answer, set by
         # the handler; the calls it makes, added as they are written)
         self.request_turn = threading.local()
@@ -4240,6 +4243,8 @@ class Service:
         """The name to answer with: the request's own when it is the model's name or an alias (#297), else the model's.
         Other names are still served, as before."""
         asked = req.get("model") if isinstance(req, dict) else None
+        if self.models is not None:                     # a variant's own name, model name or alias
+            return asked if isinstance(asked, str) and asked in self.models.all_names() else self.model
         return asked if isinstance(asked, str) and asked in self.aliases else self.model
 
     def reported_ctx(self) -> int:
@@ -4440,6 +4445,8 @@ class Service:
         print("[strata] the engine is running again", flush=True)
         if self.restore_after_load:                      # an image job unloaded it: its conversation comes back
             images_api.restore_session(self)
+        elif self.models is not None:                    # the variant's conversation from before it was switched away
+            self._restore_variant_session()
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last
             try:
                 self.engine.vram(self.vram_reserve)
@@ -4518,6 +4525,148 @@ class Service:
             if counted:
                 with self.status_lock:
                     self.status["queued"] -= 1
+
+    def apply_variant(self, v) -> None:
+        """The names and sampling a model variant (serve/models.py) answers with."""
+        self.model = v.model_name
+        self.set_aliases(v.aliases)
+        self.sampling_defaults = sampling_defaults_from_config(v.cfg)
+
+    def switch_model(self, name: str, load: bool = True) -> None:
+        """Run model variant `name` (serve/models.py): the conversation in the engine is saved to a session file, the
+        engine stops and starts again as that variant (with `load`; else the next request starts it), and the
+        variant's own saved conversation comes back.  The caller holds self.fifo (the turn)."""
+        m = self.models
+        if name == m.active:
+            if load:
+                self.ensure_loaded()
+            return
+        old, t0 = m.active, time.monotonic()
+        if self.loaded():
+            print(f"[strata] switching the model from {old} to {name} ...", flush=True)
+            self._save_variant_session(old)
+            self.engine.unload()
+        else:
+            print(f"[strata] the model is now {name} (it loads with the next request)" if not load else
+                  f"[strata] loading the model {name} ...", flush=True)
+        v = m.variants[name]
+        self.engine.spawn = v.spawn
+        self.apply_variant(v)
+        m.active, m.committed = name, None             # (Models.switched below once it has run)
+        if self.turns is not None and hasattr(self.turns, "model_switched"):
+            self.turns.model_switched()
+        try:
+            if load:
+                self.ensure_loaded()
+        finally:
+            took = time.monotonic() - t0
+            m.switched(name, took)
+            if load:
+                print(f"[strata] the model is now {name} ({took:.1f} s)", flush=True)
+
+    def _switch_beating(self, name: str):
+        """switch_model in a thread, yielding ("ping", None) every QUEUE_BEAT_S meanwhile (a switch takes a minute: the
+        client's stream stays alive).  Re-raises what the switch raised."""
+        done, err = threading.Event(), []
+
+        def work():
+            try:
+                self.switch_model(name)
+            except BaseException as e:                  # noqa: BLE001 - handed to the request
+                err.append(e)
+            finally:
+                done.set()
+        threading.Thread(target=work, daemon=True).start()
+        while not done.wait(QUEUE_BEAT_S):
+            yield "ping", None
+        if err:
+            raise err[0]
+
+    def _save_variant_session(self, name: str) -> None:
+        m = self.models
+        if not hasattr(self.engine, "session_file") or not m.session_dir:
+            return
+        path = m.session_path(name)
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            r = self.engine.session_file("save", path)
+            m.saved[name] = path
+            print(f"[strata] {name}'s conversation ({r.get('tokens')} tokens) saved until it is loaded again",
+                  flush=True)
+        except Exception as e:                          # noqa: BLE001 - the switch goes on without it
+            m.saved.pop(name, None)
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+            print(f"[strata] {name}'s conversation was not saved ({e}); its next request reads its prompt again",
+                  flush=True)
+
+    def _restore_variant_session(self) -> None:
+        m = self.models
+        path = m.saved.pop(m.active, None)
+        if not path:
+            return
+        try:
+            r = self.engine.session_file("restore", path)
+            print(f"[strata] {m.active}'s conversation is back ({r.get('tokens')} tokens)", flush=True)
+        except Exception as e:                          # noqa: BLE001 - the engine runs, without it
+            print(f"[strata] {m.active}'s conversation was not restored ({e}); its next request reads its prompt "
+                  "again", flush=True)
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+
+    def start_default_idle(self):
+        """The config's "default_idle_s": back to "default_model" after that long without a request."""
+        m = self.models
+        if m is None or not m.idle_s or m.default is None:
+            return
+        print(f"[strata] the model goes back to {m.default} after {m.idle_s:g} s without requests", flush=True)
+
+        def loop():
+            while True:
+                time.sleep(max(1.0, min(30.0, m.idle_s / 4)))
+                try:
+                    self.default_if_idle()
+                except Exception as e:                  # noqa: BLE001 - tried again at the next turn
+                    print(f"[strata] switching back to {m.default}: {e}", flush=True)
+        threading.Thread(target=loop, daemon=True).start()
+
+    def default_if_idle(self) -> bool:
+        """Switch to the default variant when no request has run for default_idle_s and none waits; an unloaded
+        engine is only pointed at it.  True when it switched."""
+        m = self.models
+        if m.default is None or not m.idle_s or m.active == m.default or \
+                time.time() - (self.last_request_at or self.started_at) < m.idle_s:
+            return False
+        if not self.fifo.acquire(blocking=False):
+            return False
+        try:
+            with self.status_lock:
+                if self.status.get("busy") or self.status.get("queued"):
+                    return False
+            print(f"[strata] {m.idle_s:g} s without a request: back to the default model {m.default}", flush=True)
+            self.switch_model(m.default, load=self.loaded())
+            return True
+        finally:
+            self.fifo.release()
+
+    def models_listing(self) -> list[dict]:
+        """GET /v1/models with variants: each one, loaded or not (all load on use), and its aliases."""
+        m, loaded, out = self.models, self.loaded(), []
+        modal = ["text", "image"] if self.vision is not None else ["text"]
+        for v in m.variants.values():
+            active = v.name == m.active
+            args = v.spawn[1] if v.spawn else []
+            ctx = self.reported_ctx() if active and loaded else \
+                int(args[args.index("--max-context") + 1]) if "--max-context" in args else None
+            names = [n for n in dict.fromkeys([v.name, *v.aliases]) if n != v.model_name]
+            entry = {"id": v.model_name, "object": "model",
+                     "status": {"value": "loaded" if active and loaded else "unloaded"},
+                     "meta": {"n_ctx": ctx, "variant": v.name, "default": v.name == m.default},
+                     "architecture": {"input_modalities": modal, "output_modalities": ["text"]},
+                     **({"aliases": names} if names else {})}
+            out += [entry, *({**entry, "id": x, "alias_of": v.model_name} for x in names)]
+        return out
 
     UNLOAD_WAIT_S = 300.0       # #1997: POST /unload?wait=1 waits this long for the running turn (wait=<s> to choose)
 
@@ -4846,6 +4995,7 @@ class Service:
         images = self.vision is not None
         return {
             "service": "strata", "model": self.model,
+            **({"models": self.models.view()} if self.models is not None else {}),
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
@@ -5406,6 +5556,12 @@ class Service:
                     # #1603: a parallel request stays counted as queued until it is registered as running below -
                     # waiting here for the fifo (an image encode, a /v1/vram resize) left it neither - and one on a
                     # loaded engine has nothing to start, so it does not wait for the fifo at all
+                    if self.models is not None and not par:
+                        # the model variant it asked for (serve/models.py): the scheduler gave it the turn to switch
+                        want = getattr(call if call is not None else getattr(self.request_turn, "turn", None),
+                                       "model", None)
+                        if want is not None and want != self.models.active:
+                            yield from self._switch_beating(want)
                     if not par:
                         self.ensure_loaded()
                     elif not (self.loaded() and not self._vision_down()):
@@ -6853,7 +7009,8 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
-                                 "loaded": svc.loaded(), "service": "strata"})
+                                 "loaded": svc.loaded(), "service": "strata",
+                                 **({"variant": svc.models.active} if svc.models is not None else {})})
             elif path.startswith("/v1/images/files/"):
                 # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is
                 f = svc.images.file(path[len("/v1/images/files/"):]) if svc.images is not None else None
@@ -6881,6 +7038,9 @@ def make_handler(svc: Service):
                 for k in ("started", "first_token"):
                     s.pop(k, None)
                 self._json(200, s)
+            elif path in ("/v1/models", "/models") and svc.models is not None:
+                if self._authorized():                      # the model variants (serve/models.py)
+                    self._json(200, {"object": "list", "data": svc.models_listing()})
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
                     loaded = svc.loaded()
@@ -7001,7 +7161,15 @@ def make_handler(svc: Service):
                 if path in ("/v1/load", "/v1/unload"):
                     if not self._own_page("the model can be loaded or unloaded"):
                         return
-                    if req.get("model") not in (None, svc.model):
+                    want = None
+                    if svc.models is not None and req.get("model") is not None:
+                        want = next((v.name for v in svc.models.variants.values()
+                                     if req["model"] in v.names()), None)
+                        if want is None or (path == "/v1/unload" and want != svc.models.active):
+                            self._json(404, {"error": {"message": "model not found" if want is None else
+                                                       "that model is not the loaded one"}})
+                            return
+                    elif req.get("model") not in (None, svc.model):
                         self._json(404, {"error": {"message": "model not found"}})
                         return
                     if path == "/v1/unload":
@@ -7017,7 +7185,10 @@ def make_handler(svc: Service):
                             with svc.status_lock:
                                 if svc.status.get("busy") or svc.status.get("queued"):
                                     raise ModelBusy("a request is running or queued")
-                            svc.ensure_loaded()
+                            if want is not None:     # a model variant: switch to it (and load it)
+                                svc.switch_model(want)
+                            else:
+                                svc.ensure_loaded()
                             svc.last_request_at = time.time()
                         finally:
                             svc.fifo.release()
@@ -7040,7 +7211,9 @@ def make_handler(svc: Service):
                     # the turn slice: the calls this request's tool results answer, and its priority and session
                     # (serve/turns.py)
                     svc.request_turn.turn = Turn(cited_calls(path, req), priority=request_priority(req, self.headers),
-                                                 session_key=request_session(req, self.headers))
+                                                 session_key=request_session(req, self.headers),
+                                                 model=svc.models.resolve(req.get("model"))
+                                                 if svc.models is not None else None)
                 if path == "/v1/responses":
                     self._responses(req)
                 elif path.startswith("/slots/"):
@@ -8411,6 +8584,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
                                          "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
                                          "the config)")
+    ap.add_argument("--variant", default=None,
+                    help='with "models" in the config: the variant to start with (default: "default_model"; '
+                         "also $STRATA_VARIANT)")
     ap.add_argument("--lazy", action="store_true", help="start the API unloaded (the engine and the vision encoder start with the first request)")
     ap.add_argument("--api-monitor", action="store_true",
                     help="the API request monitor at /api-monitor: keeps the last 100 requests' prompts and answers in "
@@ -8464,6 +8640,18 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     split_joined_args(cfg)
     if a.config and a.engine == "strata":
         cfg = apply_saved_tuning(cfg)
+    models = None
+    if a.engine == "strata" and cfg.get("models") is not None:
+        # serve/models.py: the config is the common part, each variant has its own; the engine starts as one of them
+        try:
+            models, cfg = serve_models.load(cfg, a.config, a.variant or os.environ.get("STRATA_VARIANT") or None)
+        except ValueError as e:
+            raise SystemExit(f"[strata] config {e}")
+        for v in models.variants.values():
+            split_joined_args(v.cfg)
+        print(f"[strata] model variants: {', '.join(models.variants)}"
+              + (f" (default {models.default})" if models.default is not None else "")
+              + f"; starting with {models.active}", flush=True)
     attestation_key = os.environ.pop("STRATA_OWNER_ATTEST_KEY", None)
     launch_attestation = None
     if a.owner_fd is not None:
@@ -8632,12 +8820,25 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             groups = rp.gpu_groups(cfg)
         except rp.ReplicaConfigError as e:
             raise SystemExit(f"[strata] config {e}")
+        if groups and models is not None:
+            raise SystemExit('[strata] config "models": variants cannot run on replicas')
         if groups:
             engine = start_replicas(cfg, groups, exe, effort_end or [], lazy, offline=a.offline)
         else:
             engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                                   env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
+        if models is not None:                          # each variant's start, for Service.switch_model
+            for v in models.variants.values():
+                if v.name == models.active:
+                    v.spawn = engine.spawn
+                    continue
+                vc = with_component_engine(v.cfg)
+                vexe = _component_exe(vc["exe"], vc) if engine_component.is_reference(vc["exe"]) else \
+                    vc["exe"] if os.path.isabs(vc["exe"]) else os.path.abspath(os.path.join(vc.get("cwd") or ".", vc["exe"]))
+                venv = child_env(vc, offline=a.offline)
+                configure_batch_telemetry_env(venv, vc, a.batch_telemetry)
+                v.spawn = (vexe, engine_args(vc) + (effort_end or []), vc.get("cwd"), vc.get("log"), venv, False, None)
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
                                  linux_desktop()) if not groups else None
@@ -8680,7 +8881,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         per_replica = requested if isinstance(requested, int) and not isinstance(requested, bool) and requested > 0 else 1
         svc.requested_slots = per_replica * len(groups) if groups else per_replica
     svc.answer_room = cfg.get("answer_room") is not False
-    turns, note = turns_from_config(cfg, svc.fifo)
+    if models is not None:
+        svc.models = models
+        models.loaded = svc.loaded
+    turns, note = turns_from_config(cfg, svc.fifo, models=models is not None)
     from serve.replicas import ReplicaEngine
     if turns is not None and isinstance(engine, ReplicaEngine):
         # the turn slice keeps one engine's conversation; replicas each hold their own and route by prompt
@@ -8689,6 +8893,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         engine.turn_policy = turns
     else:
         svc.turns = turns
+        if turns is not None and models is not None:
+            turns.models = models
     if note:
         print(f"[strata] {note}", flush=True)
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
@@ -8847,6 +9053,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     httpd = serve(svc, host=a.host, port=a.port)
     bound_port = httpd.server_address[1]               # --port 0: report the port the OS actually assigned
     svc.start_idle_unload()
+    svc.start_default_idle()
     svc.start_vision_idle()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{bound_port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "

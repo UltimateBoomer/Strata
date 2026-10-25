@@ -65,6 +65,19 @@ manner of CFS, in bands:
 - a waiting request gains a step of priority for every "priority_aging_s" (default 30; 0: off) it waits, so a
   session in a worse band still gets the turn in the end; it is not stopped by one less than a band better than the
   priority it took the turn with.  turn_max_wait_s applies within the band.
+
+Model variants (the config's "models", serve/models.py).  Each request names the variant it wants (None: whichever is
+loaded), and a switch costs far more than a conversation switch: the engine is stopped and the other variant started
+(about a minute) - so a request for another variant does not take the turn by arrival or virtual time.  Only the
+requests for the loaded variant are eligible, until the scheduler commits to a switch, when:
+- nobody waits for the loaded variant, the turn is free and not held for a follow-up, and the loaded variant has had
+  the engine for "model_min_resident_s" (default 30); or
+- a request for another variant has waited "model_max_wait_s" (default 120); or
+- with priorities, a request for another variant is a band better than every request for the loaded one (and the
+  running one), once the loaded variant has had its "model_min_resident_s".
+Once committed, only the requests for the target variant are eligible: the running request ends, the next one switches
+the engine (its session is charged the switch's time), and every request queued for that variant follows.  A running
+request is never stopped for another variant unless "model_preempt" is true.
 """
 from __future__ import annotations
 
@@ -114,6 +127,7 @@ class Turn:
     priority: int | None = None                   # the request's strata_priority (None: its session's, or the default)
     session_key: str | None = None                # the request's strata_session (None: found by its tool results)
     session: Session | None = None                # set by the scheduler as the request enters
+    model: str | None = None                      # the model variant it wants (serve/models.py); None: the loaded one
 
 
 def _header(headers, name):
@@ -319,6 +333,9 @@ class TurnScheduler:
         self.hold_s, self.skip_tools = max(0.0, float(hold_s or 0)), frozenset(skip_tools)
         self.skip_timeout_s = max(0.0, float(skip_timeout_s or 0))     # 0: a call's timeout is not looked at
         self.prio = prio
+        # the model variants' switching state (serve/models.py's Models: active, since, committed, the policy): set by
+        # the server with the config's "models"; None: one model
+        self.models = None
         self.sessions: dict = {}            # the named sessions, by key
         self.recent: collections.deque = collections.deque(maxlen=256)  # recent turns: a follow-up finds its session
         self.min_v = 0.0                    # the least virtual time of the sessions waiting (never goes back)
@@ -394,6 +411,50 @@ class TurnScheduler:
                 del self.sessions[k]
         return s
 
+    def _eligible(self, t: Ticket, model: str | None) -> bool:
+        return t.turn.model is None or t.turn.model == model
+
+    def _by_model(self, order: list[Ticket]) -> list[Ticket]:
+        """The waiting tickets that may take the turn with model variants (the module's docstring; the caller holds
+        self.cv): the loaded variant's, or once a switch is committed the target's.  Commits a switch when its time
+        has come."""
+        m = self.models
+        if m is None or not order:
+            return order
+        if m.committed is not None:
+            target = [t for t in order if self._eligible(t, m.committed)]
+            if target:
+                return target
+            m.committed = None                          # everyone who wanted it left
+        same = [t for t in order if self._eligible(t, m.active)]
+        others = [t for t in order if not self._eligible(t, m.active)]
+        if not others:
+            return same
+        now = self.clock()
+        resident = now - m.since >= m.min_resident_s or not m.loaded()    # an unloaded engine costs nothing to keep
+        first = min(others, key=lambda t: t.arrived)
+        pick = None
+        if m.max_wait_s > 0 and now - first.arrived >= m.max_wait_s:
+            pick = first
+        elif resident and not same and self.since is None and not self.holds():
+            pick = first
+        elif resident and self.prio is not None:
+            best = min(others, key=lambda t: (self.effective(t, now), t.seq))
+            mine = [self.effective(t, now) for t in same] + ([self.running.run_p] if self.running is not None else [])
+            if mine and self.effective(best, now) <= min(mine) - self.prio.delta:
+                pick = best
+        if pick is None:
+            return same
+        m.committed = pick.turn.model
+        return [t for t in order if self._eligible(t, m.committed)]
+
+    def model_switched(self):
+        """The engine now runs another variant (the server switched it while holding the turn): no conversation of the
+        old one continues in it."""
+        with self.cv:
+            self.lane, self.used = None, 0.0
+            self.cv.notify_all()
+
     def effective(self, t: Ticket, now: float | None = None) -> int:
         """A waiting ticket's priority: its session's, a step better for every priority_aging_s it has waited."""
         p = t.turn.session.priority if t.turn.session is not None else self.prio.default
@@ -424,7 +485,10 @@ class TurnScheduler:
         now = self.clock()
         if p.preempt == "full" and self.since is not None and now - self.since < p.min_run_s:
             return
+        m = self.models
         for t in self.waiting:
+            if m is not None and not m.preempt and not self._eligible(t, m.active):
+                continue                                # a variant switch waits for the running request to end
             if self.effective(t, now) <= r.run_p - p.delta and \
                     (p.preempt == "full" or now - t.arrived >= p.preempt_timeout_s):
                 r.preempt.set()
@@ -453,7 +517,7 @@ class TurnScheduler:
 
     def next_ticket(self) -> Ticket | None:
         """The ticket whose turn it is (the caller holds self.cv)."""
-        order = sorted(self.waiting, key=lambda t: t.seq)
+        order = self._by_model(sorted(self.waiting, key=lambda t: t.seq))
         if self.prio is not None:
             return self._next_by_priority(order)
         if order and self.holds():
@@ -573,7 +637,16 @@ class TurnScheduler:
                     "switches": self.switches, "kept": self.kept, "hold_s": self.hold_s, "holding": self.holds(),
                     "hold_hits": self.hold_hits, "hold_misses": self.hold_misses,
                     "hold_idle_s": round(self.hold_idle_s, 1),
-                    **({"priority": self._priority_view()} if self.prio is not None else {})}
+                    **({"priority": self._priority_view()} if self.prio is not None else {}),
+                    **({"models": self._models_view()} if self.models is not None else {})}
+
+    def _models_view(self) -> dict:
+        """view()'s model variants (the caller holds self.cv): what waits for each one, and the committed switch."""
+        m, waiting = self.models, {}
+        for t in self.waiting:
+            k = t.turn.model or m.active
+            waiting[k] = waiting.get(k, 0) + 1
+        return {"active": m.active, "committed": m.committed, "waiting": waiting}
 
     def _priority_view(self) -> dict:
         """view()'s priorities (the caller holds self.cv)."""
@@ -592,7 +665,7 @@ class TurnScheduler:
                 "sessions": len({id(t.session) for t in self.recent if t.session is not None})}
 
 
-def turns_from_config(cfg: dict, lock) -> tuple[TurnScheduler | TurnPolicy | None, str | None]:
+def turns_from_config(cfg: dict, lock, models: bool = False) -> tuple[TurnScheduler | TurnPolicy | None, str | None]:
     """The config's "turn_slice_s" (0 or absent: off), "turn_max_wait_s" (default 120; 0: no limit), "turn_hold_s"
     (default 3; 0: off; one request at a time only), "turn_hold_skip_tools" (default HOLD_SKIP_TOOLS) and
     "turn_hold_skip_timeout_s" (default 120; 0: a call's timeout is not looked at), and the priorities (the module's
@@ -600,8 +673,9 @@ def turns_from_config(cfg: dict, lock) -> tuple[TurnScheduler | TurnPolicy | Non
     "priority_preempt" ("full", "timeout" or "off"), "priority_preempt_delta", "priority_min_run_s",
     "priority_preempt_timeout_s", "priority_reserve_s" (0: no reservations), "priority_aging_s" (0: no aging),
     "priority_default" and "priority_floor" -> (the single turn's TurnScheduler, or with "parallel" the batch
-    admissions' TurnPolicy (no priorities), or None; a line to print or None).  ValueError for a value of the wrong
-    kind."""
+    admissions' TurnPolicy (no priorities), or None; a line to print or None).  `models`: the config has model
+    variants, which the scheduler switches between, so it is on without a slice or priorities too.  ValueError for a
+    value of the wrong kind."""
     def seconds(key, default, what):
         v = cfg.get(key, default)
         if v is None:
@@ -621,8 +695,8 @@ def turns_from_config(cfg: dict, lock) -> tuple[TurnScheduler | TurnPolicy | Non
     prio_on = cfg.get("priority")
     if prio_on is not None and not isinstance(prio_on, bool):
         raise ValueError(f'"priority" must be true or false, not {prio_on!r}')
-    prio = priorities_from_config(cfg) if prio_on is not False else None
-    if not slice_s and prio_on is not True:
+    prio = priorities_from_config(cfg) if prio_on is True or (prio_on is None and slice_s) else None
+    if not slice_s and prio_on is not True and not models:
         return None, None
     limit = f"; a request waits at most {wait:g} s" if wait else ""
     if cfg.get("parallel", 1) not in (None, 1):
@@ -634,8 +708,10 @@ def turns_from_config(cfg: dict, lock) -> tuple[TurnScheduler | TurnPolicy | Non
     if slice_s:
         note = (f"the conversation in the engine keeps the turn for {slice_s:g} s of engine time before another "
                 f"waiting one takes it (turn_slice_s{limit}){held}")
-    else:
+    elif prio_on is True:
         note = f"the waiting requests take the turn by priority (no turn slice{limit})"
+    else:
+        note = f"the waiting requests take the turn in arrival order, switching model variants by policy{limit}"
     if prio is not None:
         stop = {"full": f"stops a running one {prio.delta} worse (after it has had {prio.min_run_s:g} s)",
                 "timeout": f"stops a running one {prio.delta} worse once it has waited {prio.preempt_timeout_s:g} s",
