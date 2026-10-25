@@ -268,6 +268,46 @@ reservation kept a waiting request out). The Prometheus endpoint has `strata:pri
 "priority_aging_s": 30
 ```
 
+## Model variants (`"models"`, opt-in; one request at a time)
+
+One server can hold several variants of one model (the quantizations of one checkpoint: Q2_0 and IQ3_XXS) and run
+one at a time, switching the engine between them as requests ask (`serve/models.py`). The run config is the common
+part; `"models"` names each variant's own config, a file next to it or an object:
+
+```json
+"models": {"q2": "server-q2.json", "q3": "server-q3.json"},
+"default_model": "q2",
+"default_idle_s": 600,
+"model_max_wait_s": 120,
+"model_min_resident_s": 30,
+"model_session_dir": "/data/sessions"
+```
+
+A variant sets only `model_name`, `aliases`, `args`, `env`, `sampling`, `log` and `max_context`; everything else
+(the tokenizer, the template, the picture reader, the scheduler) is common, and `"parallel"` and replicas are refused.
+Its `args` go over the common ones: an option the variant sets replaces the common one's (`--pack`, `--native`).
+`--variant NAME` (or `$STRATA_VARIANT`) picks the variant to start with, else `default_model`.
+
+A request names its variant in `"model"`: its key, model name or an alias. A name no variant has (a client that sends
+its own model name) goes to the variant that is loaded (`"unknown_model": "current"`), to the default (`"default"`),
+or is refused (`"error"`). `GET /v1/models` lists every variant, loaded or not; `POST /v1/load {"model": ...}` switches
+to one; `/health` and `/v1/status` say which one runs.
+
+A switch stops the engine and starts it as the other variant (about a minute), so the scheduler decides when, not
+the arrival order. Only requests for the loaded variant are eligible until it commits to a switch: when nobody waits
+for the loaded variant and the turn is free (and not held for a tool follow-up), when a request for another one has
+waited `model_max_wait_s`, or, with priorities, when a request for another one is a band better than every request
+for the loaded one. The first and the last need the loaded variant to have had the engine for
+`model_min_resident_s` (an unloaded engine switches at once). Once committed, the running request ends, the next one
+switches (its session is charged the time), and the requests queued for that variant follow. A running request is not
+stopped for another variant unless `"model_preempt": true`.
+
+The conversation in the engine is saved to `model_session_dir` (`variant-<name>.session`, default: the log's folder)
+when its variant is switched away, and restored when that variant loads again; the session file carries the model's
+fingerprint, so one variant never reads another's. The parked conversations of `--conversation-cache-dir` do not
+survive a switch (the engine clears them at every start). After `default_idle_s` (0: never) without a request the
+server goes back to `default_model`; an unloaded engine is only pointed at it.
+
 ## How the server uses the slots
 
 - **One request alone** runs on the usual solo path (verify windows with MTP drafts): the fastest single stream.
