@@ -2,7 +2,7 @@
 
 A run config with "models" is the common part of every variant's config; each variant adds its own:
 
-    {"models": {"q2": "server-q2.json", "q3": "server-q3.json"}, "default_model": "q2", "default_idle_s": 600,
+    {"models": {"q2": "server-q2.json", "q3": "server-q3.json"}, "default_model": null,
      "args": [... the options every variant starts with ...], ...}
 
 A variant is a file next to the config (or the object itself) with the keys of VARIANT_KEYS: its "model_name" and
@@ -12,11 +12,12 @@ the tokenizer, the template, the picture reader, the scheduler - is the server's
 other forms (the quantizations of one checkpoint); "parallel" and replicas are refused.
 
 One engine runs at a time.  A request names its variant in "model" (a variant's key, model name or alias); a name no
-variant has goes to the loaded one ("unknown_model": "current", the default), to the default one ("default") or is
+variant has goes to the loaded one ("unknown_model": "current", the default), to "default_model" ("default") or is
 refused ("error").  The turn scheduler (serve/turns.py) decides when the engine switches; the switch saves the
 conversation in the engine to a session file ("model_session_dir", default: the log's folder) and restores it when that
-variant is loaded again.  After "default_idle_s" (0: never) without a request the server switches back to
-"default_model" (an unloaded engine is only pointed at it).
+variant is loaded again.  "default_model" (null, the default: none) is a variant the server goes back to after
+"default_idle_s" (0: never) without a request (an unloaded engine is only pointed at it); the server starts with
+`startup` (--variant, $STRATA_VARIANT), else the default model, else the first variant.
 """
 from __future__ import annotations
 
@@ -57,7 +58,7 @@ class Variant:
 class Models:
     """The variants and the switching state the turn scheduler reads (active, since, committed and the policy)."""
 
-    def __init__(self, variants: dict[str, Variant], default: str, active: str, *, idle_s: float = 0.0,
+    def __init__(self, variants: dict[str, Variant], default: str | None, active: str, *, idle_s: float = 0.0,
                  max_wait_s: float = 120.0, min_resident_s: float = 30.0, preempt: bool = False,
                  unknown: str = "current", session_dir: str | None = None, clock=time.monotonic):
         self.variants, self.default, self.active = variants, default, active
@@ -163,15 +164,18 @@ def load(cfg: dict, config_path: str | None, startup: str | None = None) -> tupl
         for n in dict.fromkeys(v.names()):
             if seen.setdefault(n, v.name) != v.name:
                 raise ValueError(f"models: the name {n!r} is both {seen[n]}'s and {v.name}'s")
-    default = cfg.get("default_model") or next(iter(variants))
-    if default not in variants:
+    default = cfg.get("default_model")
+    if default is not None and default not in variants:
         raise ValueError(f'"default_model" {default!r} is not one of the variants ({", ".join(variants)})')
-    active = startup or default
+    active = startup or default or next(iter(variants))
     if active not in variants:
         raise ValueError(f'the variant to start with, {active!r}, is not one of {", ".join(variants)}')
     unknown = cfg.get("unknown_model", "current")
     if unknown not in UNKNOWN_MODES:
         raise ValueError(f'"unknown_model" must be one of {", ".join(UNKNOWN_MODES)}, not {unknown!r}')
+    idle_s = _number(cfg, "default_idle_s", 0)
+    if default is None and (idle_s or unknown == "default"):
+        raise ValueError('"default_idle_s" and "unknown_model": "default" need a "default_model"')
     preempt = cfg.get("model_preempt", False)
     if not isinstance(preempt, bool):
         raise ValueError(f'"model_preempt" must be true or false, not {preempt!r}')
@@ -179,7 +183,7 @@ def load(cfg: dict, config_path: str | None, startup: str | None = None) -> tupl
         if v.cfg.get("parallel", 1) not in (None, 1) or v.cfg.get("replicas") or "--batch" in v.cfg.get("args", []):
             raise ValueError("models: variants run one request at a time (no \"parallel\", --batch or replicas)")
     session_dir = cfg.get("model_session_dir") or (os.path.dirname(cfg["log"]) if cfg.get("log") else None)
-    models = Models(variants, default, active, idle_s=_number(cfg, "default_idle_s", 0),
+    models = Models(variants, default, active, idle_s=idle_s,
                     max_wait_s=_number(cfg, "model_max_wait_s", 120), min_resident_s=_number(cfg, "model_min_resident_s", 30),
                     preempt=preempt, unknown=unknown, session_dir=session_dir)
     return models, variants[active].cfg

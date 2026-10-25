@@ -4618,7 +4618,7 @@ class Service:
     def start_default_idle(self):
         """The config's "default_idle_s": back to "default_model" after that long without a request."""
         m = self.models
-        if m is None or not m.idle_s:
+        if m is None or not m.idle_s or m.default is None:
             return
         print(f"[strata] the model goes back to {m.default} after {m.idle_s:g} s without requests", flush=True)
 
@@ -4635,7 +4635,8 @@ class Service:
         """Switch to the default variant when no request has run for default_idle_s and none waits; an unloaded
         engine is only pointed at it.  True when it switched."""
         m = self.models
-        if m.active == m.default or time.time() - (self.last_request_at or self.started_at) < m.idle_s:
+        if m.default is None or not m.idle_s or m.active == m.default or \
+                time.time() - (self.last_request_at or self.started_at) < m.idle_s:
             return False
         if not self.fifo.acquire(blocking=False):
             return False
@@ -8648,8 +8649,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             raise SystemExit(f"[strata] config {e}")
         for v in models.variants.values():
             split_joined_args(v.cfg)
-        print(f"[strata] model variants: {', '.join(models.variants)} (default {models.default}); starting with "
-              f"{models.active}", flush=True)
+        print(f"[strata] model variants: {', '.join(models.variants)}"
+              + (f" (default {models.default})" if models.default is not None else "")
+              + f"; starting with {models.active}", flush=True)
     attestation_key = os.environ.pop("STRATA_OWNER_ATTEST_KEY", None)
     launch_attestation = None
     if a.owner_fd is not None:

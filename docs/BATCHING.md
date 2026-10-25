@@ -276,8 +276,8 @@ part; `"models"` names each variant's own config, a file next to it or an object
 
 ```json
 "models": {"q2": "server-q2.json", "q3": "server-q3.json"},
-"default_model": "q2",
-"default_idle_s": 600,
+"default_model": null,
+"default_idle_s": 0,
 "model_max_wait_s": 120,
 "model_min_resident_s": 30,
 "model_session_dir": "/data/sessions"
@@ -286,7 +286,8 @@ part; `"models"` names each variant's own config, a file next to it or an object
 A variant sets only `model_name`, `aliases`, `args`, `env`, `sampling`, `log` and `max_context`; everything else
 (the tokenizer, the template, the picture reader, the scheduler) is common, and `"parallel"` and replicas are refused.
 Its `args` go over the common ones: an option the variant sets replaces the common one's (`--pack`, `--native`).
-`--variant NAME` (or `$STRATA_VARIANT`) picks the variant to start with, else `default_model`.
+`--variant NAME` (or `$STRATA_VARIANT`) picks the variant to start with, else `default_model`, else the first one.
+`default_model` is null (none) unless set; `default_idle_s` and `"unknown_model": "default"` need one.
 
 A request names its variant in `"model"`: its key, model name or an alias. A name no variant has (a client that sends
 its own model name) goes to the variant that is loaded (`"unknown_model": "current"`), to the default (`"default"`),
@@ -305,8 +306,8 @@ stopped for another variant unless `"model_preempt": true`.
 The conversation in the engine is saved to `model_session_dir` (`variant-<name>.session`, default: the log's folder)
 when its variant is switched away, and restored when that variant loads again; the session file carries the model's
 fingerprint, so one variant never reads another's. The parked conversations of `--conversation-cache-dir` do not
-survive a switch (the engine clears them at every start). After `default_idle_s` (0: never) without a request the
-server goes back to `default_model`; an unloaded engine is only pointed at it.
+survive a switch (the engine clears them at every start). With a `default_model`, after `default_idle_s` (0: never)
+without a request the server goes back to it; an unloaded engine is only pointed at it.
 
 ## How the server uses the slots
 

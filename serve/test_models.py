@@ -45,7 +45,8 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(q3["sampling"], {"top_k": 40})
         self.assertNotIn("models", q3)
         self.assertEqual(q3["turn_slice_s"], 30, "the common keys are every variant's")
-        self.assertIs(cfg, m.variants["q2"].cfg, "it starts with the first (default) variant")
+        self.assertIs(cfg, m.variants["q2"].cfg, "no default model: it starts with the first variant")
+        self.assertIsNone(m.default)
         self.assertEqual(cfg["args"], COMMON["args"])
 
     def test_files_next_to_the_config(self):
@@ -59,7 +60,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual((m.default, m.active), ("q3", "q3"))
 
     def test_start_with(self):
-        m, cfg = serve_models.load(config(), None, "q3")
+        m, cfg = serve_models.load(config(default_model="q2"), None, "q3")
         self.assertEqual((m.default, m.active), ("q2", "q3"))
         self.assertEqual(cfg["args"][-1], "/data/pack-q3")
 
@@ -71,6 +72,8 @@ class ConfigTest(unittest.TestCase):
             (config(parallel=2), "one request at a time"),
             (config(unknown_model="maybe"), "unknown_model"),
             (config(default_idle_s=-1), "default_idle_s"),
+            (config(default_idle_s=600), "need a"),
+            (config(unknown_model="default"), "need a"),
             (config(models={"bad name": {}}), "variant name"),
             (config(models={}), "models"),
         ]:
@@ -85,7 +88,7 @@ class ConfigTest(unittest.TestCase):
                          ["q2", "q2", "q2", "q3", "q3"])
         self.assertIsNone(m.resolve("claude-sonnet"), "an unknown name: the loaded variant")
         self.assertIsNone(m.resolve(None))
-        m.unknown = "default"
+        m.unknown, m.default = "default", "q2"
         self.assertEqual(m.resolve("claude-sonnet"), "q2")
         m.unknown = "error"
         with self.assertRaises(serve_models.UnknownModel):
@@ -274,7 +277,8 @@ class ServerTest(unittest.TestCase):
                 yield from tok.encode(f"</think>\nfrom {self.spawn[0]}", parse_special=True)
                 yield from tok.encode(IM_END, parse_special=True)
 
-        m, _ = serve_models.load(config(model_session_dir=self.dir.name, model_min_resident_s=0), None)
+        m, _ = serve_models.load(config(model_session_dir=self.dir.name, model_min_resident_s=0, default_model="q2"),
+                                 None)
 
         def spawn(name):                                # StrataEngine.spawn's shape: (exe, args, cwd, log, env, ...)
             return (name, m.variants[name].cfg["args"], None, None, None, False, None)
@@ -348,6 +352,15 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(m.active, "q2")
         self.assertEqual(self.events[-2:], [("start", "q2"), ("restore", "variant-q2.session")])
         self.assertFalse(self.svc.default_if_idle(), "already the default")
+
+    def test_no_default_model_stays(self):
+        m = self.svc.models
+        m.default, m.idle_s = None, 0
+        self.chat("q3")
+        self.svc.last_request_at = time.time() - 10 ** 6
+        self.assertFalse(self.svc.default_if_idle(), "no default model: the loaded variant stays")
+        self.assertEqual(m.active, "q3")
+        self.assertIsNone(self.call("/v1/status")["models"]["default"])
 
     def test_default_when_idle_and_unloaded(self):
         m = self.svc.models
