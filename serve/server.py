@@ -82,14 +82,21 @@ from serve import logit_bias as bias_api  # noqa: E402
 from serve import lifeline  # noqa: E402
 from serve import models as serve_models  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
-from serve.turns import (Turn, TurnPolicy, call_timeout_s, cited_calls, request_priority,  # noqa: E402
-                         request_session, timeout_units, turns_from_config)
+from serve.turns import (Turn, TurnPolicy, call_timeout_s, cited_calls, request_drops, request_flag,  # noqa: E402
+                         request_priority, request_session, request_yield_tools, timeout_units, turns_from_config)
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
+# the sampling key the server sets for the engine's conversation-cache keys (StrataEngine.session_keys)
+ENGINE_SESSION_KEY = "_strata_engine_session"
+
+
+def session_tag(key: str) -> int:
+    """A session's tag for the engine (sess=, drop=): 64 bits of its name's hash, never 0."""
+    return int.from_bytes(hashlib.blake2b(key.encode("utf-8", "replace"), digest_size=8).digest(), "big") or 1
 
 
 def popen(what: str, args: list, role: str = "engine", **kw):
@@ -1446,6 +1453,22 @@ class StrataEngine:
                 raise EngineDied("the engine did not answer the VRAM command")
 
     @staticmethod
+    def session_keys(sampling: dict) -> str:
+        """The engine's conversation-cache keys (Service.engine_session): `sess=` the session's tag, `park=0` not
+        parked on a switch, `drop=` the sessions whose cached conversations go.  Set by the server, never by a client."""
+        e = sampling.get(ENGINE_SESSION_KEY)
+        if not isinstance(e, dict):
+            return ""
+        keys = ""
+        if e.get("sess"):
+            keys += f" sess={e['sess']:016x}"
+        if e.get("park") is False:
+            keys += " park=0"
+        if e.get("drop"):
+            keys += " drop=" + ",".join(f"{d:016x}" for d in e["drop"])
+        return keys
+
+    @staticmethod
     def sampling_keys(sampling: dict) -> str:
         keys = ""
         t = sampling.get("temperature")
@@ -1504,6 +1527,7 @@ class StrataEngine:
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
             keys += " ckpt=0"
+        keys += StrataEngine.session_keys(sampling)
         # #2228: the pictures' keys (hex, in prompt order): the engine matches a picture by them, not by its embeddings
         ik = sampling.get("strata_img_keys")
         if isinstance(ik, list) and ik and all(isinstance(k, str) and k and all(c in "0123456789abcdef" for c in k)
@@ -3936,6 +3960,13 @@ class Service:
         # the turn slice: this request's response (serve/turns.py's Turn: the call IDs its tool results answer, set by
         # the handler; the calls it makes, added as they are written)
         self.request_turn = threading.local()
+        # the config's "park": "sessions" parks only the conversations of requests that name a session (and are not
+        # one-shots); "all" (the default) parks every conversation, as before
+        self.park_sessions = False
+        # the sessions a request's "strata_drop" made obsolete: the next request sent to the engine tells it (drop=),
+        # which then does not park their live conversation and evicts their parked ones first
+        self.pending_drops: set[int] = set()
+        self.drops_lock = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -5378,6 +5409,28 @@ class Service:
             if ka is not None:
                 ka.release()
 
+    def drop_session(self, key: str):
+        """A request's "strata_drop": the session's cached conversation is obsolete (its client compacted it, or moved
+        the conversation to a new session).  The next
+        request sent to the engine, whoever's, carries drop= for it, so the engine does not write it out on that switch."""
+        with self.drops_lock:
+            self.pending_drops.add(session_tag(key))
+
+    def engine_session(self, sampling: dict, turn: Turn | None) -> dict:
+        """`sampling` with the engine's conversation-cache keys for this pass (StrataEngine.session_keys): the
+        session's tag, park=0 when "park": "sessions" and the request names none, and the drops pending (taken: the
+        engine applies them as it reads the request).  A request's later pass gets the keys afresh: the drops an
+        earlier pass sent are not sent again."""
+        if sampling and ENGINE_SESSION_KEY in sampling:
+            sampling = {k: v for k, v in sampling.items() if k != ENGINE_SESSION_KEY}
+        key = turn.session_key if turn is not None else None
+        with self.drops_lock:
+            drops, self.pending_drops = sorted(self.pending_drops), set()
+        e = {"sess": session_tag(key) if key else 0, "park": not (self.park_sessions and key is None), "drop": drops}
+        if not e["sess"] and e["park"] and not drops:
+            return sampling                             # nothing to say: the request goes as before
+        return {**(sampling or {}), ENGINE_SESSION_KEY: e}
+
     def _preempt_stop(self) -> bool:
         """A better-priority request waits (serve/turns.py): STOP the engine and read on to its DONE (True), or, with
         an engine that cannot be told so, False: the caller leaves the stream, which STOPs it and drops what it wrote
@@ -5396,6 +5449,8 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        if sampling and ENGINE_SESSION_KEY in sampling:  # the server's own key (engine_session), never a client's
+            sampling = {k: v for k, v in sampling.items() if k != ENGINE_SESSION_KEY}
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
         if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
@@ -5592,6 +5647,8 @@ class Service:
                         extra = {"embeddings": emb} if emb else {}
                         if getattr(self.engine, "turn_policy", None) is not None:
                             extra["turn"] = call            # the batch admissions' turn slice
+                        sampling = self.engine_session(
+                            sampling, call if call is not None else getattr(self.request_turn, "turn", None))
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, **extra)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
@@ -7210,10 +7267,14 @@ def make_handler(svc: Service):
                     self.record = svc.begin_request(path, req)
                     # the turn slice: the calls this request's tool results answer, and its priority and session
                     # (serve/turns.py)
-                    svc.request_turn.turn = Turn(cited_calls(path, req), priority=request_priority(req, self.headers),
-                                                 session_key=request_session(req, self.headers),
-                                                 model=svc.models.resolve(req.get("model"))
-                                                 if svc.models is not None else None)
+                    svc.request_turn.turn = turn = Turn(
+                        cited_calls(path, req), priority=request_priority(req, self.headers),
+                        session_key=request_session(req, self.headers),
+                        one_shot=req.get("strata_checkpoint") is False,
+                        yield_now=request_flag(req, "strata_yield"), yield_tools=request_yield_tools(req),
+                        model=svc.models.resolve(req.get("model")) if svc.models is not None else None)
+                    for gone in request_drops(req, turn.session_key):    # "strata_drop"
+                        svc.drop_session(gone)
                 if path == "/v1/responses":
                     self._responses(req)
                 elif path.startswith("/slots/"):
@@ -8884,6 +8945,13 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if models is not None:
         svc.models = models
         models.loaded = svc.loaded
+    park = cfg.get("park", "all")
+    if park not in (None, "all", "sessions"):
+        raise ValueError(f'"park" must be "all" or "sessions", not {park!r}')
+    svc.park_sessions = park == "sessions"
+    if svc.park_sessions:
+        print("[strata] the conversation cache parks only the conversations of requests that name a session "
+              "(strata_session, X-Strata-Session, metadata.user_id): side calls are not written out", flush=True)
     turns, note = turns_from_config(cfg, svc.fifo, models=models is not None)
     from serve.replicas import ReplicaEngine
     if turns is not None and isinstance(engine, ReplicaEngine):

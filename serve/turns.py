@@ -16,7 +16,19 @@ A request continues a lane when it is the next step of the response the lane las
 that response made.  Every call's ID is minted here (serve/frontend.py's ToolCall, 96 random bits) and a client sends
 it back with the result (Chat Completions' tool_call_id, Anthropic's tool_use_id, the Responses API's call_id), so the
 match is exact: no prompt comparison, no shared system prompt mistaken for the same conversation, no minimum length.
-A new user message starts a new turn of its own (a switch); so does a retry, which cites nothing new.
+A request that names the lane's session ("strata_session", X-Strata-Session or Anthropic's metadata.user_id) continues
+it too - a new user message, a retry - unless either is a one-shot ("strata_checkpoint": false: a summary, a side
+call), which nothing continues.  Without a session a new user message starts a new turn of its own (a switch); so does
+a retry, which cites nothing new.
+
+A session may give the turn up (yield): a request with "strata_yield": true ends its session's hold and reservation as
+it arrives (a client sends it with a summary, after which the conversation is read again anyway), and a response whose
+calls include one to a tool its request named in "strata_yield_tools" (a subagent, a web fetch: the client knows its
+slow tools) or one that asks for a timeout above "turn_hold_skip_timeout_s" is not held or reserved for.  A one-shot of
+a session whose follow-up the turn is held or reserved for may wait for it, up to "turn_side_wait_s" (default 0: off):
+it is the session's own side work (a memory review between its tool calls) and would push its conversation out
+mid-loop.  Only for clients whose side calls run in the background: one the session's loop waits on (a summary, an
+approval check) would stall it for that long.
 
 A request that pushes nobody out (it continues a lane, or an empty lane is free) goes in arrival order; so does
 everything once the lanes it would wait for are past their slice; and one that has waited "turn_max_wait_s" goes next
@@ -28,10 +40,10 @@ waiting would take the turn at once.  So when a response that made tool calls gi
 the turn is held for its follow-up for "turn_hold_s" (default 3): only a request that answers those calls takes it
 meanwhile.  Most tools come back well inside that (a file read, an edit, a quick command: under a second), and a
 switch costs seconds (the park, then the tail since the checkpoint read again on the way back); a long command or a
-web fetch outlasts the hold and the turn goes on as before.  Calls to "turn_hold_skip_tools" (HOLD_SKIP_TOOLS) are
-not waited for: a subagent's own requests are what its call waits on (Claude Code's Agent/Task, Hermes Agent's
-delegate_task), a question waits for a person (AskUserQuestion, clarify), and Claude Code's web calls almost never
-return in time.  Nor is a call whose timeout argument is above "turn_hold_skip_timeout_s" (default 120): the model asks
+web fetch outlasts the hold and the turn goes on as before.  Calls to the tools a request names in
+"strata_yield_tools" are not waited for: the client knows which of its tools are slow (a subagent's own requests are
+what its call waits on, a question waits for a person).  Nor is a call whose timeout argument is above
+"turn_hold_skip_timeout_s" (default 120): the model asks
 for a long timeout when it expects a long command (in Claude Code transcripts, 9 in 10 Bash calls without one returned
 within 3 s, 1 in 5 with one over 2 minutes; pi's bash: 91% without one, 53% with one).  The unit is read from the
 tool's own schema in the request (Claude Code's Bash: ms; pi's bash and Hermes Agent's terminal: seconds); a call that
@@ -54,8 +66,8 @@ manner of CFS, in bands:
   below) or the session the turn is reserved for: the rest wait.  Within the band, a request that continues the lane
   within its slice goes first (as above), else the least virtual time;
 - once a response of a session made tool calls, the turn is reserved for its follow-up: the requests outside its band
-  wait until it ends a response with no calls (its turn is over), its calls are ones it does not hold for (the skipped
-  tools, a long timeout: it is yielding), or "priority_reserve_s" (default 60) runs out.  A request of the band waits
+  wait until it ends a response with no calls (its turn is over), it yields (strata_yield, a call to one of its
+  strata_yield_tools, a long timeout), or "priority_reserve_s" (default 60) runs out.  A request of the band waits
   for the follow-up only as long as the hold (turn_hold_s) says;
 - a request that is a band better than the running one stops it ("priority_preempt"): "full" once the running one has
   had the turn for "priority_min_run_s" (default 2), "timeout" once the better one has waited
@@ -91,13 +103,6 @@ from dataclasses import dataclass, field
 # the tool results' item and block types that carry the ID of the call they answer, per API
 OUTPUTS = ("function_call_output", "custom_tool_call_output")
 MODEL_ITEMS = ("function_call", "custom_tool_call", "reasoning")
-# tools whose results the turn is not held for: a subagent's call waits on the subagent's own requests (holding the
-# turn for it would make them wait), a question waits for a person, and Claude Code's web calls almost never return
-# within the hold (pi's web_search and fetch_content mostly do: 96% and 74% within 3 s)
-HOLD_SKIP_TOOLS = (
-    "Agent", "Task", "AskUserQuestion", "ExitPlanMode", "WebFetch", "WebSearch",    # Claude Code
-    "delegate_task", "clarify", "kanban_block",                                     # Hermes Agent
-)
 # a call's run time limit, by argument name: (name, seconds per unit, or None to read the unit from the schema)
 TIMEOUT_KEYS = (("timeout", None), ("timeout_ms", 0.001), ("timeout_s", 1.0), ("timeout_sec", 1.0),
                 ("timeout_seconds", 1.0))
@@ -126,6 +131,10 @@ class Turn:
     timeout_s: float = 0.0                        # the longest "timeout" one of its calls asked for (call_timeout_s)
     priority: int | None = None                   # the request's strata_priority (None: its session's, or the default)
     session_key: str | None = None                # the request's strata_session (None: found by its tool results)
+    one_shot: bool = False                        # "strata_checkpoint": false: nothing continues it, not even by session
+    yield_now: bool = False                       # "strata_yield": its session gives the turn up as it arrives
+    yield_tools: frozenset = frozenset()          # "strata_yield_tools": calls to these are not held or reserved for
+    yielded: bool = False                         # a later request of its session yielded (strata_yield)
     session: Session | None = None                # set by the scheduler as the request enters
     model: str | None = None                      # the model variant it wants (serve/models.py); None: the loaded one
 
@@ -171,6 +180,42 @@ def request_session(req: dict, headers=None) -> str | None:
     if not isinstance(v, str) or not v.strip():
         raise ValueError(f"strata_session must be a non-empty string, not {v!r}")
     return v.strip()[:256]
+
+
+def request_flag(req: dict, key: str) -> bool:
+    """A boolean field of the request ("strata_yield"): absent or null is False; ValueError for one
+    that is not true or false."""
+    v = req.get(key) if isinstance(req, dict) else None
+    if v is None:
+        return False
+    if not isinstance(v, bool):
+        raise ValueError(f"{key} must be true or false, not {v!r}")
+    return v
+
+
+def request_drops(req: dict, session: str | None) -> tuple[str, ...]:
+    """The sessions whose cached conversations the request's "strata_drop" makes obsolete: true is its own session (a
+    compaction), a list names others (a client that moved the conversation to a new session).  ValueError for anything
+    else."""
+    v = req.get("strata_drop") if isinstance(req, dict) else None
+    if v is None or v is False:
+        return ()
+    if v is True:
+        return (session,) if session else ()
+    if not isinstance(v, list) or not all(isinstance(x, str) and x.strip() for x in v):
+        raise ValueError(f"strata_drop must be true, false or a list of session names, not {v!r}")
+    return tuple(x.strip()[:256] for x in v)
+
+
+def request_yield_tools(req: dict) -> frozenset:
+    """The request's "strata_yield_tools": the names of the tools whose calls its session does not hold the turn for
+    (its client's slow tools).  ValueError for one that is not a list of names."""
+    v = req.get("strata_yield_tools") if isinstance(req, dict) else None
+    if v is None:
+        return frozenset()
+    if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
+        raise ValueError(f"strata_yield_tools must be a list of tool names, not {v!r}")
+    return frozenset(v)
 
 
 @dataclass
@@ -286,10 +331,13 @@ class TurnPolicy:
     @staticmethod
     def continues(turn: Turn | None, lane: Turn | None) -> bool:
         """`turn` is the next step of the response `lane` ran: it answers a call that response made (or it is that
-        same response, in a later pass)."""
+        same response, in a later pass), or it names the same session and neither is a one-shot."""
         if turn is None or lane is None:
             return False
-        return turn is lane or bool(turn.cites & lane.issued)
+        if turn is lane or turn.cites & lane.issued:
+            return True
+        return turn.session_key is not None and turn.session_key == lane.session_key and \
+            not turn.one_shot and not lane.one_shot
 
     def pick(self, waiting, lanes, room: bool):
         """The waiting request that goes next.  `waiting`: (key, Turn, arrived) in arrival order; `lanes`: (the Turn
@@ -326,12 +374,14 @@ class TurnScheduler:
     preempted ticket gives the turn back with release(preempted=True) and waits again with requeue()."""
 
     def __init__(self, lock, slice_s: float = 0.0, max_wait_s: float = 120.0, hold_s: float = 0.0,
-                 skip_tools=(), skip_timeout_s: float = 0.0, clock=time.monotonic, prio: Priorities | None = None):
+                 skip_timeout_s: float = 0.0, side_wait_s: float = 0.0, clock=time.monotonic,
+                 prio: Priorities | None = None):
         self.lock = lock
         self.policy = TurnPolicy(slice_s, max_wait_s, clock)
         self.slice_s, self.max_wait_s, self.clock = self.policy.slice_s, self.policy.max_wait_s, clock
-        self.hold_s, self.skip_tools = max(0.0, float(hold_s or 0)), frozenset(skip_tools)
+        self.hold_s = max(0.0, float(hold_s or 0))
         self.skip_timeout_s = max(0.0, float(skip_timeout_s or 0))     # 0: a call's timeout is not looked at
+        self.side_wait_s = max(0.0, float(side_wait_s or 0))           # 0: a session's one-shots do not wait for it
         self.prio = prio
         # the model variants' switching state (serve/models.py's Models: active, since, committed, the policy): set by
         # the server with the config's "models"; None: one model
@@ -365,6 +415,11 @@ class TurnScheduler:
         with self.cv:
             if self.prio is not None:
                 self._attach(turn)
+            lane = self.lane
+            if turn.yield_now and lane is not None and turn.session_key is not None and \
+                    lane.session_key == turn.session_key:
+                lane.yielded = True                     # its session gives the turn up: no hold, no reservation
+                self.cv.notify_all()
             self.waiting.append(t)
             self._check_preempt()
         return t
@@ -465,12 +520,11 @@ class TurnScheduler:
 
     def reserved(self, now: float | None = None) -> Session | None:
         """The session the free turn is reserved for (the caller holds self.cv): the last response made tool calls it
-        is not yielding on (none to a skipped tool, none with a long timeout), it was not preempted, and
-        priority_reserve_s has not run out since it gave the turn back."""
+        is not yielding on (yielding()), it was not preempted, and priority_reserve_s has not run out since it gave the
+        turn back."""
         p, lane = self.prio, self.lane
         if p is None or p.reserve_s <= 0 or self.released is None or self.no_hold or lane is None or \
-                lane.session is None or not lane.issued or lane.tools & self.skip_tools or \
-                (self.skip_timeout_s and lane.timeout_s > self.skip_timeout_s):
+                lane.session is None or not lane.issued or self.yielding(lane):
             return None
         now = self.clock() if now is None else now
         return lane.session if now - self.released < p.reserve_s else None
@@ -489,6 +543,8 @@ class TurnScheduler:
         for t in self.waiting:
             if m is not None and not m.preempt and not self._eligible(t, m.active):
                 continue                                # a variant switch waits for the running request to end
+            if self.deferred(t, now):
+                continue
             if self.effective(t, now) <= r.run_p - p.delta and \
                     (p.preempt == "full" or now - t.arrived >= p.preempt_timeout_s):
                 r.preempt.set()
@@ -502,13 +558,28 @@ class TurnScheduler:
                 self.waiting.remove(t)
                 self.cv.notify_all()
 
+    def yielding(self, lane: Turn) -> bool:
+        """The session of `lane` gave the turn up: a later request of it said so (strata_yield), or its calls include
+        one to a tool its request named slow (strata_yield_tools) or one with a timeout above turn_hold_skip_timeout_s."""
+        return lane.yielded or bool(lane.tools & lane.yield_tools) or \
+            bool(self.skip_timeout_s and lane.timeout_s > self.skip_timeout_s)
+
     def hold_wanted(self) -> bool:
-        """The response that ran last is worth holding the turn for (the caller holds self.cv): it made tool calls,
-        none to a skipped tool or with a long timeout, and its conversation is within its slice.  Read when asked, not at release: a call
+        """The response that ran last is worth holding the turn for (the caller holds self.cv): it made tool calls, its
+        session is not yielding, and its conversation is within its slice.  Read when asked, not at release: a call
         the parser completes as the response ends is counted even when it comes after the release."""
         lane = self.lane
-        return (self.hold_s > 0 and lane is not None and bool(lane.issued) and not lane.tools & self.skip_tools
-                and not (self.skip_timeout_s and lane.timeout_s > self.skip_timeout_s) and self.used < self.slice_s)
+        return (self.hold_s > 0 and lane is not None and bool(lane.issued) and not self.yielding(lane)
+                and self.used < self.slice_s)
+
+    def deferred(self, t: Ticket, now: float) -> bool:
+        """`t` is a one-shot of the session whose follow-up the turn waits for (the caller holds self.cv): the last
+        response made calls its session is not yielding on.  It stays back for turn_side_wait_s from its arrival, so
+        the session's side work does not push its conversation out between its tool calls."""
+        lane, turn = self.lane, t.turn
+        return (self.side_wait_s > 0 and turn.one_shot and turn.session_key is not None and lane is not None
+                and lane.session_key == turn.session_key and not lane.one_shot and bool(lane.issued)
+                and not self.yielding(lane) and now - t.arrived < self.side_wait_s)
 
     def holds(self) -> bool:
         """The turn is free but held for the follow-up of the response that gave it back (the caller holds self.cv)."""
@@ -517,7 +588,8 @@ class TurnScheduler:
 
     def next_ticket(self) -> Ticket | None:
         """The ticket whose turn it is (the caller holds self.cv)."""
-        order = self._by_model(sorted(self.waiting, key=lambda t: t.seq))
+        now = self.clock()
+        order = self._by_model(sorted((t for t in self.waiting if not self.deferred(t, now)), key=lambda t: t.seq))
         if self.prio is not None:
             return self._next_by_priority(order)
         if order and self.holds():
@@ -667,8 +739,8 @@ class TurnScheduler:
 
 def turns_from_config(cfg: dict, lock, models: bool = False) -> tuple[TurnScheduler | TurnPolicy | None, str | None]:
     """The config's "turn_slice_s" (0 or absent: off), "turn_max_wait_s" (default 120; 0: no limit), "turn_hold_s"
-    (default 3; 0: off; one request at a time only), "turn_hold_skip_tools" (default HOLD_SKIP_TOOLS) and
-    "turn_hold_skip_timeout_s" (default 120; 0: a call's timeout is not looked at), and the priorities (the module's
+    (default 3; 0: off; one request at a time only), "turn_hold_skip_timeout_s" (default 120; 0: a call's timeout is
+    not looked at), "turn_side_wait_s" (default 0: off), and the priorities (the module's
     docstring): "priority" (default true with a turn slice; true without one turns the scheduler on for them alone),
     "priority_preempt" ("full", "timeout" or "off"), "priority_preempt_delta", "priority_min_run_s",
     "priority_preempt_timeout_s", "priority_reserve_s" (0: no reservations), "priority_aging_s" (0: no aging),
@@ -687,11 +759,10 @@ def turns_from_config(cfg: dict, lock, models: bool = False) -> tuple[TurnSchedu
     wait = seconds("turn_max_wait_s", 120, "0 = no limit")
     hold = seconds("turn_hold_s", 3, "0 = off")
     skip_timeout = seconds("turn_hold_skip_timeout_s", 120, "0 = not looked at")
-    skip = cfg.get("turn_hold_skip_tools", HOLD_SKIP_TOOLS)
-    if skip is None:
-        skip = HOLD_SKIP_TOOLS
-    if not isinstance(skip, (list, tuple)) or not all(isinstance(x, str) for x in skip):
-        raise ValueError(f'"turn_hold_skip_tools" must be a list of tool names, not {skip!r}')
+    side_wait = seconds("turn_side_wait_s", 0, "0 = off")
+    if cfg.get("turn_hold_skip_tools") is not None:
+        raise ValueError('"turn_hold_skip_tools" was removed: a client names its slow tools in each request\'s '
+                         '"strata_yield_tools"')
     prio_on = cfg.get("priority")
     if prio_on is not None and not isinstance(prio_on, bool):
         raise ValueError(f'"priority" must be true or false, not {prio_on!r}')
@@ -720,7 +791,7 @@ def turns_from_config(cfg: dict, lock, models: bool = False) -> tuple[TurnSchedu
         reserve = f"; a session's tool calls keep worse bands out for up to {prio.reserve_s:g} s" \
             if prio.reserve_s else ""
         note += (f"; priorities: a request {stop} (priority_preempt: {prio.preempt}){reserve}{aging}")
-    return TurnScheduler(lock, slice_s, wait, hold, skip, skip_timeout, prio=prio), note
+    return TurnScheduler(lock, slice_s, wait, hold, skip_timeout, side_wait, prio=prio), note
 
 
 def priorities_from_config(cfg: dict) -> Priorities:

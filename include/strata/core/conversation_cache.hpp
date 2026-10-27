@@ -423,6 +423,21 @@ public:
         release(entries_[i]);
         erase(i);
     }
+    /// The entries parked for `session` (a conversation its client said no request will continue: it compacted it)
+    /// become obsolete: they stay, and can still be taken or borrowed from (a shared system prompt), but make_room
+    /// evicts them before any other.  An entry parked for the session later is not.  How many it marked.
+    size_t drop_session(uint64_t session) {
+        if (session == 0) return 0;
+        size_t n = 0;
+        for (auto& e : entries_)
+            if (e.session == session && !e.obsolete) { e.obsolete = true; ++n; }
+        return n;
+    }
+    size_t obsolete() const {
+        size_t n = 0;
+        for (const auto& e : entries_) n += e.obsolete;
+        return n;
+    }
     // While a borrowed entry (the donor) is being restored, parking the outgoing conversation must not evict or drop
     // it: guard() it.  When the outgoing image fits only without it, make_room refuses before evicting anything and
     // guard_blocked() says so: the caller then takes the entry as before, so the conversation that was active a
@@ -460,17 +475,20 @@ public:
     // gate in generate.cpp).  A ConversationBuffer is a list of 16 MiB segments and each segment is its
     // own allocation, far above glibc's mmap threshold, so dropping an entry returns the whole footprint
     // to the kernel at once - the next admission check reads it back from /proc/meminfo.
+    // An obsolete entry (drop_session) goes first, the oldest of them.
     // False when none can go (empty, or only entries that hold a pinned shared prefix are left).
     bool evict_oldest() {
         // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
-        for (size_t i = 0; i < entries_.size(); ++i) {
-            if (entries_[i].image.pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
-            bytes_ -= entries_[i].bytes;
-            release(entries_[i]);
-            erase(i);
-            ++evictions_;
-            return true;
-        }
+        for (const bool obsolete_only : {true, false})
+            for (size_t i = 0; i < entries_.size(); ++i) {
+                if (obsolete_only && !entries_[i].obsolete) continue;
+                if (entries_[i].image.pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
+                bytes_ -= entries_[i].bytes;
+                release(entries_[i]);
+                erase(i);
+                ++evictions_;
+                return true;
+            }
         return false;
     }
 
@@ -547,12 +565,13 @@ public:
         return longest;
     }
 
-    bool put(SavedConversation&& image, size_t held = 0) {
+    /// `session`: the server's tag of the conversation (0: none), for drop_session.
+    bool put(SavedConversation&& image, size_t held = 0, uint64_t session = 0) {
         const size_t n = image.bytes();
         if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
         if (!make_room(n, held)) return false;
-        entries_.push_back(Entry{std::move(image), 0, n});
+        entries_.push_back(Entry{std::move(image), 0, n, session});
         serials_.push_back(next_serial_++);
         bytes_ += n;
         return true;
@@ -560,14 +579,14 @@ public:
 
     /// The file tier: the engine wrote the image to file `file` (`bytes` on disk); the cache keeps `skeleton`
     /// (conversation_skeleton) and owns the file from here on, so a refusal removes it.
-    bool put_file(SavedConversation&& skeleton, uint64_t file, size_t bytes, size_t held = 0) {
+    bool put_file(SavedConversation&& skeleton, uint64_t file, size_t bytes, size_t held = 0, uint64_t session = 0) {
         if (!on_disk() || file == 0 || !enabled() || held > budget_ || bytes > budget_ - held) {
             if (on_disk() && file != 0) remove_(file);
             return false;
         }
         drop_superseded(skeleton.live.ids, skeleton.live.imgs, skeleton.checkpoints, skeleton.cvec);
         if (!make_room(bytes, held)) { remove_(file); return false; }
-        entries_.push_back(Entry{std::move(skeleton), file, bytes});
+        entries_.push_back(Entry{std::move(skeleton), file, bytes, session});
         serials_.push_back(next_serial_++);
         bytes_ += bytes;
         return true;
@@ -580,6 +599,8 @@ private:
         SavedConversation image;
         uint64_t file = 0;
         size_t bytes = 0;
+        uint64_t session = 0;   // the server's tag of the conversation (sess=), 0: none
+        bool obsolete = false;  // drop_session: evicted before any other
     };
     void release(Entry& e) {
         if (e.file != 0 && remove_) remove_(e.file);

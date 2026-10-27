@@ -9458,6 +9458,10 @@ int main(int argc, char** argv) {
         std::vector<int32_t> live;
         std::vector<ImgKey> live_imgs, req_imgs;
         bool live_ok = false;
+        // the server's tag of the live conversation's session (sess=; 0: none), and whether it may be parked (park=0: a
+        // request no later one continues by its session - a side call, a summary - is not written out on a switch)
+        uint64_t live_session = 0;
+        bool live_park = true;
         // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
         bool nan_flush = false;
         // #3465: the non-finite logits came in a window that reads the PROMPT's tail (the last few tokens, read through
@@ -9648,6 +9652,11 @@ int main(int argc, char** argv) {
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            if (!live_park) {   // park=0, or its session was dropped: no request will continue it
+                std::fprintf(stderr, "strata serve: conversation cache: skip parking (%zu tokens, not a session's "
+                                     "turn; parked=%zu)\n", live.size(), conversations.size());
+                return true;
+            }
             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
             // is a silent stretch of the "request" stage; when the OS has paged that memory out it takes minutes.
             // Named, so a stall report says "parking"; its copies beat (conversation_copy.hpp), so the watchdog
@@ -9838,7 +9847,7 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 const bool stored = conversations.put_file(strata::core::conversation_skeleton(meta, view.checkpoints),
-                                                           file, (size_t) fs.bytes(), held);
+                                                           file, (size_t) fs.bytes(), held, live_session);
                 const std::string at_note = at ? ", live at its checkpoint, " +
                                                      std::to_string((int64_t) live.size() - park_tokens) + " tail tokens"
                                                : std::string();
@@ -9921,7 +9930,7 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
-                const bool stored = conversations.put(std::move(image), held);
+                const bool stored = conversations.put(std::move(image), held, live_session);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
@@ -12574,6 +12583,8 @@ int main(int argc, char** argv) {
                     for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
                     cvec_cached = image.cvec;
                     live_ok = true;
+                    live_session = 0;   // a session file has no server tag: parked as before
+                    live_park = true;
                     if (nan_flush) {   // #879: the file replaced the poisoned session; the parked ones go (no slots here)
                         nan_flush = false;
                         const size_t n_parked = conversations.clear();
@@ -12612,6 +12623,13 @@ int main(int argc, char** argv) {
             // parked after it.  It still resumes from a checkpoint it matches, and still saves the system-prompt root
             // when that reaches --prompt-cache-root.  Absent = checkpointed as before.
             int req_ckpt = 1;
+            // sess=<hex>: the server's tag of the request's session.  park=0: the conversation it leaves is continued
+            // while it is live but not parked when the engine switches away.  drop=<hex>,...: sessions whose parked
+            // conversations become obsolete (evicted first), and whose live one is not parked (their client compacted
+            // them).  Absent = as before.
+            uint64_t req_sess = 0;
+            int req_park = 1;
+            std::vector<uint64_t> req_drops;
             // pin=N: the first N prompt tokens are a shared read-only prefix (a long document that many short queries
             // follow).  The prompt is read in two parts at N, the checkpoint there is PINNED (retention never evicts it,
             // a parked conversation holding it stays parked) and a later request that resumes from it does not park the
@@ -12642,6 +12660,19 @@ int main(int argc, char** argv) {
                     if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
+                    else if (key == "park") req_park = std::atoi(tok.c_str() + eq + 1) != 0;
+                    else if (key == "sess") req_sess = std::strtoull(tok.c_str() + eq + 1, nullptr, 16);
+                    else if (key == "drop") {
+                        req_drops.clear();
+                        const char* q = tok.c_str() + eq + 1;
+                        while (*q != '\0') {
+                            char* qe = nullptr;
+                            const unsigned long long v = std::strtoull(q, &qe, 16);
+                            if (qe == q || (*qe != ',' && *qe != '\0')) { req_drops.clear(); break; }
+                            if (v != 0) req_drops.push_back((uint64_t) v);
+                            q = *qe == ',' ? qe + 1 : qe;
+                        }
+                    }
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
@@ -12672,6 +12703,16 @@ int main(int argc, char** argv) {
                 }
             }
             strata::prefill::Prefill::set_pipe_request(req_pipe);   // every request sets it: none carries over
+            for (const uint64_t d : req_drops) {   // before anything below matches or parks
+                const size_t marked = conversations.drop_session(d);
+                const bool live_gone = live_session == d && live_ok && live_park;
+                if (live_session == d) live_park = false;
+                if (marked > 0 || live_gone)
+                    std::fprintf(stderr, "strata serve: conversation cache: session %016llx dropped (%zu parked marked "
+                                         "obsolete, evicted first%s); parked=%zu obsolete=%zu\n", (unsigned long long) d,
+                                 marked, live_gone ? ", the live one not parked" : "", conversations.size(),
+                                 conversations.obsolete());
+            }
             std::vector<float> req_bias;
             std::string bias_error;
             if (req_bias_present && (o.batch > 0 ||
@@ -15700,6 +15741,8 @@ int main(int argc, char** argv) {
                 live.swap(consumed);
                 live_imgs = imgs_below(req_imgs, (int64_t) live.size());
                 live_ok = o.prompt_cache > 0 && req_ckpt;   // ckpt=0: nothing to continue or park (#830)
+                live_session = req_sess;
+                live_park = req_park != 0;
                 if (nf_hit) live_ok = false;   // #879 (the next request's start drops the rest)
             } else if (!nf_hit && pp_exact && pp_reached > 0 && o.prompt_cache > 0 && req_ckpt &&
                        pp_reached <= (int64_t) cur.size()) {
@@ -15709,6 +15752,8 @@ int main(int argc, char** argv) {
                 live.assign(cur.begin(), cur.begin() + pp_reached);
                 live_imgs = imgs_below(req_imgs, pp_reached);
                 live_ok = true;
+                live_session = req_sess;
+                live_park = req_park != 0;
                 std::fprintf(stderr, "strata serve: cancelled request keeps its conversation: %lld tokens live\n",
                              (long long) pp_reached);
             }

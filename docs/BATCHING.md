@@ -168,8 +168,21 @@ would push it out, even one that arrived earlier.
 - **What continues a conversation**: the next step of the response the engine last ran for it, the request whose tool
   results answer a call that response made. The server mints every call's ID and the client sends it back with the
   result (`tool_call_id`, Anthropic's `tool_use_id`, the Responses API's `call_id`), so the match is exact: no prompt
-  comparison, and an agent and a subagent with the same system prompt are never taken for one conversation. A new
-  user message starts a turn of its own (a switch), and so does a retry.
+  comparison, and an agent and a subagent with the same system prompt are never taken for one conversation. A
+  request that names the same session (`"strata_session"`, the `X-Strata-Session` header, or Anthropic's
+  `metadata.user_id`) continues it too: a new user message, a retry. A one-shot (`"strata_checkpoint": false`: a
+  summary, a client's side call) never continues a conversation nor is continued, even in its session. Without a
+  session a new user message starts a turn of its own (a switch), and so does a retry.
+- **Yielding**: a session gives the turn up, so other sessions need not wait for it:
+  - `"strata_yield": true` on a request: as it arrives, its session's hold and reservation end. A client sends it
+    with a summary (the conversation is read again after it anyway).
+  - `"strata_yield_tools": [...]` on a request: the tools it knows to be slow (a subagent, a question for a person).
+    A response with a call to one of them is neither held nor reserved for. The server knows no tool names of its
+    own: a client that sends none is held for (3 s) and reserved for (`priority_reserve_s`) whatever it called.
+  - `"turn_side_wait_s"` (default 0: off): a one-shot of a session whose follow-up is held or reserved for waits for
+    it up to this long, so its side work (a memory review between tool calls) does not push its conversation out
+    mid-loop. Only for clients whose side calls run in the background: one the session's loop waits on would stall
+    it that long.
 
 - **One request at a time** (no `"parallel"`): the lane is the engine's session; the slice counts the time each of the
   conversation's requests held the turn since it took over. Without a slice the turn goes to whichever request takes
@@ -184,10 +197,8 @@ would push it out, even one that arrived earlier.
   nothing else takes it meanwhile. Most tools return within that (in Claude Code transcripts, 9 in 10 Bash calls
   without a timeout came back within 3 s), and a switch costs seconds. A longer tool outlasts the hold and the turn
   moves on. Not held for:
-  - calls to `"turn_hold_skip_tools"`, by default Claude Code's `Agent`, `Task`, `AskUserQuestion`, `ExitPlanMode`,
-    `WebFetch`, `WebSearch` and Hermes Agent's `delegate_task`, `clarify`, `kanban_block`: a subagent's requests are
-    what its call waits on, a question waits for a person, and Claude Code's web calls rarely return in time (pi's
-    `web_search` and `fetch_content` mostly do, so they are held for);
+  - a session that yielded (`"strata_yield"`), or calls to the tools its request named in `"strata_yield_tools"`
+    (above; `"turn_hold_skip_tools"`, the server's own list, was removed: the client knows its slow tools);
   - a call whose timeout argument is above `"turn_hold_skip_timeout_s"` (default 120): the model asks for a long
     timeout when it expects a long command. The unit is read from the tool's schema in the request (Claude Code's
     `Bash`: milliseconds; pi's `bash` and Hermes Agent's `terminal`: seconds), and a call in the background
@@ -229,8 +240,8 @@ The scheduler is fair in the manner of Linux's CFS, in bands:
   waiting, or than the session the turn is reserved for. Requests further down wait, and
   `turn_max_wait_s` applies within the band only.
 - **Reservations.** Once a session's response makes tool calls, the turn is reserved for its follow-up: requests
-  outside its band wait until it ends a response with no calls (its turn is over), its calls are ones the hold skips
-  (the skipped tools, a timeout above `turn_hold_skip_timeout_s`: the session is yielding), or
+  outside its band wait until it ends a response with no calls (its turn is over), it yields (`strata_yield`, a call
+  to one of its `strata_yield_tools`, a timeout above `turn_hold_skip_timeout_s`), or
   `"priority_reserve_s"` (default 60; 0 = none) runs out. A reservation spares the urgent session the read-back a
   worse request in the gap would cost it; the engine may stand idle meanwhile. Requests of the session's own band
   wait only as long as the hold says.
