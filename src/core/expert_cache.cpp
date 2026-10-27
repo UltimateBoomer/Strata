@@ -766,6 +766,32 @@ bool ExpertCache::fill_slot_queued_parts(int32_t slot, const BlobPart* parts, in
     return true;
 }
 
+bool ExpertCache::fill_arena_queued(uint64_t at, const void* host, uint64_t n, std::string& err) {
+    if (base_ == nullptr || host == nullptr || at > (uint64_t) bytes() || n > (uint64_t) bytes() - at) {
+        err = "ExpertCache::fill_arena_queued: the range is outside the arena";
+        return false;
+    }
+    const cudaError_t e = cudaMemcpyAsync(base_ + at, host, (size_t) n, cudaMemcpyHostToDevice, (cudaStream_t) 0);
+    if (e != cudaSuccess) {
+        err = std::string("ExpertCache::fill_arena_queued: ") + cudaGetErrorString(e);
+        return false;
+    }
+    return true;
+}
+
+bool ExpertCache::read_arena(uint64_t at, void* host, uint64_t n, std::string& err) const {
+    if (base_ == nullptr || host == nullptr || at > (uint64_t) bytes() || n > (uint64_t) bytes() - at) {
+        err = "ExpertCache::read_arena: the range is outside the arena";
+        return false;
+    }
+    const cudaError_t e = cudaMemcpy(host, base_ + at, (size_t) n, cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        err = std::string("ExpertCache::read_arena: ") + cudaGetErrorString(e);
+        return false;
+    }
+    return true;
+}
+
 bool ExpertCache::sync_queued(std::string& err) {
     const cudaError_t e = cudaStreamSynchronize((cudaStream_t) 0);
     if (e != cudaSuccess) {

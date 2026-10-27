@@ -33,6 +33,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/pinned.hpp"
+#include "strata/core/load_image.hpp"
 #include "strata/core/pin_budget.hpp"
 #include "strata/core/uma_cache.hpp"
 #include "strata/core/remote_experts.hpp"
@@ -6493,7 +6494,69 @@ int main(int argc, char** argv) {
         }
         const auto fill_t0 = std::chrono::steady_clock::now();
         uint64_t fill_bytes = 0;
-        for (int64_t i = 0; i < want; ++i) {
+        // load_image.hpp: the filled slots' bytes as one file in slot order, read sequentially instead of blob by blob.
+        // The admission is the same on every start (the profile's pairs in order until the slots run out), so the
+        // pairs are admitted first and the key holds each one's slot: another profile or cache size is a miss.
+        std::string image_path;
+        uint64_t image_key = 0, image_bytes = 0;
+        bool image_write = false, from_image = false;
+        if (const std::string image_dir = strata::core::load_image::dir();
+            !image_dir.empty() && !per_layer && srcp == &src) {
+            std::vector<uint64_t> table;   // per admitted pair: layer, expert, slot offset, blob bytes
+            for (int64_t i = 0; i < want; ++i) {
+                const auto& pr = profile[(size_t) i];
+                const int32_t slot = xcache.admit(pr.first, pr.second);
+                if (slot == strata::core::kNotResident) break;
+                table.insert(table.end(), {(uint64_t) pr.first, (uint64_t) pr.second, xcache.slot_offset(slot),
+                                           (uint64_t) strata::kernels::cpu::expert_layout().blob_bytes(pr.first)});
+            }
+            image_bytes = xcache.slot_offset(xcache.resident());
+            image_key = strata::core::fnv1a64((const uint8_t*) "vram1", 5, src.files_identity());
+            image_key = strata::core::fnv1a64((const uint8_t*) table.data(), (uint64_t) (table.size() * sizeof(uint64_t)),
+                                              image_key);
+            image_path = image_dir + "/vram.img";
+            strata::core::load_image::Reader image;
+            std::string why;
+            void* stage[2] = {nullptr, nullptr};
+            cudaEvent_t done[2] = {nullptr, nullptr};
+            constexpr uint64_t kStage = 64ull << 20;
+            if (image_bytes > 0 && image.open(image_path, image_key, image_bytes, why)) {
+                // two page-locked buffers: one is read from the drive while the other is copied to the GPU
+                bool ok = true;
+                for (int b = 0; b < 2 && ok; ++b)
+                    ok = cudaHostAlloc(&stage[b], (size_t) kStage, cudaHostAllocDefault) == cudaSuccess &&
+                         cudaEventCreateWithFlags(&done[b], cudaEventDisableTiming) == cudaSuccess;
+                for (uint64_t at = 0, k = 0; ok && at < image_bytes; at += kStage, ++k) {
+                    const uint64_t n = std::min(kStage, image_bytes - at);
+                    ok = (k < 2 || cudaEventSynchronize(done[k % 2]) == cudaSuccess) &&
+                         image.read(at, stage[k % 2], n) && xcache.fill_arena_queued(at, stage[k % 2], n, err) &&
+                         cudaEventRecord(done[k % 2], (cudaStream_t) 0) == cudaSuccess;
+                }
+                ok = ok && xcache.sync_queued(err);
+                (void) cudaGetLastError();
+                if (ok) {
+                    from_image = true;
+                    xcache.note_fills(xcache.resident());
+                    prefilled = xcache.resident();
+                    fill_bytes = image_bytes;
+                    std::fprintf(stderr, "strata generate: the GPU cache's slots come from the load image %s\n",
+                                 image_path.c_str());
+                } else {
+                    std::fprintf(stderr, "strata generate: WARNING: the load image %s could not be read (%s); the "
+                                         "slots are filled blob by blob\n", image_path.c_str(), err.c_str());
+                    err.clear();
+                }
+            } else if (image_bytes > 0) {
+                image_write = strata::core::load_image::write_enabled();
+                std::fprintf(stderr, "strata generate: load image %s: %s; the slots are filled blob by blob%s\n",
+                             image_path.c_str(), why.c_str(), image_write ? " and written to it after" : "");
+            }
+            for (int b = 0; b < 2; ++b) {
+                if (stage[b] != nullptr) (void) cudaFreeHost(stage[b]);
+                if (done[b] != nullptr) (void) cudaEventDestroy(done[b]);
+            }
+        }
+        for (int64_t i = 0; i < want && !from_image; ++i) {
             if (!per_layer && srcp == &src && src.unbuffered() && i % 64 == 0) {
                 if (ahead.valid()) ahead.get();
                 else read_batch(i);
@@ -6530,6 +6593,19 @@ int main(int argc, char** argv) {
                              "slot 0 verified\n",
                      (long long) prefilled, (long long) (per_layer ? xcache.slots() : want), fill_s,
                      fill_s > 0 ? (double) fill_bytes / 1e6 / fill_s : 0.0);
+        if (image_write && prefilled > 0) {
+            const auto write_t0 = std::chrono::steady_clock::now();
+            std::string werr;
+            if (strata::core::load_image::write(image_path, image_key, image_bytes, [&](uint64_t at, uint64_t n, void* buf) {
+                    return xcache.read_arena(at, buf, n, werr);
+                }, werr))
+                std::fprintf(stderr, "strata generate: wrote the load image %s (%.2f GiB) in %.1f s\n", image_path.c_str(),
+                             (double) image_bytes / 1073741824.0,
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - write_t0).count());
+            else
+                std::fprintf(stderr, "strata generate: WARNING: the load image %s was not written: %s\n",
+                             image_path.c_str(), werr.c_str());
+        }
         if (std::getenv("STRATA_VERIFY_COMPLEMENT") != nullptr) {
             // tests: the filled slots' checksum (each slot's blob read back and hashed, then the hashes in slot order)
             std::vector<std::pair<int32_t, int64_t>> sl;   // (slot, blob bytes)
