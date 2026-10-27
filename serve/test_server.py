@@ -1665,6 +1665,65 @@ class SamplingKeys(unittest.TestCase):
         self.assertFalse([k for k in self.keys(temperature=0.7) if k.startswith("penalty")])
 
 
+class SessionKeys(unittest.TestCase):
+    """The engine's conversation-cache keys: sess= (the session's tag), park=0 ("park": "sessions" and no session),
+    drop= (the sessions a request's strata_drop made obsolete, sent once with the next request)."""
+
+    class Recording(MockEngine):
+        def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+            self.seen = StrataEngine.sampling_keys(sampling).split()
+            return super().generate(ids, max_new, sampling, cancel, embeddings)
+
+    def setUp(self):
+        tok = ByteTokenizer()
+        self.engine = self.Recording(tok, "ok", max_context=CTX)
+        self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+
+    def run_with(self, turn, sampling=None):
+        from serve.turns import Turn
+        self.svc.request_turn.turn = turn if turn is not None else Turn()
+        try:
+            list(self.svc.run([1, 2, 3], False, None, 4, dict(sampling or {}), threading.Event()))
+        finally:
+            self.svc.request_turn.turn = None
+        return self.engine.seen
+
+    def test_session_tag(self):
+        from serve.server import session_tag
+        from serve.turns import Turn
+        keys = self.run_with(Turn(session_key="S"))
+        self.assertIn(f"sess={session_tag('S'):016x}", keys)
+        self.assertNotIn("park=0", keys)
+        self.assertFalse([k for k in self.run_with(None) if k.startswith(("sess=", "park=", "drop="))],
+                         "no session, \"park\": \"all\": as before")
+
+    def test_park_sessions(self):
+        from serve.turns import Turn
+        self.svc.park_sessions = True
+        self.assertIn("park=0", self.run_with(None))
+        self.assertNotIn("park=0", self.run_with(Turn(session_key="S")))
+
+    def test_drop_sent_once(self):
+        from serve.server import session_tag
+        from serve.turns import Turn
+        self.svc.drop_session("S")
+        self.assertIn(f"drop={session_tag('S'):016x}", self.run_with(Turn(session_key="T")), "whoever goes next")
+        self.assertFalse([k for k in self.run_with(None) if k.startswith("drop=")])
+
+    def test_a_later_pass_does_not_send_the_drop_again(self):
+        from serve.server import ENGINE_SESSION_KEY, session_tag
+        self.svc.drop_session("S")
+        first = self.svc.engine_session({"temperature": 0.5}, None)
+        self.assertEqual(first[ENGINE_SESSION_KEY]["drop"], [session_tag("S")])
+        again = self.svc.engine_session(first, None)   # the pass loop hands its sampling back in
+        self.assertEqual(again, {"temperature": 0.5}, "no session, \"park\": \"all\", nothing pending: no keys")
+
+    def test_a_client_cannot_set_the_keys(self):
+        from serve.server import ENGINE_SESSION_KEY
+        keys = self.run_with(None, {ENGINE_SESSION_KEY: {"sess": 5, "park": False, "drop": [7]}})
+        self.assertFalse([k for k in keys if k.startswith(("sess=", "park=", "drop="))])
+
+
 class SharedPrefix(unittest.TestCase):
     """R1: "strata_prefix" marks the first messages as a shared prefix; the engine gets pin=N."""
 

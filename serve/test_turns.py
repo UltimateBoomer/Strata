@@ -11,8 +11,8 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from serve.turns import (HOLD_SKIP_TOOLS, Turn, TurnPolicy, TurnScheduler, call_timeout_s,  # noqa: E402
-                         cited_calls, timeout_units, turns_from_config)
+from serve.turns import (Turn, TurnPolicy, TurnScheduler, call_timeout_s, cited_calls,  # noqa: E402
+                         request_drops, request_flag, request_yield_tools, timeout_units, turns_from_config)
 
 def step(name):
     """A response that made one call, `name`."""
@@ -167,8 +167,8 @@ class HoldTest(unittest.TestCase):
         self.lock = threading.Lock()
 
     def sched(self, hold_s=3, max_wait_s=120):
-        return TurnScheduler(self.lock, 600, max_wait_s=max_wait_s, hold_s=hold_s, skip_tools=("Agent",),
-                             skip_timeout_s=120, clock=self.clock)
+        return TurnScheduler(self.lock, 600, max_wait_s=max_wait_s, hold_s=hold_s, skip_timeout_s=120,
+                             clock=self.clock)
 
     def run_one(self, s, turn):
         t = s.enter(turn)
@@ -204,7 +204,8 @@ class HoldTest(unittest.TestCase):
 
     def test_no_hold(self):
         cases = {"no calls": Turn(),
-                 "a skipped tool": Turn(issued={"x"}, tools={"Read", "Agent"}),
+                 "a tool its client named slow": Turn(issued={"x"}, tools={"Read", "Agent"},
+                                                       yield_tools=frozenset({"Agent"})),
                  "a long timeout": Turn(issued={"x"}, tools={"Bash"}, timeout_s=300)}
         for why, turn in cases.items():
             s = self.sched()
@@ -286,11 +287,124 @@ class HoldTest(unittest.TestCase):
                          "seconds as the schema says, though 1000 or more")
         self.assertEqual(call_timeout_s({"command": "ls"}, units["bash"]), 0.0)
 
-    def test_skip_tools_cover_the_agents(self):
-        for name in ("Agent", "Task", "AskUserQuestion", "delegate_task", "clarify"):
-            self.assertIn(name, HOLD_SKIP_TOOLS)
-        for name in ("Bash", "bash", "terminal", "web_search", "read_file"):
-            self.assertNotIn(name, HOLD_SKIP_TOOLS)
+    def test_no_tool_is_skipped_by_name_unless_the_client_says(self):
+        s = self.sched()
+        self.run_one(s, Turn(issued={"x"}, tools={"Agent"}))
+        self.assertTrue(s.view()["holding"], "the server knows no tool names of its own")
+
+
+class SessionTest(unittest.TestCase):
+    """strata_session continues a conversation; one-shots, strata_yield, strata_yield_tools and turn_side_wait_s."""
+
+    def setUp(self):
+        self.clock = Clock()
+        self.lock = threading.Lock()
+
+    def sched(self, side_wait_s=30):
+        return TurnScheduler(self.lock, 600, hold_s=3, skip_timeout_s=120, side_wait_s=side_wait_s, clock=self.clock)
+
+    def run_one(self, s, turn):
+        t = s.enter(turn)
+        self.assertTrue(s.acquire(t, 0))
+        s.release(1)
+
+    def test_continues_by_session(self):
+        lane = Turn(issued={"x"}, session_key="S")
+        self.assertTrue(TurnPolicy.continues(Turn(session_key="S"), lane), "a new user message of the session")
+        self.assertFalse(TurnPolicy.continues(Turn(session_key="T"), lane))
+        self.assertFalse(TurnPolicy.continues(Turn(), lane), "no session, no cited call")
+        self.assertFalse(TurnPolicy.continues(Turn(session_key="S", one_shot=True), lane), "a summary")
+        self.assertFalse(TurnPolicy.continues(Turn(session_key="S"), Turn(session_key="S", one_shot=True)),
+                         "nothing continues a one-shot")
+        self.assertTrue(TurnPolicy.continues(Turn(frozenset({"x"}), session_key="T"), lane), "a cited call still does")
+
+    def test_same_session_takes_a_held_turn(self):
+        s = self.sched()
+        self.run_one(s, Turn(issued={"x"}, session_key="S"))
+        other = s.enter(Turn(session_key="T"))
+        self.assertFalse(s.acquire(other, 0), "held for S")
+        mine = s.enter(Turn(session_key="S"))           # a retry or a new message of S, no cited call
+        self.assertTrue(s.acquire(mine, 0))
+        s.release(1)
+
+    def test_yield_ends_the_hold(self):
+        s = self.sched()
+        self.run_one(s, Turn(issued={"x"}, session_key="S"))
+        other = s.enter(Turn(session_key="T"))
+        self.assertFalse(s.acquire(other, 0))
+        summary = s.enter(Turn(session_key="S", one_shot=True, yield_now=True))
+        self.assertFalse(s.view()["holding"], "S gave the turn up")
+        self.assertTrue(s.acquire(other, 0), "in arrival order once nothing is held")
+        s.release(1)
+        self.assertTrue(s.acquire(summary, 0))
+        s.release(1)
+
+    def test_yield_of_another_session_does_nothing(self):
+        s = self.sched()
+        self.run_one(s, Turn(issued={"x"}, session_key="S"))
+        s.enter(Turn(session_key="T", yield_now=True))
+        self.assertTrue(s.view()["holding"])
+
+    def test_yield_tools(self):
+        s = self.sched()
+        self.run_one(s, Turn(issued={"x"}, tools={"subagent"}, session_key="S",
+                             yield_tools=frozenset({"subagent", "web_search"})))
+        self.assertFalse(s.view()["holding"])
+        s = self.sched()
+        self.run_one(s, Turn(issued={"x"}, tools={"read"}, session_key="S", yield_tools=frozenset({"subagent"})))
+        self.assertTrue(s.view()["holding"])
+
+    def test_side_call_waits_for_its_session(self):
+        s = self.sched()
+        self.run_one(s, Turn(issued={"x"}, session_key="S"))
+        self.clock.t = 10                               # past the hold: the turn is free
+        side = s.enter(Turn(session_key="S", one_shot=True))
+        self.assertFalse(s.acquire(side, 0), "S's tool loop goes on: its side call waits")
+        follow = s.enter(Turn(frozenset({"x"}), session_key="S"))
+        self.assertTrue(s.acquire(follow, 0))
+        s.release(1)                                    # S's turn ended with no calls
+        self.assertTrue(s.acquire(side, 0))
+        s.release(1)
+
+    def test_side_call_waits_only_while_its_session_is_in_the_engine(self):
+        s = self.sched()
+        self.run_one(s, Turn(issued={"x"}, session_key="S"))
+        self.clock.t = 10
+        side = s.enter(Turn(session_key="S", one_shot=True))
+        other = s.enter(Turn(session_key="T", one_shot=True))
+        self.assertTrue(s.acquire(other, 0), "another session's one-shot does not wait for S")
+        s.release(1)                                    # S's conversation is out of the engine already
+        self.assertTrue(s.acquire(side, 0))
+        s.release(1)
+
+    def test_side_wait_runs_out(self):
+        s = self.sched(side_wait_s=30)
+        self.run_one(s, Turn(issued={"x"}, session_key="S"))
+        side = s.enter(Turn(session_key="S", one_shot=True))
+        self.clock.t = 29
+        self.assertFalse(s.acquire(side, 0))
+        self.clock.t = 31
+        self.assertTrue(s.acquire(side, 0))
+        s.release(1)
+
+    def test_request_fields(self):
+        self.assertEqual(request_flag({}, "strata_yield"), False)
+        self.assertEqual(request_flag({"strata_yield": True}, "strata_yield"), True)
+        self.assertEqual(request_drops({"strata_drop": True}, "S"), ("S",))
+        self.assertEqual(request_drops({"strata_drop": True}, None), (), "no session: nothing to drop")
+        self.assertEqual(request_drops({"strata_drop": ["old", "older"]}, "S"), ("old", "older"))
+        self.assertEqual(request_drops({"strata_drop": False}, "S"), ())
+        for bad in ({"strata_drop": "S"}, {"strata_drop": [1]}, {"strata_drop": 1}):
+            with self.assertRaises(ValueError):
+                request_drops(bad, "S")
+        self.assertEqual(request_yield_tools({"strata_yield_tools": ["a", "b"]}), frozenset({"a", "b"}))
+        self.assertEqual(request_yield_tools({}), frozenset())
+        for bad in ({"strata_yield": 1}, {"strata_yield": "yes"}):
+            with self.assertRaises(ValueError):
+                request_flag(bad, "strata_yield")
+        for bad in ({"strata_yield_tools": "a"}, {"strata_yield_tools": [1]}, {"strata_yield_tools": [""]}):
+            with self.assertRaises(ValueError):
+                request_yield_tools(bad)
 
 
 class ConfigTest(unittest.TestCase):
@@ -301,19 +415,19 @@ class ConfigTest(unittest.TestCase):
         s, note = turns_from_config({"turn_slice_s": 30, "turn_max_wait_s": 90}, lock)
         self.assertIsInstance(s, TurnScheduler)
         self.assertEqual((s.slice_s, s.max_wait_s, s.lock), (30.0, 90.0, lock))
-        self.assertEqual((s.hold_s, s.skip_tools, s.skip_timeout_s), (3.0, frozenset(HOLD_SKIP_TOOLS), 120.0))
+        self.assertEqual((s.hold_s, s.skip_timeout_s, s.side_wait_s), (3.0, 120.0, 0.0))
         self.assertIn("30 s", note)
         self.assertIn("up to 3 s", note)
-        s, note = turns_from_config({"turn_slice_s": 30, "turn_hold_s": 0, "turn_hold_skip_tools": ["X"],
-                                     "turn_hold_skip_timeout_s": 0}, lock)
-        self.assertEqual((s.hold_s, s.skip_tools, s.skip_timeout_s), (0.0, frozenset({"X"}), 0.0))
+        s, note = turns_from_config({"turn_slice_s": 30, "turn_hold_s": 0, "turn_hold_skip_timeout_s": 0,
+                                     "turn_side_wait_s": 0}, lock)
+        self.assertEqual((s.hold_s, s.skip_timeout_s, s.side_wait_s), (0.0, 0.0, 0.0))
         self.assertNotIn("turn_hold_s", note)
         s, note = turns_from_config({"turn_slice_s": 30, "parallel": 2}, lock)
         self.assertIsInstance(s, TurnPolicy)
         self.assertIn("batch slot", note)
         for bad in ({"turn_slice_s": "30s"}, {"turn_slice_s": -1}, {"turn_slice_s": True},
                     {"turn_slice_s": 1, "turn_max_wait_s": "x"}, {"turn_slice_s": 1, "turn_hold_s": -1},
-                    {"turn_slice_s": 1, "turn_hold_skip_tools": "Agent"}):
+                    {"turn_slice_s": 1, "turn_hold_skip_tools": ["Agent"]}, {"turn_slice_s": 1, "turn_side_wait_s": "x"}):
             with self.assertRaises(ValueError):
                 turns_from_config(bad, lock)
 

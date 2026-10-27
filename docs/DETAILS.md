@@ -1197,6 +1197,20 @@ slots and the RAM budget, how many were parked, restored and evicted, and the la
 log), and for every setup how many prompt tokens the cache gave back - in the last request and since the start.
 `/metrics` has the same under `"conversation_cache"`.
 
+**Which conversations are parked (`"park"`, run config).** `"all"` (the default) parks every conversation the engine
+switches away from, as above. `"sessions"` parks only those of requests that name a session (`"strata_session"`, the
+`X-Strata-Session` header, or Anthropic's `metadata.user_id`): an agent client's side calls (a memory review, a title)
+are continued while they are live but not written out on a switch, so they neither cost a file write nor push a long
+conversation out of the budget. A one-shot (`"strata_checkpoint": false`) is never parked in either mode.
+`"strata_drop": true` says the request's own session's cached conversation is obsolete (its client compacted it);
+`"strata_drop": ["<session>", ...]` names others (a client that moved the conversation to a new session). The next
+request sent to the engine, whoever's, carries them: the engine does not park their live conversation on that switch,
+and marks their parked copies obsolete (`strata serve: conversation cache: session ... dropped` in the log). An
+obsolete copy stays until the cache needs its room - it is evicted before any other - so it can still be taken back
+or borrowed from (another conversation with the same system prompt). A copy parked for the session after the drop is
+not obsolete. The engine's
+keys are `sess=<tag>` (64 bits of the session name's hash), `park=0` and `drop=<tag>,...` on the `GEN` line.
+
 Snapshots contain running state, checkpoints, used K/V pages, and draft-layer K/V.
 They add host RAM, not another model or VRAM allocation. The byte budget also counts
 an incoming snapshot during a switch. After a restore, unchanged K/V pages can be

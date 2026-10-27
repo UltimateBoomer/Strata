@@ -35,7 +35,7 @@ class PriorityTest(unittest.TestCase):
 
     def sched(self, slice_s=0.0, hold_s=0.0, max_wait_s=0.0, **prio):
         prio.setdefault("aging_s", 0.0)
-        return TurnScheduler(self.lock, slice_s, max_wait_s, hold_s, ("Agent",), 120.0, clock=self.clock,
+        return TurnScheduler(self.lock, slice_s, max_wait_s, hold_s, 120.0, clock=self.clock,
                              prio=Priorities(**prio))
 
     def take(self, s, *tickets):
@@ -195,6 +195,7 @@ class PriorityTest(unittest.TestCase):
         for tools, timeout in (({"Agent"}, 0.0), ({"bash"}, 300.0)):
             turn = req("h", 0, issued={"h1"}, tools=tools)
             turn.timeout_s = timeout
+            turn.yield_tools = frozenset({"Agent"})     # the client named its slow tool
             h = s.enter(turn)
             self.take(s, h)
             s.release(1)

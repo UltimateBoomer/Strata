@@ -751,6 +751,36 @@ int main() {
                       why = "torn"; return false; }) && !files.count(57),
                   "a failed read removes the file");
         }
+        files.clear();
+        {   // drop_session: a compacted conversation's entries become obsolete - kept, but evicted before any other
+            ConversationCache cache(1000, 5);
+            disk_of(cache);
+            auto park_as = [&](uint64_t f, SavedConversation img, uint64_t session) {
+                files[f] = img;
+                return cache.put_file(conversation_skeleton(img, img.checkpoints), f, 100, 0, session);
+            };
+            check(park_as(62, image({3, 3}), 8), "session 8 parked (the oldest)");
+            check(park_as(60, image({1, 1}), 7) && park_as(61, image({2, 2}), 7), "session 7 parked twice apart");
+            check(park(cache, 63, image({5, 5}), 100), "one untagged");
+            const size_t b = cache.bytes();
+            check(cache.drop_session(7) == 2 && cache.obsolete() == 2 && cache.size() == 4 && cache.bytes() == b &&
+                      files.count(60) && files.count(61), "drop_session marks the session's entries, removes nothing");
+            check(cache.drop_session(7) == 0 && cache.obsolete() == 2, "marking again marks nothing new");
+            check(cache.drop_session(0) == 0 && cache.drop_session(9) == 0, "session 0 and an unknown one mark nothing");
+            check(cache.best(std::vector<int32_t>{2, 2, 9}, {}, true).tokens == 2, "an obsolete entry is still found");
+            check(park_as(64, image({6, 6}), 7) && cache.obsolete() == 2, "a later park of the session is not obsolete");
+            // a full cache (5 slots): the next park evicts the oldest obsolete entry, not the oldest one (8)
+            check(park(cache, 65, image({7, 7}), 100) && !files.count(60) && files.count(61) && files.count(62) &&
+                      cache.obsolete() == 1, "eviction takes the oldest obsolete entry first");
+            const auto donor = cache.best(std::vector<int32_t>{2, 2, 9}, {}, true);
+            cache.guard(donor.serial);
+            check(park(cache, 66, image({8, 8}), 100) && files.count(61) && !files.count(62),
+                  "a guarded obsolete entry stays; then the oldest goes as before");
+            cache.unguard();
+            check(park(cache, 67, image({9, 9}), 100) && !files.count(61) && cache.obsolete() == 0,
+                  "unguarded, the obsolete entry goes next");
+            check(files.count(63) && files.count(64) && files.count(65), "the untagged and the later park stay");
+        }
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
