@@ -207,6 +207,13 @@ public:
     /// `fill_slot_queued` for a blob that is not in one piece: each `parts[i].n` bytes at `parts[i].p` go to byte `parts[i].at`
     /// of the slot (the pieces tile the blob).  Same queue, same `sync_queued`.
     bool fill_slot_queued_parts(int32_t slot, const BlobPart* parts, int n, std::string& err);
+    /// A load image (load_image.hpp): `n` bytes from page-locked `host` to arena byte `at`, on the same queue as
+    /// `fill_slot_queued` (`sync_queued` waits for it).  The caller admitted the slots the range covers and counts
+    /// them with `note_fills`.
+    bool fill_arena_queued(uint64_t at, const void* host, uint64_t n, std::string& err);
+    void note_fills(int64_t n) { fills_ += n; }
+    /// Arena bytes [at, at + n) back to the host, blocking (writing a load image).
+    bool read_arena(uint64_t at, void* host, uint64_t n, std::string& err) const;
     bool sync_queued(std::string& err);
 
     /// Reads `slot` back to the host and compares it to `host_blob`, byte for byte.  **THE ONLY THING THAT SAYS

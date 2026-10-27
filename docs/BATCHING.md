@@ -309,6 +309,15 @@ fingerprint, so one variant never reads another's. The parked conversations of `
 survive a switch (the engine clears them at every start). With a `default_model`, after `default_idle_s` (0: never)
 without a request the server goes back to it; an unloaded engine is only pointed at it.
 
+A start reads each variant's experts blob by blob from the pack: the GPU cache's slots from the profile, then the RAM
+copy. `STRATA_LOAD_IMAGE=<dir>` in a variant's `"env"` (Linux; one folder per variant) keeps those bytes as two files
+in the order they are loaded (`vram.img`, `ram.img`), written after the first start and read sequentially, unbuffered,
+after that. An image is bound to the expert files and to the place of every expert in the cache and the copy: another
+profile, `--expert-cache` or `--resident-budget-gib` is a miss, and the start reads the blobs and writes the image
+again (not when the RAM budget was clamped to the memory free at the start; `STRATA_LOAD_IMAGE_WRITE=0` never writes).
+It takes the cache's and the copy's size on disk. Measured on an RX 7800 XT with a 990 EVO Plus, IQ3_XXS with 7 GiB of
+cache and a 22 GiB RAM budget: the engine's start to READY went from 21.7 s to 8.4 s.
+
 ## How the server uses the slots
 
 - **One request alone** runs on the usual solo path (verify windows with MTP drafts): the fastest single stream.

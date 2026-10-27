@@ -9,6 +9,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 
 #include "strata/core/pinned.hpp"
+#include "strata/core/load_image.hpp"
 #include "strata/platform/memory.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/quantize_act.hpp"
@@ -2404,6 +2405,15 @@ uint64_t FileExpertSource::expert_bytes() const {
     return total;
 }
 
+uint64_t FileExpertSource::files_identity() const {
+    uint64_t h = 0x6c6f6164696d6731ull;
+#if !defined(_WIN32)
+    h = load_image::file_identity(fd_, h);
+    for (const Map& m : maps_) h = load_image::file_identity(m.fd, h);
+#endif
+    return h;
+}
+
 bool FileExpertSource::open_direct(std::string& why) {
 #if defined(_WIN32)
     for (const std::string& path : paths_) {
@@ -3513,6 +3523,7 @@ bool FileExpertSource::pin_cache_complement(
     int64_t budget_lent = 0, budget_lendable = 0;   // the lend region's slots kept by a budget (below), and its size
     uint64_t budget_physical = 0;   // #403: reuse the memory snapshot a budget was sized from
     uint64_t budget_commit = std::numeric_limits<uint64_t>::max();
+    bool budget_clamped = what_fits;   // the copy's size follows the RAM free at start (a load image would not match)
     if (budget_bytes > 0) {
         // CS-T: a RAM budget.  The complement's experts in `rank` order (the expert profile, hottest first) while
         // they fit, the rest left on the mapped files; Windows commit capacity also limits the allocation (#730).
@@ -3540,6 +3551,7 @@ bool FileExpertSource::pin_cache_complement(
                              (double) budget_bytes / 1073741824.0, limit, (double) available / 1073741824.0,
                              (double) headroom_bytes / 1073741824.0, (double) clamped / 1073741824.0);
             budget_bytes = clamped;
+            budget_clamped = true;
         }
         std::vector<uint64_t> ranked(offsets.size(), kNoComplement);
         uint64_t at = 0;
@@ -3673,6 +3685,29 @@ bool FileExpertSource::pin_cache_complement(
                                                        stage_lend_regions_, err);
         if (stage_lent < 0) return false;
         stage_lent_bytes = bytes - before;
+    }
+
+    // load_image.hpp: the copy's bytes as one file in arena order, read sequentially instead of blob by blob.  The key
+    // holds the files and every expert's place in the copy, so another budget or profile is a miss.
+    load_image::Reader image;
+    std::string image_path;
+    uint64_t image_key = 0;
+    bool image_write = false;
+    if (const std::string image_dir = load_image::dir(); bytes > 0 && !image_dir.empty()) {
+        image_key = fnv1a64((const uint8_t*) "ram1", 4, files_identity());
+        image_key = fnv1a64((const uint8_t*) offsets.data(), (uint64_t) (offsets.size() * sizeof(uint64_t)), image_key);
+        image_key = fnv1a64((const uint8_t*) layer_blob_bytes_.data(),
+                            (uint64_t) (layer_blob_bytes_.size() * sizeof(uint64_t)), image_key);
+        image_path = image_dir + "/ram.img";
+        std::string why;
+        if (image.open(image_path, image_key, bytes, why)) {
+            std::fprintf(stderr, "FileExpertSource: load image %s: the copy is read from it in order\n", image_path.c_str());
+        } else {
+            image_write = load_image::write_enabled() && !budget_clamped;
+            std::fprintf(stderr, "FileExpertSource: load image %s: %s; the copy is read blob by blob%s\n",
+                         image_path.c_str(), why.c_str(),
+                         image_write ? " and written to it after" : budget_clamped ? " (a clamped budget: not written)" : "");
+        }
     }
 
     void* arena = nullptr;
@@ -3817,7 +3852,18 @@ bool FileExpertSource::pin_cache_complement(
 #if !defined(_WIN32)
                 void* aligned = nullptr;
                 const uint64_t page = 4096;
-                if (posix_memalign(&aligned, (size_t) page, (size_t) ((bytes + page - 1) / page * page)) == 0) arena = aligned;
+#if defined(__linux__)
+                // 2 MiB huge pages (STRATA_COMPLEMENT_THP=0: 4 KiB, as before): on pc26 (THP "madvise") taking 22 GiB in
+                // 4 KiB faults cost 6.6 s, in 2 MiB pages 1.0 s
+                static const bool thp = [] {
+                    const char* v = std::getenv("STRATA_COMPLEMENT_THP");
+                    return v == nullptr || std::atoi(v) != 0;
+                }();
+                const uint64_t align = thp && !numa.place ? 2ull << 20 : page;
+#else
+                const uint64_t align = page;
+#endif
+                if (posix_memalign(&aligned, (size_t) align, (size_t) ((bytes + align - 1) / align * align)) == 0) arena = aligned;
 #endif
 #if defined(__linux__)
                 // STRATA_NUMA_SPLIT: a 2 MiB huge page would put several slices on its toucher's node, so the arena
@@ -3825,6 +3871,10 @@ bool FileExpertSource::pin_cache_complement(
                 if (arena != nullptr && numa.place) {
                     if (madvise(arena, (size_t) ((bytes + page - 1) / page * page), MADV_NOHUGEPAGE) != 0)
                         std::fprintf(stderr, "FileExpertSource: WARNING: madvise(MADV_NOHUGEPAGE) on the complement "
+                                             "failed (errno %d)\n", errno);
+                } else if (arena != nullptr && align > page) {
+                    if (madvise(arena, (size_t) ((bytes + align - 1) / align * align), MADV_HUGEPAGE) != 0)
+                        std::fprintf(stderr, "FileExpertSource: WARNING: madvise(MADV_HUGEPAGE) on the complement "
                                              "failed (errno %d)\n", errno);
                 }
 #endif
@@ -3866,6 +3916,7 @@ bool FileExpertSource::pin_cache_complement(
                     // hottest experts come first in the arena: they are the pinned ones; the rest is locked pageable
                     // memory, as when the driver refuses the page-locking.
                     constexpr uint64_t kStep = 1ull << 30, kPage = 4096;
+                    const auto steps_t0 = std::chrono::steady_clock::now();
                     uint64_t got = 0;
                     const char* stop = nullptr;
                     while (got < bytes) {
@@ -3890,6 +3941,7 @@ bool FileExpertSource::pin_cache_complement(
                         const uint64_t b = layer_blob_bytes_[i / (size_t) n_expert_];
                         if (offsets[i] < got && offsets[i] + b > got) { w = offsets[i]; break; }
                     }
+                    const auto register_t0 = std::chrono::steady_clock::now();
                     if (w > 0) {
                         if (cudaHostRegister(arena, (size_t) w, cudaHostRegisterMapped | cudaHostRegisterPortable) ==
                             cudaSuccess) {
@@ -3914,8 +3966,10 @@ bool FileExpertSource::pin_cache_complement(
                                       "resident but pageable, so its copies to the GPU go through the CPU (#1250)",
                                       (double) partial_pin / 1073741824.0, (double) bytes / 1073741824.0, stop);
                     else
-                        std::snprintf(msg, sizeof msg, "%.2f GiB page-locked after taking the pages in steps",
-                                      (double) partial_pin / 1073741824.0);
+                        std::snprintf(msg, sizeof msg, "%.2f GiB page-locked after taking the pages in steps (%.1f s "
+                                      "taking them, %.1f s page-locking)", (double) partial_pin / 1073741824.0,
+                                      std::chrono::duration<double>(register_t0 - steps_t0).count(),
+                                      std::chrono::duration<double>(std::chrono::steady_clock::now() - register_t0).count());
                     note += std::string(note.empty() ? "" : "; ") + msg;
                     if (stop != nullptr) std::fprintf(stderr, "FileExpertSource: %s\n", msg);
 #if defined(__linux__)
@@ -4065,7 +4119,21 @@ bool FileExpertSource::pin_cache_complement(
                              std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count());
         }
     };
-    {
+    bool from_image = false;
+    if (image.is_open() && host != nullptr) {
+        // into pages already there (page-locked or locked): on pc26 reads that faulted their pages in ran at 2.3-2.8
+        // GB/s, these at 7 GB/s (22 GiB in 3.3 s)
+        from_image = image.read(0, (uint8_t*) host, bytes);
+        if (from_image)
+            std::fprintf(stderr, "FileExpertSource: read the %.2f GiB copy from the load image in %.1f s\n",
+                         (double) bytes / 1073741824.0,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count());
+        else
+            std::fprintf(stderr, "FileExpertSource: WARNING: the load image could not be read; the copy is read blob by "
+                                 "blob\n");
+        image.close();
+    }
+    if (!from_image) {
         const int threads = (int) std::max<int64_t>(1, std::min<int64_t>(6, n_layers_));
         std::vector<std::thread> pool;
         for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
@@ -4103,6 +4171,21 @@ bool FileExpertSource::pin_cache_complement(
         h = fnv1a64((const uint8_t*) ph.data(), (uint64_t) (ph.size() * sizeof(uint64_t)), h);
         std::fprintf(stderr, "FileExpertSource: cache complement checksum %016llx (%.2f GiB, its offsets included)\n",
                      (unsigned long long) h, (double) bytes / 1073741824.0);
+    }
+
+    if (image_write && !from_image && host != nullptr) {
+        const auto write_t0 = std::chrono::steady_clock::now();
+        std::string werr;
+        if (load_image::write(image_path, image_key, bytes, [&](uint64_t at, uint64_t n, void* buf) {
+                std::memcpy(buf, host + (size_t) at, (size_t) n);
+                return true;
+            }, werr))
+            std::fprintf(stderr, "FileExpertSource: wrote the load image %s (%.2f GiB) in %.1f s\n", image_path.c_str(),
+                         (double) bytes / 1073741824.0,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - write_t0).count());
+        else
+            std::fprintf(stderr, "FileExpertSource: WARNING: the load image %s was not written: %s\n",
+                         image_path.c_str(), werr.c_str());
     }
 
     complement_arena_ = arena;
