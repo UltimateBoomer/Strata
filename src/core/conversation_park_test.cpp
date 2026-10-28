@@ -395,6 +395,40 @@ int main(int argc, char** argv) {
               "it reads back as of checkpoint 2");
     }
 
+    {
+        // --conversation-cache-keep: a file an earlier run left, indexed back without its K/V or running states
+        const std::string p = (dir / "keep.park").string();
+        const SavedConversation a = image(sz);
+        ParkFileState st;
+        ParkWriteStats ws;
+        check(park_file_write(p, 70, nullptr, meta_of(a), a.checkpoints, sources(a), caps(3, cap), {}, 0, beat, st, ws, err,
+                              -1, 0xabc),
+              "write a file to keep, parked for session 0xabc");
+        SavedConversation skel;
+        uint64_t bytes = 0, session = 0;
+        check(park_file_index(p, 70, {}, skel, bytes, err, &session), "index a kept file");
+        check(session == 0xabc && st.session == 0xabc, "the session's tag comes back with it");
+        const SavedConversation want = conversation_skeleton(a, a.checkpoints);
+        check(bytes == st.bytes(), "the index charges what the file holds");
+        check(skel.geometry == want.geometry && skel.layer_lo == want.layer_lo && skel.layer_hi == want.layer_hi &&
+              skel.cvec == want.cvec && skel.live.ids == a.live.ids && skel.live.imgs == a.live.imgs &&
+              skel.live.gdn.empty() && skel.kv.empty() && skel.checkpoints.size() == 2 &&
+              skel.checkpoints[0].ids == a.checkpoints[0].ids && skel.checkpoints[1].used == 9 &&
+              skel.checkpoints[1].gdn.empty() && skel.checkpoints[0].park_file == 0,
+              "the skeleton: the token and image lists and the LRU stamps, no state");
+        SessionReadLimits other;
+        other.geometry = a.geometry;
+        (*other.geometry)[0] += 1;
+        check(!park_file_index(p, 70, other, skel, bytes, err) && err.find("geometry") != std::string::npos,
+              "a file of another geometry is not indexed");
+        SessionReadLimits tight;
+        tight.max_state_bytes[0] = 100;
+        check(!park_file_index(p, 70, tight, skel, bytes, err), "the running states are bounded as a read's");
+        poke(p, st.checkpoints[0].offset + st.checkpoints[0].length - 3);   // inside a state array: passed over, hashed
+        check(!park_file_index(p, 70, {}, skel, bytes, err) && err.find("hash") != std::string::npos,
+              "a torn record is refused");
+    }
+
     fs::remove_all(dir, ec);
     std::printf("conversation_park_test: %d checks passed\n", checks);
 }

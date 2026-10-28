@@ -1250,8 +1250,23 @@ every K/V part in its own region reserved for `--max-context` (a sparse file: on
 a hash per MiB of K/V and per record. A conversation read back keeps its file, and when it is parked again the file
 is updated in place: only each K/V part's bytes past the pages the session has not written since (the rule a RAM
 park reuses a retained image by), the checkpoints the file does not hold, the running state and the directory are
-written, and the records it no longer names are punched out. The files live as long as the engine: every `park-*`
-file is removed at start. A sibling borrows a prefix from a file as from RAM, its K/V streamed into the session.
+written, and the records it no longer names are punched out. A sibling borrows a prefix from a file as from RAM, its K/V streamed into the session.
+The files are kept across restarts (`--no-conversation-cache-keep`: every `park-*` file is removed at start instead). The folder's
+`identity` file names the model and the settings that wrote them (the fingerprints a disk session carries; the engine
+version is one of them) and the park file format (2: each file keeps the session's tag, `sess=`, so `"strata_drop"`
+reaches a conversation parked by an earlier run). At start, when it matches, each file's token lists are read back into
+the cache, oldest first, with every record's hash checked and no K/V read; the budget and the slots apply as to a new
+park. The folder's `obsolete` file lists the files `"strata_drop"` marked (evicted first), so the marks outlast a
+restart too. When the identity does not match, the files are removed. At QUIT the live conversation is parked too, so
+the next run goes on from it. The server waits 20 s for the engine after QUIT; a park cut short leaves a file that fails its
+hashes when it is read back, and it is removed then. Two engines that share a folder remove each other's files; the
+server gives each model variant its own (`<dir>/<variant>`, docs/BATCHING.md). `--conversation-cache-group DIR` makes
+the budget cover the `park-*` files in every other folder under DIR too, each charged the space it takes on disk; DIR's
+own `park-*` files (strays of the shared layout, which no variant reads) are removed at start. The other folders' files
+are listed once at start; at start and whenever a park needs room the oldest file goes first, the engine's own or
+another variant's. The log line is `conversation cache: removed N
+files of other variants (M MiB) to stay in the budget`. The log lines are `conversation cache: kept K parked conversations of an earlier run` and
+`discard kept file park-N.park (why)`. Not measured yet: how long the index takes at start for a full budget.
 `--conversation-cache-skip-tail N` (opt-in, default 0 = park it) does not park the outgoing state when a request goes
 on from one of the session's own checkpoints and at most N tokens past it are left behind: the tail its client
 rewrote, such as the last reply re-rendered without its reasoning. Parking it would write the whole conversation

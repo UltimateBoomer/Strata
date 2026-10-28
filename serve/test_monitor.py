@@ -268,6 +268,22 @@ class ConversationCacheCard(unittest.TestCase):
             st["disk"]["parks"] = 99                    # a copy: the caller cannot change the parser's state
             self.assertEqual(c.poll(str(log), 0)["disk"]["parks"], 2)
 
+    def test_kept_files(self):
+        """--conversation-cache-keep: the files an earlier run left count as parked from the start."""
+        from serve.server import ConvCacheLog
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "strata.log"
+            log.write_text("strata serve: conversation cache: discard kept file park-3.park (park file: record hash "
+                           "mismatch)\n"
+                           "strata serve: conversation cache: on disk in /data/convcache (budget 16384 MiB, unlimited "
+                           "slots); 1 files of an earlier run removed, in 812.0 ms\n"
+                           "strata serve: conversation cache: kept 2 parked conversations of an earlier run; parked=2 "
+                           "bytes=2220025152\n", encoding="utf-8")
+            st = ConvCacheLog().poll(str(log), 0)
+            self.assertEqual((st["disk"]["kept"], st["disk"]["failures"]), (2, 1))
+            self.assertEqual((st["parked"], st["bytes"], st["parks"]), (2, 2220025152, 0))
+
     def test_disk_metrics(self):
         import tempfile
         tok = ByteTokenizer()

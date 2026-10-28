@@ -49,6 +49,59 @@ class ConfigTest(unittest.TestCase):
         self.assertIsNone(m.default)
         self.assertEqual(cfg["args"], COMMON["args"])
 
+    def test_cache_dirs_of_their_own(self):
+        """A --conversation-cache-dir in the common args is one folder per variant (the engine keeps the files of one
+        model and removes the others'); one a variant names alone stays as it is."""
+        common = {**COMMON, "args": COMMON["args"] + ["--conversation-cache-dir", "/data/convcache"]}
+        m, _ = serve_models.load({**common, "models": {"q2": {}, "q3": {"args": ["--pack", "/data/pack-q3"]}}}, None)
+        for name in ("q2", "q3"):
+            args = m.variants[name].cfg["args"]
+            self.assertEqual(args[args.index("--conversation-cache-dir") + 1], f"/data/convcache/{name}")
+            self.assertEqual(args[args.index("--conversation-cache-group") + 1], "/data/convcache",
+                             "one budget for all the variants' files")
+        self.assertEqual(common["args"][-1], "/data/convcache", "the common config is not changed")
+        m, _ = serve_models.load({**common, "models": {
+            "q2": {}, "q3": {"args": ["--conversation-cache-dir", "/fast/q3"]},
+            "q4": {"args": ["--conversation-cache-dir=/data/convcache/"]}}}, None)
+        self.assertEqual(m.variants["q3"].cfg["args"][-1], "/fast/q3", "a folder of its own stays")
+        self.assertNotIn("--conversation-cache-group", m.variants["q3"].cfg["args"], "and its budget is its own")
+        self.assertIn("/data/convcache/q2", m.variants["q2"].cfg["args"])
+        self.assertIn("--conversation-cache-dir=/data/convcache/q4", m.variants["q4"].cfg["args"],
+                      "the same folder written otherwise is still shared")
+        m, _ = serve_models.load({**common, "models": {
+            "q2": {"args": ["--conversation-cache-group", "/data"]}, "q3": {}}}, None)
+        args = m.variants["q2"].cfg["args"]
+        self.assertEqual((args.count("--conversation-cache-group"), args[args.index("--conversation-cache-group") + 1]),
+                         (1, "/data"), "a group the variant sets stays")
+        m, _ = serve_models.load(config(), None)
+        self.assertNotIn("--conversation-cache-dir", m.variants["q2"].cfg["args"], "none set: none added")
+
+    def test_keeps_parks(self):
+        """A variant whose engine keeps its parked conversations on disk needs no session file at a switch."""
+        base = ["--mtp", "/data/pack/mtp/rt", "--conversation-cache-dir", "/data/convcache"]
+        self.assertTrue(serve_models.keeps_parks(base))
+        self.assertTrue(serve_models.keeps_parks(base[:2] + ["--conversation-cache-dir=/data/convcache"]))
+        for extra, why in ((["--no-conversation-cache-keep"], "the files removed at start"),
+                           (["--conversation-cache-mib", "0"], "the cache off"),
+                           (["--prompt-cache", "0"], "checkpoints off"),
+                           (["--layer-split", "12,24"], "a split parks in RAM")):
+            self.assertFalse(serve_models.keeps_parks(base + extra), why)
+        self.assertFalse(serve_models.keeps_parks(base[2:]), "no --mtp: the file tier is off")
+        self.assertFalse(serve_models.keeps_parks(base[:2]), "no folder")
+        common = {**COMMON, "args": COMMON["args"] + base}
+        m, _ = serve_models.load({**common, "models": {"q2": {}, "q3": {}}}, None)
+        self.assertTrue(m.variants["q2"].keeps_parks())
+        m, _ = serve_models.load({**common, "mtp": False, "models": {"q2": {}, "q3": {}}}, None)
+        self.assertFalse(m.variants["q2"].keeps_parks(), '"mtp": false starts the engine without --mtp')
+
+    def test_no_session_dir(self):
+        m, _ = serve_models.load(config(model_session_dir=False), None)
+        self.assertIsNone(m.session_dir, "false: no session files")
+        m, _ = serve_models.load(config(), None)
+        self.assertEqual(m.session_dir, "/data", "absent: the log's folder")
+        with self.assertRaises(ValueError):
+            serve_models.load(config(model_session_dir=1), None)
+
     def test_files_next_to_the_config(self):
         with tempfile.TemporaryDirectory() as d:
             Path(d, "server-q3.json").write_text(json.dumps({"model_name": "qwen-q3"}))
@@ -323,6 +376,16 @@ class ServerTest(unittest.TestCase):
                                        ("restore", "variant-q2.session")], "q2's conversation comes back")
         self.assertFalse(Path(self.dir.name, "variant-q2.session").exists(), "a restored session file goes")
         self.assertEqual(self.svc.models.switches, 2)
+
+    def test_switch_keeps_parks(self):
+        """Variants whose engines keep their parked conversations: a switch writes no session file (the engine parks
+        the conversation as it stops) and restores none."""
+        for v in self.svc.models.variants.values():
+            v.cfg["args"] = v.cfg["args"] + ["--mtp", "/m", "--conversation-cache-dir", f"/data/convcache/{v.name}"]
+        self.assertEqual(self.chat("q3"), ("q3", "from q3"))
+        self.assertEqual(self.chat("q2"), ("q2", "from q2"))
+        self.assertEqual(self.events, [("unload", "q2"), ("start", "q3"), ("unload", "q3"), ("start", "q2")])
+        self.assertEqual(list(Path(self.dir.name).iterdir()), [])
 
     def test_models_listing(self):
         data = self.call("/v1/models")["data"]

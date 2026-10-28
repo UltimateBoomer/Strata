@@ -40,7 +40,7 @@ uint64_t ParkFileState::bytes() const {
 bool park_file_write(const std::string&, uint64_t, const ParkFileState*, const SavedConversation&,
                      const std::vector<ConversationCheckpoint>&, const std::vector<SessionKvSource>&,
                      const std::vector<std::array<uint64_t, 5>>&, const std::vector<std::array<uint64_t, 5>>&, uint64_t,
-                     const std::function<void()>&, ParkFileState&, ParkWriteStats&, std::string& error, int) {
+                     const std::function<void()>&, ParkFileState&, ParkWriteStats&, std::string& error, int, uint64_t) {
     error = "park files need a POSIX system";
     return false;
 }
@@ -50,13 +50,18 @@ bool park_file_read(const std::string&, uint64_t, SavedConversation&, const Sess
     error = "park files need a POSIX system";
     return false;
 }
+bool park_file_index(const std::string&, uint64_t, const SessionReadLimits&, SavedConversation&, uint64_t&,
+                     std::string& error, uint64_t*) {
+    error = "park files need a POSIX system";
+    return false;
+}
 
 #else
 
 namespace {
 constexpr char kMagic[8] = {'S', 'T', 'R', 'P', 'A', 'R', 'K', '\x01'};
 constexpr char kDirMagic[8] = {'P', 'A', 'R', 'K', 'D', 'I', 'R', '1'};
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;   // 2: the directory ends with the session's tag
 constexpr uint64_t kSuper = 4096, kAlign = 4096;
 constexpr size_t kChunk = 16u << 20;   // 16 hash blocks: what one read or write moves
 constexpr uint64_t kMaxDirectory = 64ull << 20;
@@ -246,6 +251,17 @@ public:
         v.resize((size_t) n);
         return raw(v.data(), (size_t) n * sizeof(T));
     }
+    // `n` bytes passed over (hashed, not kept)
+    bool skip(uint64_t n, uint64_t limit) {
+        if (n > left_ || n > limit) return fail("record count exceeds its bounds");
+        uint8_t scratch[4096];
+        while (n) {
+            const size_t m = (size_t) std::min<uint64_t>(n, sizeof scratch);
+            if (!raw(scratch, m)) return false;
+            n -= m;
+        }
+        return true;
+    }
     bool done() {
         if (left_ != 0 || pos_ != have_) return fail("record holds more than it says");
         if (hash_.digest() != want_) return fail("record hash mismatch");
@@ -274,6 +290,22 @@ bool get_state(RecordIn& in, ConversationCheckpoint& c, const SessionReadLimits&
     const auto& m = l.max_state_bytes;
     return in.vec(c.gdn, m[0]) && in.vec(c.ple, m[1]) && in.vec(c.tails, m[2]) && in.vec(c.dead, m[3]) &&
            in.vec(c.block_pos, m[4]) && in.done();
+}
+
+// park_file_index: a record's token and image lists; the running-state arrays are hashed and skipped, not kept
+bool get_identity(RecordIn& in, ConversationCheckpoint& c, const SessionReadLimits& l) {
+    uint64_t n = 0;
+    if (!in.vec(c.ids, l.max_tokens) || !in.u64(n)) return false;
+    if (n > in.left() / 16 || n > l.max_tokens) return in.fail("record count exceeds its bounds");
+    c.imgs.resize((size_t) n);
+    for (auto& k : c.imgs) {
+        uint64_t start = 0;
+        if (!in.u64(start) || !in.u64(k.hash)) return false;
+        k.start = (int64_t) start;
+    }
+    for (uint64_t limit : l.max_state_bytes)
+        if (!in.u64(n) || !in.skip(n, limit)) return false;
+    return in.done();
 }
 
 // ---- the directory: small, built and parsed in RAM
@@ -323,6 +355,7 @@ std::vector<uint8_t> directory_bytes(const ParkFileState& st, const SavedConvers
             o.raw(p.hashes.data(), p.hashes.size() * 8);
         }
     }
+    o.u64(st.session);
     return std::move(o.b);
 }
 
@@ -351,7 +384,7 @@ bool park_file_write(const std::string& path, uint64_t file, const ParkFileState
                      const std::vector<ConversationCheckpoint>& checkpoints, const std::vector<SessionKvSource>& kv,
                      const std::vector<std::array<uint64_t, 5>>& caps, const std::vector<std::array<uint64_t, 5>>& keep,
                      uint64_t min_free_bytes, const std::function<void()>& beat, ParkFileState& state,
-                     ParkWriteStats& stats, std::string& error, int live_checkpoint) {
+                     ParkWriteStats& stats, std::string& error, int live_checkpoint, uint64_t session) {
     stats = {};
     error.clear();
     auto fail = [&](const std::string& m) { if (error.empty()) error = "park file: " + m; return false; };
@@ -372,6 +405,7 @@ bool park_file_write(const std::string& path, uint64_t file, const ParkFileState
     ParkFileState st;
     st.file = file;
     st.generation = base ? base->generation + 1 : 1;
+    st.session = session;
     st.layers.resize(kv.size());
     uint64_t at = kSuper, adds = 0;
     for (size_t j = 0; j < kv.size(); ++j) {
@@ -500,29 +534,18 @@ bool park_file_write(const std::string& path, uint64_t file, const ParkFileState
     return true;
 }
 
-bool park_file_read(const std::string& path, uint64_t file, SavedConversation& meta, const SessionKvTarget& target,
-                    const SessionReadLimits& limits, ParkFileState& state, std::string& error,
-                    SessionStatus* status) {
-    SessionStatus local;
-    SessionStatus& stt = status ? *status : local;
-    stt = {};
-    stt.error = SessionError::invalid;
-    error.clear();
-    auto fail = [&](const std::string& m) { if (error.empty()) error = "park file: " + m; return false; };
-    File f;
-    if (!f.open(path, O_RDONLY, error)) { stt.error = SessionError::io; return false; }
-    struct stat sb{};
-    if (::fstat(f.fd(), &sb) != 0 || !S_ISREG(sb.st_mode)) return fail("not a regular file");
-    const uint64_t size = (uint64_t) sb.st_size;
-    Buffer buf = chunk_buffer();
-    if (!buf) { stt.error = SessionError::memory; return fail("no memory for the read buffer"); }
+namespace {
+// The superblock and the directory, every bound checked, and the RAM the records will take asked of limits.admit:
+// what park_file_read and park_file_index share before the records.
+bool read_directory(File& f, uint64_t size, uint8_t* buffer, uint64_t file, const SessionReadLimits& limits,
+                    SavedConversation& m, ParkFileState& st, std::vector<uint64_t>& used, uint64_t& kv_total,
+                    std::string& error, SessionStatus& stt) {
+    auto fail = [&](const std::string& msg) { if (error.empty()) error = "park file: " + msg; return false; };
     auto io = [&](bool ok) { if (!ok) stt.error = f.kind; return ok; };
-
-    if (size < kSuper || !io(f.read(buf.get(), kSuper, 0, error))) return fail("no superblock");
-    const uint8_t* s = buf.get();
+    if (size < kSuper || !io(f.read(buffer, kSuper, 0, error))) return fail("no superblock");
+    const uint8_t* s = buffer;
     uint32_t version = 0, ssize = 0;
     uint64_t hh = 0;
-    ParkFileState st;
     st.file = file;
     std::memcpy(&version, s + 8, 4); std::memcpy(&ssize, s + 12, 4);
     std::memcpy(&st.generation, s + 16, 8);
@@ -542,7 +565,6 @@ bool park_file_read(const std::string& path, uint64_t file, SavedConversation& m
     Parse in{dir, 0, error};
     char magic[8];
     if (!in.raw(magic, 8) || std::memcmp(magic, kDirMagic, 8) != 0) return fail("not a park directory");
-    SavedConversation m;
     for (auto& g : m.geometry) if (!in.i64(g)) return false;
     if (limits.geometry && *limits.geometry != m.geometry) return fail("saved with another model geometry");
     uint64_t cvec = 0, generation = 0;
@@ -555,11 +577,11 @@ bool park_file_read(const std::string& path, uint64_t file, SavedConversation& m
     uint64_t n = 0;
     if (!in.rec(st.live) || !in.count(n, 32, limits.max_checkpoints)) return false;
     st.checkpoints.resize((size_t) n);
-    std::vector<uint64_t> used((size_t) n);
+    used.assign((size_t) n, 0);
     for (size_t i = 0; i < n; ++i) if (!in.rec(st.checkpoints[i]) || !in.u64(used[i])) return false;
     if (!in.count(n, 56 + 5 * 32, limits.max_kv_layers)) return false;
     st.layers.resize((size_t) n);
-    uint64_t kv_total = 0;
+    kv_total = 0;
     for (size_t j = 0; j < st.layers.size(); ++j) {
         ParkLayer& l = st.layers[j];
         int64_t format = 0;
@@ -581,6 +603,7 @@ bool park_file_read(const std::string& path, uint64_t file, SavedConversation& m
             kv_total += r.size;
         }
     }
+    if (!in.u64(st.session)) return false;
     if (in.at != dir.size()) return fail("directory holds more than it says");
     auto record_in_file = [&](const ParkRecord& r) { return r.offset >= kSuper && r.offset <= size && r.length <= size - r.offset; };
     if (!record_in_file(st.live)) return fail("a record is out of the file");
@@ -591,6 +614,33 @@ bool park_file_read(const std::string& path, uint64_t file, SavedConversation& m
     }
     std::string why;
     if (limits.admit && !limits.admit(need, why)) { stt.error = SessionError::memory; return fail(why); }
+    return true;
+}
+} // namespace
+
+bool park_file_read(const std::string& path, uint64_t file, SavedConversation& meta, const SessionKvTarget& target,
+                    const SessionReadLimits& limits, ParkFileState& state, std::string& error,
+                    SessionStatus* status) {
+    SessionStatus local;
+    SessionStatus& stt = status ? *status : local;
+    stt = {};
+    stt.error = SessionError::invalid;
+    error.clear();
+    auto fail = [&](const std::string& m) { if (error.empty()) error = "park file: " + m; return false; };
+    File f;
+    if (!f.open(path, O_RDONLY, error)) { stt.error = SessionError::io; return false; }
+    struct stat sb{};
+    if (::fstat(f.fd(), &sb) != 0 || !S_ISREG(sb.st_mode)) return fail("not a regular file");
+    const uint64_t size = (uint64_t) sb.st_size;
+    Buffer buf = chunk_buffer();
+    if (!buf) { stt.error = SessionError::memory; return fail("no memory for the read buffer"); }
+    auto io = [&](bool ok) { if (!ok) stt.error = f.kind; return ok; };
+    SavedConversation m;
+    ParkFileState st;
+    std::vector<uint64_t> used;
+    uint64_t kv_total = 0;
+    if (!read_directory(f, size, buf.get(), file, limits, m, st, used, kv_total, error, stt)) return false;
+    std::string why;
 
     // ---- the running states, before any K/V byte is handed on (a live record that is a checkpoint's is read once)
     m.checkpoints.resize(st.checkpoints.size());
@@ -649,6 +699,46 @@ bool park_file_read(const std::string& path, uint64_t file, SavedConversation& m
     meta = std::move(m);
     state = std::move(st);
     stt.error = SessionError::none;
+    return true;
+}
+
+bool park_file_index(const std::string& path, uint64_t file, const SessionReadLimits& limits,
+                     SavedConversation& skeleton, uint64_t& bytes, std::string& error, uint64_t* session) {
+    SessionStatus stt;
+    error.clear();
+    auto fail = [&](const std::string& m) { if (error.empty()) error = "park file: " + m; return false; };
+    File f;
+    if (!f.open(path, O_RDONLY, error)) return false;
+    struct stat sb{};
+    if (::fstat(f.fd(), &sb) != 0 || !S_ISREG(sb.st_mode)) return fail("not a regular file");
+    Buffer buf = chunk_buffer();
+    if (!buf) return fail("no memory for the read buffer");
+    SessionReadLimits bounds = limits;
+    bounds.admit = nullptr;   // only one chunk buffer is held: the states are hashed and passed over
+    SavedConversation m;
+    ParkFileState st;
+    std::vector<uint64_t> used;
+    uint64_t kv_total = 0;
+    if (!read_directory(f, (uint64_t) sb.st_size, buf.get(), file, bounds, m, st, used, kv_total, error, stt))
+        return false;
+    m.checkpoints.resize(st.checkpoints.size());
+    int live_at = -1;
+    for (size_t i = 0; i < st.checkpoints.size(); ++i) {
+        RecordIn r(f, buf.get(), st.checkpoints[i], error);
+        if (!get_identity(r, m.checkpoints[i], bounds)) return false;
+        m.checkpoints[i].used = used[i];
+        if (st.checkpoints[i].offset == st.live.offset && st.checkpoints[i].length == st.live.length) live_at = (int) i;
+    }
+    if (live_at >= 0) {
+        m.live = m.checkpoints[(size_t) live_at];
+        m.live.used = 0;
+    } else {
+        RecordIn r(f, buf.get(), st.live, error);
+        if (!get_identity(r, m.live, bounds)) return false;
+    }
+    skeleton = conversation_skeleton(m, m.checkpoints);
+    bytes = st.bytes();
+    if (session) *session = st.session;
     return true;
 }
 

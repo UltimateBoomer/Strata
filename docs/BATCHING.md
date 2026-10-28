@@ -314,10 +314,17 @@ for the loaded one. The first and the last need the loaded variant to have had t
 switches (its session is charged the time), and the requests queued for that variant follow. A running request is not
 stopped for another variant unless `"model_preempt": true`.
 
-The conversation in the engine is saved to `model_session_dir` (`variant-<name>.session`, default: the log's folder)
-when its variant is switched away, and restored when that variant loads again; the session file carries the model's
-fingerprint, so one variant never reads another's. The parked conversations of `--conversation-cache-dir` do not
-survive a switch (the engine clears them at every start). With a `default_model`, after `default_idle_s` (0: never)
+The parked conversations of `--conversation-cache-dir` survive a switch: variants that would share the folder (it is
+in the common `"args"`) each get `<dir>/<variant>`, since the engine keeps only the files of its own model and settings;
+a variant that names a folder alone keeps it. Those variants also get `--conversation-cache-group <dir>`, so
+`--conversation-cache-mib` is one budget for all their files together: when the loaded variant needs room, the oldest
+file goes first, whichever variant's (a file the loaded variant parked in this run is newer than any other's). A variant
+with a folder of its own has a budget of its own. Such a variant's engine parks the conversation it holds at QUIT, so
+a switch writes no session file: the variant's next request goes on from its parked conversation. A variant without
+them (no folder, `--no-conversation-cache-keep`, no `--mtp`, a layer split) has the conversation in the engine saved to
+`model_session_dir` (`variant-<name>.session`, default: the log's folder; `false`: none) when it is switched away, and
+restored when it loads again; the session file carries the model's fingerprint, so one variant never reads another's.
+`--no-conversation-cache-keep` clears them at every start. With a `default_model`, after `default_idle_s` (0: never)
 without a request the server goes back to it; an unloaded engine is only pointed at it.
 
 A start reads each variant's experts blob by blob from the pack: the GPU cache's slots from the profile, then the RAM

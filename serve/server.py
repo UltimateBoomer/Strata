@@ -780,7 +780,9 @@ class ConvCacheLog:
     DISK_READ = re.compile(r"conversation cache: read (\d+) (parked|borrowed) tokens from disk into the session in "
                            r"([\d.]+) ms")
     DISK_FAIL = ("discard parked file", "cannot borrow from a parked file", "updating the parked file in place failed",
-                 "skip parking (file:")
+                 "skip parking (file:", "discard kept file", "parking at exit failed")
+    # --conversation-cache-keep: the files an earlier run of the same model left, back in the cache at start
+    DISK_KEPT = re.compile(r"conversation cache: kept (\d+) parked conversations .*?parked=(\d+) bytes=(\d+)")
     SKIP_TAIL = "skip parking (goes on from its own checkpoint"
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
 
@@ -795,7 +797,7 @@ class ConvCacheLog:
                       "disk": {"enabled": False, "dir": None, "parks": 0, "in_place": 0, "live_at_checkpoint": 0,
                                "snapshot_bytes": 0,
                                "written_bytes": 0, "reused_kv_bytes": 0, "reads": 0, "read_tokens": 0, "read_ms": 0.0,
-                               "borrows": 0, "borrowed_tokens": 0, "failures": 0}}
+                               "borrows": 0, "borrowed_tokens": 0, "failures": 0, "kept": 0}}
 
     def poll(self, path, start) -> dict:
         """The state after the log's new lines; `start` is where the engine's current run began in it."""
@@ -851,6 +853,9 @@ class ConvCacheLog:
             d["failures"] += 1
         if m := self.DISK_ON.search(line):
             d["enabled"], d["dir"] = True, m.group(1)
+        elif m := self.DISK_KEPT.search(line):
+            d["kept"] = int(m.group(1))
+            self.state["parked"], self.state["bytes"] = int(m.group(2)), int(m.group(3))
         elif m := self.DISK_PARK.search(line):
             if m.group(1) == "parked":
                 d["parks"] += 1
@@ -4616,6 +4621,12 @@ class Service:
     def _save_variant_session(self, name: str) -> None:
         m = self.models
         if not hasattr(self.engine, "session_file") or not m.session_dir:
+            return
+        if m.variants[name].keeps_parks():
+            # the engine parks the conversation in its folder at QUIT (unload, below): the variant's next request goes
+            # on from that file, so a session file would only write the conversation a second time
+            print(f"[strata] {name}'s conversation is parked by the engine as it stops (its conversation cache keeps "
+                  "it), not saved to a session file", flush=True)
             return
         path = m.session_path(name)
         try:
