@@ -832,6 +832,26 @@ class FlagsCommand(unittest.TestCase):
         self.assertNotIn("--pool-cores", p["settings"]["extra"])
         self.assertTrue(any("pool-cores" in w for w in p["warnings"]))
 
+    def test_dspark_takes_a_word_and_the_word_reaches_the_engine_line(self):
+        # --set dspark=on used to start strata-dsv41 with a lone "--dspark" ("--dspark needs a value", #3959)
+        from strata_cli.launch import settings as S
+        from strata_control import tune_knobs
+        base = ["--pack", "p", "--max-context", "262144"]
+        for word in ("on", "off", "auto", "none"):
+            a, _ = S.as_argv_changes({"--dspark": word}, tune_knobs.BOOL_FLAGS)
+            self.assertEqual(a, {"--dspark": word})
+            out = tune_knobs.apply_to_argv(base + ["--dspark", "auto"], a)
+            self.assertEqual(out[out.index("--dspark") + 1], word, word)
+            self.assertEqual(out.count("--dspark"), 1)
+        a, _ = S.as_argv_changes({"--dspark": "ON", "--dspark-conf": "0.7"}, tune_knobs.BOOL_FLAGS)
+        self.assertEqual(a, {"--dspark": "on", "--dspark-conf": "0.7"})
+        self.assertEqual(S.as_argv_changes({"--dspark": ""}, tune_knobs.BOOL_FLAGS)[0], {})
+        code, out, _err = run_cli(["launch", "--help"])
+        self.assertIn("--dspark", out)
+        p = self.plan("--model", "q2_0", "--dspark", "on")
+        self.assertEqual(p["settings"]["extra"], {"--dspark": "on"})
+        self.assertIn("--set dspark=on", p["flags"])
+
     def test_api_key_flags(self):
         p = self.plan("--model", "q2_0", "--access", "lan", "--api-key", "sk-mine")
         self.assertEqual(p["settings"]["api_key"], "set")
@@ -951,6 +971,24 @@ class FlagsCommand(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("Nothing was changed.", out)
         self.assertEqual(store.list_presets(), [])
+
+    def test_the_access_help_names_the_flags_for_showing_and_setting_a_key(self):             # #3713 #3951
+        from strata_cli.launch import screens
+        self.assertIn("strata launch --show-key", screens.AccessScreen.help_text)
+        self.assertIn("--api-key YOUR-KEY", screens.AccessScreen.help_text)
+
+    def test_the_summary_says_where_the_engine_log_is(self):                                  # #3656
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / "x.json"
+            cfg.write_text(json.dumps({"log": str(Path(d) / "office.engine.log"), "args": []}), encoding="utf-8")
+            fake = Result(profile="launch-office", urls=["http://127.0.0.1:8080"], key=None, tune_word=None, notices=[], config=str(cfg))
+            with mock.patch.object(Runner, "run", return_value=fake):
+                code, out, err = run_cli(["launch", "--no-tui", "--model", "q2_0"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("Engine log", out)
+        self.assertIn("office.engine.log", out)
+        self.assertIn("strata logs --follow", out)
 
     def test_run_without_screens_prints_the_address_and_saves_the_preset(self):
         fake = Result(profile="launch-office", urls=["http://127.0.0.1:8080", "http://192.168.1.5:8080"], key="sk-strata-abcdefghijkl",
@@ -1236,7 +1274,19 @@ class ConnectCommand(unittest.TestCase):
     def test_context_flag_reaches_the_config(self):
         code, out, _ = run_cli(["connect", "pi", "--url", "http://127.0.0.1:8080", "--context", "64k", "--show-key"])
         self.assertIn('"contextWindow": 65536', out)
-        self.assertIn('"reserveTokens": 50536', out)
+        self.assertIn('"reserveTokens": 33394', out)             # 65536 - 32142: the tested 52.3% share, not a flat 15K
+
+    def test_the_compaction_point_scales_with_the_window(self):
+        """A wider server must not be summarised every 15,000 tokens: the share the tested 32K configs used carries over."""
+        wide = harness.target("http://127.0.0.1:18900", None, "qwen3.8-flash-next-q2_0", 262144)
+        self.assertEqual(harness.compact_at(wide), 135000)                     # 52.3% of the 258048 input limit
+        cfg = json.loads(self.render("opencode", context=262144)["files"][0]["text"])
+        self.assertEqual(wide.input_limit - cfg["compaction"]["buffer"], 135000)
+        self.assertIn("model_auto_compact_token_limit = 135000", self.render("codex", context=262144)["files"][0]["text"])
+        self.assertIn("thresholdTokens: 135000", self.render("omp", context=262144)["files"][1]["text"])
+        # the window every config was tested on keeps exactly the value it was tested at
+        tested = harness.target("http://127.0.0.1:18900", None, "qwen3.8-flash-next-q2_0", 32768)
+        self.assertEqual(harness.compact_at(tested), 15000)
 
 
 class GpuRolesFlag(unittest.TestCase):
