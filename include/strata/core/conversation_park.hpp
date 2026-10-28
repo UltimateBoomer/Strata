@@ -17,7 +17,9 @@
 // conversation_kv_save reuses a retained image by), new checkpoint records (one already in this file is kept when the
 // checkpoint names it: ConversationCheckpoint::park_file/park_record), the live state and the directory; then the
 // superblock is pointed at the new directory and the records it no longer names are punched out.  Not crash-safe:
-// the engine removes every park file at start, and a failed update leaves a file the caller removes.  The files are
+// the engine removes the park files of another model or configuration at start (with --no-conversation-cache-keep,
+// every one), a failed update leaves a file the caller removes, and a file torn by a crash fails its hashes when
+// it is read back.  The files are
 // written by this process for itself; the hashes catch a torn or corrupted read, they do not authenticate a file.
 #pragma once
 
@@ -51,6 +53,7 @@ struct ParkFileState {
     ParkRecord live, directory;
     std::vector<ParkRecord> checkpoints;   // in the order of the conversation's checkpoints
     std::vector<ParkLayer> layers;
+    uint64_t session = 0;       // the server's tag of the conversation (sess=), 0: none; kept for the next run
     // what the file holds that is in use: the budget charges this (regions' used bytes, records, directory; a live
     // record that is a checkpoint's counts once)
     uint64_t bytes() const;
@@ -70,13 +73,14 @@ inline constexpr uint64_t kParkHashBlock = 1ull << 20;
 // since `base` was written or read (ignored without a base).  `min_free_bytes`: the free-space preflight, as a SAVE's.
 // `beat`: called after every block moved.  `live_checkpoint` (>= 0): the live running state IS checkpoints[i]'s (the
 // conversation parked as of that checkpoint: meta.live has its token and image lists and no state), so the live record
-// is that checkpoint's and nothing more is written for it.  On success `state` describes the file; on failure the file
-// may be torn and the caller removes it.
+// is that checkpoint's and nothing more is written for it.  `session`: the server's tag of the conversation, kept in
+// the directory for the next run.  On success `state` describes the file; on failure the file may be torn and the
+// caller removes it.
 bool park_file_write(const std::string& path, uint64_t file, const ParkFileState* base, const SavedConversation& meta,
                      const std::vector<ConversationCheckpoint>& checkpoints, const std::vector<SessionKvSource>& kv,
                      const std::vector<std::array<uint64_t, 5>>& caps, const std::vector<std::array<uint64_t, 5>>& keep,
                      uint64_t min_free_bytes, const std::function<void()>& beat, ParkFileState& state,
-                     ParkWriteStats& stats, std::string& error, int live_checkpoint = -1);
+                     ParkWriteStats& stats, std::string& error, int live_checkpoint = -1, uint64_t session = 0);
 
 // Reads the file back with its K/V streamed: `meta` gets the running state and the checkpoints (each marked with this
 // file and its record, so an update keeps them), the K/V goes to `target`, layer by layer, each block checked against
@@ -85,5 +89,13 @@ bool park_file_write(const std::string& path, uint64_t file, const ParkFileState
 bool park_file_read(const std::string& path, uint64_t file, SavedConversation& meta, const SessionKvTarget& target,
                     const SessionReadLimits& limits, ParkFileState& state, std::string& error,
                     SessionStatus* status = nullptr);
+
+// The files an earlier run left (kept by default, --no-conversation-cache-keep): what the cache keeps in RAM for a file an earlier run left (conversation_skeleton: the
+// token and image lists and the checkpoints' LRU stamps), read from its directory and records with every hash checked;
+// the running states are passed over and no K/V is read.  `limits` bound the counts as park_file_read's do (its RAM
+// admission is not asked: only one chunk buffer is held).  `bytes`: what the file holds, as ParkFileState::bytes();
+// `session` (optional): the tag the file was parked with.
+bool park_file_index(const std::string& path, uint64_t file, const SessionReadLimits& limits,
+                     SavedConversation& skeleton, uint64_t& bytes, std::string& error, uint64_t* session = nullptr);
 
 } // namespace strata::core

@@ -780,6 +780,47 @@ int main() {
             check(park(cache, 67, image({9, 9}), 100) && !files.count(61) && cache.obsolete() == 0,
                   "unguarded, the obsolete entry goes next");
             check(files.count(63) && files.count(64) && files.count(65), "the untagged and the later park stay");
+            check(cache.obsolete_files().empty(), "none obsolete: no file to list");
+            check(cache.mark_obsolete(64) && cache.obsolete_files() == std::vector<uint64_t>{64} &&
+                      !cache.mark_obsolete(99),
+                  "a kept file marked obsolete again (the next run's list); an unknown one is not");
+        }
+        {   // --conversation-cache-group: one budget with the other variants' files, the oldest file first
+            ConversationCache cache(1000, SIZE_MAX);
+            disk_of(cache);
+            std::vector<std::string> gone;
+            cache.use_others([&](const std::string& path) { gone.push_back(path); });
+            cache.add_other(30, 300, "q3/park-2.park");
+            cache.add_other(10, 200, "q3/park-1.park");
+            check(cache.put_file(conversation_skeleton(image({1, 1}), {}), 70, 300, 0, 0, 20),
+                  "a file of an earlier run, parked between the other variant's two");
+            files[70] = image({1, 1});
+            check(cache.bytes() == 300 && cache.other_bytes() == 500 && cache.others() == 2,
+                  "the other variant's files are charged beside this one's, not parked here");
+            check(park(cache, 71, image({2, 2}), 300) && gone == std::vector<std::string>{"q3/park-1.park"} &&
+                      files.count(70) && cache.others_removed() == 1 && cache.other_bytes_removed() == 200,
+                  "room: the oldest file goes first, the other variant's");
+            check(park(cache, 72, image({3, 3}), 300) && !files.count(70) && gone.size() == 1,
+                  "then this variant's own, older than the other variant's next");
+            check(park(cache, 73, image({4, 4}), 300) && gone.size() == 2 && cache.others() == 0 &&
+                      cache.other_bytes() == 0 && files.count(71) && files.count(72),
+                  "a file parked in this run is newer than any of another variant's");
+        }
+        {   // fit(): the start of a run, everything over the budget goes oldest first
+            ConversationCache cache(500, SIZE_MAX);
+            disk_of(cache);
+            std::vector<std::string> gone;
+            cache.use_others([&](const std::string& path) { gone.push_back(path); });
+            files[80] = image({1});
+            files[81] = image({2});
+            check(cache.put_file(conversation_skeleton(image({1}), {}), 80, 200, 0, 0, 10) &&
+                      cache.put_file(conversation_skeleton(image({2}), {}), 81, 200, 0, 0, 30), "two kept files");
+            cache.add_other(20, 200, "q1/park-9.park");
+            cache.add_other(40, 200, "q1/park-10.park");
+            cache.fit();
+            check(!files.count(80) && files.count(81) && gone == std::vector<std::string>{"q1/park-9.park"} &&
+                      cache.bytes() + cache.other_bytes() <= 500,
+                  "800 over a 500 budget: the two oldest files go, one of each variant");
         }
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);

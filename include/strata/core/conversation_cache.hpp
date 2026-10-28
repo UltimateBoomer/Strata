@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -246,6 +247,33 @@ public:
     /// (load_with, borrow_with); `remove` deletes one (a missing file is fine).  The budget then bounds the files' bytes.
     void use_disk(std::function<void(uint64_t file)> remove) { remove_ = std::move(remove); }
     bool on_disk() const { return (bool) remove_; }
+    /// --conversation-cache-group: a file of another variant of this model (`when`: when it was last parked, in
+    /// nanoseconds of the system clock; `bytes`: what it takes on disk).  This engine cannot read it back, but the
+    /// budget covers it: make_room removes the oldest file first, whichever variant's it is.  `remove` deletes one.
+    void use_others(std::function<void(const std::string& path)> remove) { remove_other_ = std::move(remove); }
+    void add_other(int64_t when, size_t bytes, std::string path) {
+        Other o{when, bytes, std::move(path)};
+        others_.insert(std::upper_bound(others_.begin(), others_.end(), o,
+                                        [](const Other& a, const Other& b) { return a.when < b.when; }),
+                       std::move(o));
+        other_bytes_ += bytes;
+    }
+    size_t others() const { return others_.size(); }
+    size_t other_bytes() const { return other_bytes_; }
+    /// The files of other variants removed to stay in the budget, and their bytes.
+    size_t others_removed() const { return others_removed_; }
+    size_t other_bytes_removed() const { return other_bytes_removed_; }
+    /// Evicts until what is parked (and the other variants' files) fits the budget again, as make_room(0) without
+    /// the slot rule; the start of a run that kept the files of an earlier one.
+    void fit() {
+        while ((!entries_.empty() || !others_.empty()) && bytes_ + base_bytes() + other_bytes_ > budget_)
+            if (!evict_for_room()) break;
+    }
+    /// The system clock in nanoseconds: an entry's `when`.
+    static int64_t now_ns() {
+        return (int64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
     /// Whether evicting a parked conversation gives RAM back.  With the file tier it gives back disk space only, so
     /// the RAM admission paths must not empty the cache for nothing.
     bool frees_ram() const { return !on_disk(); }
@@ -433,6 +461,19 @@ public:
             if (e.session == session && !e.obsolete) { e.obsolete = true; ++n; }
         return n;
     }
+    /// The files of the obsolete entries (drop_session), for the next run: the engine keeps their list beside them.
+    std::vector<uint64_t> obsolete_files() const {
+        std::vector<uint64_t> out;
+        for (const auto& e : entries_)
+            if (e.obsolete && e.file != 0) out.push_back(e.file);
+        return out;
+    }
+    /// A file an earlier run left that was obsolete then (put_file's entry for it): obsolete again.
+    bool mark_obsolete(uint64_t file) {
+        for (auto& e : entries_)
+            if (e.file == file) { e.obsolete = true; return true; }
+        return false;
+    }
     size_t obsolete() const {
         size_t n = 0;
         for (const auto& e : entries_) n += e.obsolete;
@@ -461,13 +502,36 @@ public:
                 if (stays(i)) { ++kept; kept_bytes += entries_[i].bytes; }
             if (kept >= slots_ || kept_bytes > budget_ - held - incoming) { guard_blocked_ = true; return false; }
         }
-        if (bytes() > budget_ - held - incoming) reuse_ = {};
-        while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ + base_bytes() > budget_ - held - incoming)) {
-            // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
-            // image does not fit (the caller skips parking it - the pinned prefix is what the queries come back to)
+        if (bytes() + other_bytes_ > budget_ - held - incoming) reuse_ = {};
+        while (!entries_.empty() && entries_.size() >= slots_)
             if (!evict_oldest()) return false;
+        while ((!entries_.empty() || !others_.empty()) && bytes_ + base_bytes() + other_bytes_ > budget_ - held - incoming) {
+            // the oldest entry that does not hold a pinned shared prefix leaves, or an older file of another variant;
+            // with only pinned ones left the new image does not fit (the caller skips parking it - the pinned prefix is
+            // what the queries come back to)
+            if (!evict_for_room()) return false;
         }
         return true;
+    }
+
+    // make_room's eviction for bytes: an obsolete entry first (drop_session), then whichever is older - this engine's
+    // oldest entry that may go, or the oldest file of another variant.
+    bool evict_for_room() {
+        auto may_go = [&](size_t i) { return !entries_[i].image.pinned() && !(guarded_ != 0 && serials_[i] == guarded_); };
+        for (size_t i = 0; i < entries_.size(); ++i)
+            if (entries_[i].obsolete && may_go(i)) return evict_oldest();
+        int64_t own = INT64_MAX;
+        for (size_t i = 0; i < entries_.size(); ++i)
+            if (may_go(i)) { own = entries_[i].when; break; }
+        if (!others_.empty() && (own == INT64_MAX || others_.front().when <= own)) {
+            if (remove_other_) remove_other_(others_.front().path);
+            other_bytes_ -= others_.front().bytes;
+            other_bytes_removed_ += others_.front().bytes;
+            ++others_removed_;
+            others_.pop_front();
+            return true;
+        }
+        return evict_oldest();
     }
 
     // The parked conversation that has gone unused the longest.  This is make_room()'s loop body, so
@@ -571,22 +635,24 @@ public:
         if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
         if (!make_room(n, held)) return false;
-        entries_.push_back(Entry{std::move(image), 0, n, session});
+        entries_.push_back(Entry{std::move(image), 0, n, session, false, now_ns()});
         serials_.push_back(next_serial_++);
         bytes_ += n;
         return true;
     }
 
     /// The file tier: the engine wrote the image to file `file` (`bytes` on disk); the cache keeps `skeleton`
-    /// (conversation_skeleton) and owns the file from here on, so a refusal removes it.
-    bool put_file(SavedConversation&& skeleton, uint64_t file, size_t bytes, size_t held = 0, uint64_t session = 0) {
+    /// (conversation_skeleton) and owns the file from here on, so a refusal removes it.  `when`: when it was parked
+    /// (now_ns(); a file an earlier run left: its modification time), 0: now.
+    bool put_file(SavedConversation&& skeleton, uint64_t file, size_t bytes, size_t held = 0, uint64_t session = 0,
+                  int64_t when = 0) {
         if (!on_disk() || file == 0 || !enabled() || held > budget_ || bytes > budget_ - held) {
             if (on_disk() && file != 0) remove_(file);
             return false;
         }
         drop_superseded(skeleton.live.ids, skeleton.live.imgs, skeleton.checkpoints, skeleton.cvec);
         if (!make_room(bytes, held)) { remove_(file); return false; }
-        entries_.push_back(Entry{std::move(skeleton), file, bytes, session});
+        entries_.push_back(Entry{std::move(skeleton), file, bytes, session, false, when ? when : now_ns()});
         serials_.push_back(next_serial_++);
         bytes_ += bytes;
         return true;
@@ -601,6 +667,12 @@ private:
         size_t bytes = 0;
         uint64_t session = 0;   // the server's tag of the conversation (sess=), 0: none
         bool obsolete = false;  // drop_session: evicted before any other
+        int64_t when = 0;       // when it was parked (now_ns()), for the budget shared with other variants' files
+    };
+    struct Other {
+        int64_t when = 0;
+        size_t bytes = 0;
+        std::string path;
     };
     void release(Entry& e) {
         if (e.file != 0 && remove_) remove_(e.file);
@@ -627,6 +699,9 @@ private:
     ConversationKvReuse reuse_;
     std::optional<Base> base_;
     std::function<void(uint64_t file)> remove_;
+    std::deque<Other> others_;   // other variants' files, oldest first
+    size_t other_bytes_ = 0, others_removed_ = 0, other_bytes_removed_ = 0;
+    std::function<void(const std::string& path)> remove_other_;
     std::string last_error_;
 };
 
