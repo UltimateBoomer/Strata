@@ -34,6 +34,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from serve import engine_fields
 from strata_control import user_args
 
 # the keys a variant may set (everything else is the common config's)
@@ -112,7 +113,11 @@ class Models:
         return {"active": self.active, "default": self.default, "committed": self.committed,
                 "variants": {n: v.model_name for n, v in self.variants.items()},
                 "saved": sorted(self.saved), "switches": self.switches, "switch_s": round(self.switch_s, 1),
-                "last_switch_s": self.last_switch_s, "default_idle_s": self.idle_s}
+                "last_switch_s": self.last_switch_s, "default_idle_s": self.idle_s,
+                "resident_s": round(self.clock() - self.since, 1), "max_wait_s": self.max_wait_s,
+                "min_resident_s": self.min_resident_s, "preempt": self.preempt, "unknown": self.unknown,
+                "aliases": {n: v.aliases for n, v in self.variants.items()},
+                "sampling": {n: v.cfg.get("sampling") or {} for n, v in self.variants.items()}}
 
 
 def _number(cfg: dict, key: str, default: float) -> float:
@@ -229,6 +234,7 @@ def load(cfg: dict, config_path: str | None, startup: str | None = None) -> tupl
                 raise ValueError(f"models.{name}: cannot read {path}: {e}") from None
         if not isinstance(own, dict):
             raise ValueError(f"models.{name} must be a config file name or an object")
+        own = engine_fields.expand(own, f"models.{name}")
         vcfg = variant_config(cfg, own, name)
         aliases = vcfg.get("aliases") or []
         if isinstance(aliases, str):

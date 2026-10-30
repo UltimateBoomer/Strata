@@ -65,6 +65,9 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthro
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve import engine_fields  # noqa: E402
+from serve import parkfiles  # noqa: E402
+from serve import liveconfig  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from strata_control import engine_component  # noqa: E402
 from strata_control import tls  # noqa: E402
@@ -84,8 +87,8 @@ from serve import logit_bias as bias_api  # noqa: E402
 from serve import lifeline  # noqa: E402
 from serve import models as serve_models  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json, extract_json  # noqa: E402
-from serve.turns import (Turn, TurnPolicy, call_timeout_s, cited_calls, request_drops, request_flag,  # noqa: E402
-                         request_priority, request_session, request_yield_tools, timeout_units, turns_from_config)
+from serve.turns import (Turn, TurnPolicy, TurnScheduler, call_timeout_s, cited_calls, request_drops,  # noqa: E402
+                         request_flag, request_priority, request_session, request_yield_tools, timeout_units, turns_from_config)
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
@@ -448,6 +451,10 @@ class SessionRefused(ValueError):
 class EngineStuck(RuntimeError):
     """The engine process did not end after QUIT, terminate and kill: the server keeps it (and says so) rather than
     reporting its GPU and RAM as given back."""
+
+
+class ConfigApplyFailed(RuntimeError):
+    """The Config view's new config did not start; the earlier one is back (Service.apply_config)."""
 
 
 class GpuBusy(RuntimeError):
@@ -4104,6 +4111,13 @@ class Service:
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
+        self.session_names = parkfiles.SessionNames()   # session tags -> names, for the Monitor's parked files
+        # the Config view (serve/liveconfig.py): what main() does to a config before its variants are read, the
+        # engine's start options, where applied versions are kept, and whether the engine can be restarted with a new start
+        self.config_prepare = None
+        self.spawn_options: dict = {}
+        self.config_history: Path | None = None
+        self.live_engine = False
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
         # matters); empty = no CORS headers at all, as before
         self.cors_origins: list[str] = []
@@ -4729,6 +4743,183 @@ class Service:
             if load:
                 print(f"[strata] the model is now {name} ({took:.1f} s)", flush=True)
 
+    # ------------------------------------------------------------------ the Config view (serve/liveconfig.py)
+    def config_view(self) -> dict:
+        """GET /api/config: the run config's files as they are on disk, and what applies without a restart."""
+        main = Path(self.config_path)
+        files = liveconfig.read_files(main)
+        return {"main": main.name, "files": files, "variants": liveconfig.variant_files(files[main.name]),
+                "active": self.models.active if self.models is not None else None,
+                "live_engine": self.live_engine, "live_keys": sorted(liveconfig.LIVE_KEYS),
+                "engine_keys": sorted(liveconfig.ENGINE_KEYS),
+                "variant_keys": sorted(serve_models.VARIANT_KEYS | {"engine", "engine_env"})}
+
+    def _plan_config(self, main: Path, files: dict) -> dict:
+        """The files checked as a start would check them, and what applying them would do (nothing is changed)."""
+        old = liveconfig.read_files(main)
+        files = liveconfig.check_files(main.name, files)
+        plan = liveconfig.classify(main.name, old, files)
+        restart = set(plan["restart_required"])
+        tmp = Path(tempfile.mkdtemp(prefix="strata-config-"))
+        try:
+            liveconfig.write_temp(tmp, files)
+            active = self.models.active if self.models is not None else None
+            cfg, models = liveconfig.build(tmp / main.name, active, self.config_prepare)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        live = (models is None) == (self.models is None)
+        if not live:                                    # one model <-> variants: a server of another shape
+            restart.add("models")
+        cfgs = {v.name: v.cfg for v in models.variants.values()} if models is not None else {None: cfg}
+        for name, c in cfgs.items():
+            split_joined_args(c)
+            try:
+                sampling_defaults_from_config(c)
+            except SystemExit as e:
+                raise ValueError(str(e).replace("[strata] config ", "", 1) +
+                                 (f" (variant {name})" if name else "")) from None
+            if c.get("park", "all") not in (None, "all", "sessions"):
+                raise ValueError(f'"park" must be "all" or "sessions", not {c.get("park")!r}')
+            rb = c.get("reasoning_budget_tokens")
+            if rb is not None and (isinstance(rb, bool) or not isinstance(rb, int) or rb < 0):
+                raise ValueError(f'"reasoning_budget_tokens" must be a whole number >= 0, not {rb!r}')
+        turns, _ = turns_from_config(cfg, self.fifo, models=models is not None)
+        if (turns is None) != (self.turns is None) or (turns is not None and not isinstance(turns, TurnScheduler)) \
+                or (self.turns is not None and not isinstance(self.turns, TurnScheduler)):
+            if any(k in liveconfig.TURN_KEYS for keys in plan["changes"].values() for k in keys):
+                restart.add("turn scheduler")
+            turns = None
+        spawns, engine_restart = {}, False
+        active = models.active if models is not None else None
+        if live and self.live_engine:
+            opts = self.spawn_options
+            spawns = {n: engine_spawn(c, **opts) for n, c in cfgs.items()}
+            # only a change to the engine's own keys (main file, or the loaded variant's file) restarts it, so an
+            # environment that reads differently now (a device probe) does not restart an engine nothing changed for
+            vfiles = liveconfig.variant_files(files[main.name])
+            own = vfiles.get(active) if active is not None else None
+            touched = any(k in liveconfig.ENGINE_KEYS for k in plan["changes"].get(main.name, [])) or \
+                any(k not in ("sampling", "model_name", "aliases") for k in plan["changes"].get(own, [])) or \
+                (self.models is not None and active != self.models.active)
+            engine_restart = touched and spawns[active] != tuple(self.engine.spawn)
+        elif any(k in liveconfig.ENGINE_KEYS for keys in plan["changes"].values() for k in keys):
+            restart.add("engine (this server's engine cannot be restarted with a new start)")
+        return {**plan, "restart_required": sorted(restart), "live": live, "cfg": cfg, "models": models,
+                "turns": turns, "spawns": spawns, "engine_restart": engine_restart, "active": active,
+                "files": files}
+
+    def _config_state(self) -> dict:
+        m, t = self.models, self.turns
+        return {"model": self.model, "aliases": list(self.aliases), "sampling": self.sampling_defaults,
+                "park": self.park_sessions, "rb": (self.reasoning_budget_tokens, self.reasoning_budget_configured),
+                "models": dict(m.__dict__) if m is not None else None,
+                "turns": {k: getattr(t, k) for k in ("slice_s", "max_wait_s", "policy", "hold_s", "skip_timeout_s",
+                                                     "side_wait_s", "prio")} if isinstance(t, TurnScheduler) else None,
+                "spawn": getattr(self.engine, "spawn", None), "loaded": self.loaded()}
+
+    def _set_config_state(self, st: dict) -> None:
+        self.model, self.aliases, self.sampling_defaults = st["model"], st["aliases"], st["sampling"]
+        self.park_sessions = st["park"]
+        self.reasoning_budget_tokens, self.reasoning_budget_configured = st["rb"]
+        if st["models"] is not None:
+            self.models.__dict__.update(st["models"])
+        if st["turns"] is not None:
+            with self.turns.cv:
+                for k, v in st["turns"].items():
+                    setattr(self.turns, k, v)
+                self.turns.cv.notify_all()
+        if st["spawn"] is not None:
+            self.engine.spawn = st["spawn"]
+
+    def _apply_plan(self, plan: dict) -> None:
+        """The checked config made the server's (the caller holds the turn); the engine is not touched here."""
+        cfg, models = plan["cfg"], plan["models"]
+        if not plan["live"]:
+            return
+        if models is not None:
+            m = self.models
+            was_idle = m.idle_s
+            for v in models.variants.values():
+                old = m.variants.get(v.name)
+                v.spawn = plan["spawns"].get(v.name) or (old.spawn if old is not None else None)
+            m.variants, m.default, m.idle_s = models.variants, models.default, models.idle_s
+            m.max_wait_s, m.min_resident_s, m.preempt = models.max_wait_s, models.min_resident_s, models.preempt
+            m.unknown, m.session_dir = models.unknown, models.session_dir
+            if m.active not in m.variants:
+                m.active = models.active
+            if m.committed not in m.variants:
+                m.committed = None
+            m.saved = {k: v for k, v in m.saved.items() if k in m.variants}
+            self.apply_variant(m.variants[m.active])
+            if m.idle_s and not was_idle:
+                self.start_default_idle()
+        else:
+            self.model = default_model_name(cfg)
+            self.set_aliases(cfg.get("aliases"))
+            self.sampling_defaults = sampling_defaults_from_config(cfg)
+        self.park_sessions = cfg.get("park", "all") == "sessions"
+        rb = cfg.get("reasoning_budget_tokens")
+        self.reasoning_budget_configured = rb is not None
+        self.reasoning_budget_tokens = rb or 0
+        new = plan["turns"]
+        if new is not None and isinstance(self.turns, TurnScheduler):
+            t = self.turns
+            with t.cv:
+                t.policy, t.slice_s, t.max_wait_s = new.policy, new.slice_s, new.max_wait_s
+                t.policy.clock = t.clock
+                t.hold_s, t.skip_timeout_s, t.side_wait_s, t.prio = new.hold_s, new.skip_timeout_s, new.side_wait_s, \
+                    new.prio
+                t.cv.notify_all()
+
+    def apply_config(self, files: dict, dry_run: bool = False, wait_s: float = 60.0) -> dict:
+        """POST /api/config: check `files` (the run config's, whole), and unless `dry_run` write them and apply them -
+        the engine restarted when its start changed; on a failed start the earlier files and engine come back.
+        ValueError for a config that cannot be used, ModelBusy when the turn is not free within `wait_s`."""
+        main = Path(self.config_path)
+        with self.config_lock:
+            plan = self._plan_config(main, files)
+            answer = {"changes": plan["changes"], "restart_required": plan["restart_required"],
+                      "engine_restart": plan["engine_restart"], "dry_run": bool(dry_run)}
+            if dry_run or not plan["changes"]:
+                return {**answer, "applied": False}
+            if not self.fifo.acquire(timeout=max(0.0, wait_s)):
+                raise ModelBusy(f"a request held the engine for {wait_s:g} s; nothing was changed - try again")
+            try:
+                before = self._config_state()
+                history = self.config_history or main.parent / ".history"
+                backup = liveconfig.save(main, plan["files"], history)
+                restarted = False
+                try:
+                    self._apply_plan(plan)
+                    if plan["engine_restart"]:
+                        spawn = plan["spawns"][plan["active"]]
+                        if self.loaded():
+                            print("[strata] the config changed the engine's start: restarting the engine ...", flush=True)
+                            self.engine.unload()
+                            self.engine.spawn = spawn
+                            self.ensure_loaded()
+                            restarted = True
+                        else:
+                            self.engine.spawn = spawn
+                except Exception as e:                  # noqa: BLE001 - the earlier config comes back
+                    liveconfig.restore(main, backup, plan["files"])
+                    self._set_config_state(before)
+                    back = ""
+                    if before["loaded"] and not self.loaded():
+                        try:
+                            self.ensure_loaded()
+                        except Exception as e2:         # noqa: BLE001
+                            back = f"; the earlier engine did not start either ({e2})"
+                    print(f"[strata] the new config was not applied ({e}); the earlier files are back{back}", flush=True)
+                    raise ConfigApplyFailed(f"{e}; the earlier config is back{back}") from e
+            finally:
+                self.fifo.release()
+            changed = ", ".join(f"{n}: {', '.join(k)}" for n, k in plan["changes"].items())
+            print(f"[strata] the Config view applied {changed} (the earlier files: {backup})"
+                  + (f"; restart the server for {', '.join(plan['restart_required'])}" if plan["restart_required"] else ""),
+                  flush=True)
+            return {**answer, "applied": True, "engine_restarted": restarted, "backup": str(backup)}
+
     def _switch_beating(self, name: str):
         """switch_model in a thread, yielding ("ping", None) every QUEUE_BEAT_S meanwhile (a switch takes a minute: the
         client's stream stays alive).  Re-raises what the switch raised."""
@@ -5061,9 +5252,16 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+        cache = conversation_cache_view(engine, hist, totals, parked)
+        spawn = getattr(self.engine, "spawn", None)
+        if isinstance(spawn, tuple) and len(spawn) > 1 and isinstance(spawn[1], list):
+            files = parkfiles.scan(spawn[1], self.session_names.snapshot())
+            if files is not None:                       # the parked files on disk, every variant's (serve/parkfiles.py)
+                cache["files"] = files
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
-                "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
+                "conversation_cache": cache,
                 **({"turns": self.turns.view()} if self.turns is not None else {}),
+                **({"models": self.models.view()} if self.models is not None else {}),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
@@ -5601,6 +5799,8 @@ class Service:
         with self.drops_lock:
             drops, self.pending_drops = sorted(self.pending_drops), set()
         e = {"sess": session_tag(key) if key else 0, "park": not (self.park_sessions and key is None), "drop": drops}
+        if key:
+            self.session_names.note(e["sess"], key)
         if not e["sess"] and e["park"] and not drops:
             return sampling                             # nothing to say: the request goes as before
         return {**(sampling or {}), ENGINE_SESSION_KEY: e}
@@ -7512,13 +7712,24 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._config_get()
                 return
+            if path == "/api/config":                        # the Config view: the run config's files (serve/liveconfig.py)
+                if self._authorized():
+                    if not svc.config_path:
+                        self._json(404, {"error": {"message": "this server was started without a run config"}})
+                        return
+                    try:
+                        self._json(200, svc.config_view())
+                    except ValueError as e:
+                        self._json(500, {"error": {"type": "server_error", "message": str(e)}})
+                return
             if path == "/mcp":
                 # the MCP servers, their state and tools (the web app's switch and Monitor card)
                 if self._authorized():
                     self._json(200, svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0})
                 return
             if path == "" or (path == "/api-monitor" and svc.api_monitor):
-                body = (ROOT / "serve" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
+                # the fork's console (Monitor, Config, About) at /: the chat page (index.html) is not served
+                body = (ROOT / "serve" / "web" / ("monitor.html" if path else "console.html")).read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 if not path:
@@ -7628,6 +7839,9 @@ def make_handler(svc: Service):
                 return
             if path == "/config":
                 self._config_post()
+                return
+            if path == "/api/config":
+                self._live_config_post()
                 return
             if path in ("/unload", "/load") and not self._control_body():
                 return
@@ -7964,6 +8178,37 @@ def make_handler(svc: Service):
                 print(f"[strata] the Settings view changed {', '.join(changed)} in {Path(svc.config_path).name} "
                       f"(the earlier file: {bak.name}); used from the next start", flush=True)
             self._json(200, {**runconfig.view(new, svc.config_path), "changed": changed})
+        def _live_config_post(self):
+            """The Config view: {"files": {name: object}, "dry_run": bool, "wait_s": seconds} - JSON from Strata's own
+            page only, as /config (the key is checked before)."""
+            body = self._body()
+            if not self._own_page("the run config can be changed"):
+                return
+            if not svc.config_path:
+                self._json(404, {"error": {"message": "this server was started without a run config"}})
+                return
+            try:
+                req = json.loads(body or b"{}")
+                if not isinstance(req, dict):
+                    raise ValueError("send a JSON object")
+                wait = req.get("wait_s", 60)
+                if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not 0 <= wait <= 600:
+                    raise ValueError("wait_s: a number of seconds from 0 to 600")
+                result = svc.apply_config(req.get("files"), dry_run=req.get("dry_run") is True, wait_s=float(wait))
+            except ValueError as e:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                return
+            except ModelBusy as e:
+                self._json(409, {"error": {"type": "server_error", "code": "busy", "message": str(e)}})
+                return
+            except ConfigApplyFailed as e:
+                self._json(500, {"error": {"type": "server_error", "code": "apply_failed", "message": str(e)}})
+                return
+            except OSError as e:
+                self._json(500, {"error": {"type": "server_error", "message": f"the config cannot be written: {e}"}})
+                return
+            self._json(200, result)
+
         def _foreign_origin(self) -> bool:
             """A web page of another origin sent this.  The Origin must be this server's own address (host and port),
             or an origin the config trusts (trusted_origins: the web app behind a reverse proxy or tunnel); no Origin
@@ -9050,6 +9295,17 @@ def model_card_sampling(arch, thinking) -> dict:
     return dict(sets["thinking" if thinking else "instruct"]) if sets else {}
 
 
+def engine_spawn(cfg: dict, *, offline: bool = False, batch_telemetry=None, effort_end=()) -> tuple:
+    """A run config's engine start (StrataEngine.spawn): what a model variant switches to, and what the Config view
+    compares to the running engine's."""
+    vc = with_component_engine(cfg)
+    vexe = _component_exe(vc["exe"], vc) if engine_component.is_reference(vc["exe"]) else \
+        vc["exe"] if os.path.isabs(vc["exe"]) else os.path.abspath(os.path.join(vc.get("cwd") or ".", vc["exe"]))
+    venv = child_env(vc, offline=offline)
+    configure_batch_telemetry_env(venv, vc, batch_telemetry)
+    return (vexe, engine_args(vc) + list(effort_end or []), vc.get("cwd"), vc.get("log"), venv, False, None)
+
+
 def default_model_name(cfg: dict) -> str:
     """The config's "model_name", else its family's name ("arch": qwen4exp, qwen35moe), else Flash-Next's."""
     return cfg.get("model_name") or FAMILY_MODEL_NAMES.get(cfg.get("arch") or "qwen4exp", "qwen3.8-flash-next")
@@ -9228,6 +9484,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         ap.error("--shutdown-timeout must be in 0..300 seconds")
     config_bytes = Path(a.config).read_bytes() if a.config else b""
     cfg = parse_config_text(config_bytes.decode("utf-8-sig"), a.config) if a.config else {}   # Notepad adds a BOM
+    try:                                                # "engine" / "engine_env" fields (serve/engine_fields.py)
+        cfg = engine_fields.expand(cfg, Path(a.config).name if a.config else "config")
+    except ValueError as e:
+        raise SystemExit(f"[strata] config {e}")
     split_joined_args(cfg)
     if a.config and a.engine == "strata":
         cfg = apply_saved_tuning(cfg)
@@ -9447,12 +9707,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                 if v.name == models.active:
                     v.spawn = engine.spawn
                     continue
-                vc = with_component_engine(v.cfg)
-                vexe = _component_exe(vc["exe"], vc) if engine_component.is_reference(vc["exe"]) else \
-                    vc["exe"] if os.path.isabs(vc["exe"]) else os.path.abspath(os.path.join(vc.get("cwd") or ".", vc["exe"]))
-                venv = child_env(vc, offline=a.offline)
-                configure_batch_telemetry_env(venv, vc, a.batch_telemetry)
-                v.spawn = (vexe, engine_args(vc) + (effort_end or []), vc.get("cwd"), vc.get("log"), venv, False, None)
+                v.spawn = engine_spawn(v.cfg, offline=a.offline, batch_telemetry=a.batch_telemetry,
+                                       effort_end=effort_end or [])
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
                                  linux_desktop()) if not groups and not split else None
@@ -9502,6 +9758,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         per_replica = requested if isinstance(requested, int) and not isinstance(requested, bool) and requested > 0 else 1
         svc.requested_slots = per_replica * len(groups) if groups else per_replica
     svc.answer_room = cfg.get("answer_room") is not False
+    if cfg.get("log"):                                  # the session names behind the parked files' tags, kept
+        svc.session_names = parkfiles.SessionNames(Path(cfg["log"]).parent / "session-names.json")
     if models is not None:
         svc.models = models
         models.loaded = svc.loaded
@@ -9666,6 +9924,18 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)
     if a.config:
         svc.config_path = a.config                      # #564: the web page's Settings view
+        # the Config view (serve/liveconfig.py): a new config is read as this one was, and its engine started the same way
+
+        def prepare(c):
+            split_joined_args(c)
+            return apply_saved_tuning(c, say=lambda line: None) if a.engine == "strata" else c
+        svc.config_prepare = prepare
+        svc.config_history = Path(cfg["log"]).parent / "config-history" if cfg.get("log") else \
+            Path(a.config).parent / ".history"
+        if a.engine == "strata" and isinstance(engine, StrataEngine) and not groups and not split:
+            svc.spawn_options = {"offline": a.offline, "batch_telemetry": a.batch_telemetry,
+                                 "effort_end": effort_end or []}
+            svc.live_engine = True
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:

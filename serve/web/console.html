@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Strata Console</title>
+<link rel="icon" href="web/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="web/tokens.css">
+<link rel="stylesheet" href="web/components.css">
+<link rel="stylesheet" href="web/app.css">
+<link rel="stylesheet" href="web/console.css">
+<script>
+  // the theme before the first paint: the saved choice, else the system's
+  try {
+    const t = localStorage.getItem("strata.theme") ||
+      (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    document.documentElement.dataset.theme = t;
+  } catch (e) {}
+</script>
+</head>
+<body>
+<!-- serve/web/console.html - the fork's page at /: Monitor (the engine, the turn scheduler, the model variants, the
+     parked conversations), Config (the run config's files, applied while the server runs) and About. No chat. -->
+<header class="st-header">
+  <span class="st-header__brand">Strata</span>
+  <nav class="st-tabs" role="tablist" aria-label="Views">
+    <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="true" data-tab="monitor">
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg><span>Monitor</span></button>
+    <button class="st-tab" role="tab" id="tab-btn-config" aria-controls="view-config" aria-selected="false" data-tab="config">
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-settings"/></svg><span>Config</span></button>
+    <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about">
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg><span>About</span></button>
+  </nav>
+  <span class="st-header__spacer"></span>
+  <span class="variant-chip" id="variant-chip" hidden></span>
+  <span class="st-pill" id="pill" data-state="idle" role="status" aria-live="polite">
+    <span class="st-pill__dot"></span><span id="pill-text">Connecting&hellip;</span></span>
+  <button class="st-btn st-btn--secondary" id="unload-btn" type="button" title="Waiting for the server" disabled>&hellip;</button>
+  <button class="st-btn st-btn--icon" id="theme-btn" title="Light / dark" aria-label="Switch between light and dark">
+    <svg class="st-icon"><use id="theme-icon" href="web/sprite.svg#i-moon"/></svg></button>
+</header>
+
+<main>
+  <!-- ============================ Monitor ============================ -->
+  <section class="view view--monitor" id="view-monitor" role="tabpanel" aria-labelledby="tab-btn-monitor">
+    <div class="monitor">
+      <div class="st-card state-card">
+        <div class="state-card__head">
+          <span class="card-title">Model state</span>
+          <span class="badges" id="state-badges">
+            <span class="st-badge" data-s="idle">Idle</span>
+            <span class="st-badge" data-s="unloaded">Unloaded</span>
+            <span class="st-badge st-badge--reading" data-s="reading">Reading</span>
+            <span class="st-badge st-badge--generating" data-s="generating">Generating</span>
+            <span class="st-badge st-badge--queued" data-s="queued">Queued</span>
+          </span>
+        </div>
+        <div class="state-card__row"><span id="state-label">Waiting for a request</span><span class="muted" id="state-detail"></span></div>
+        <div class="st-progress" id="state-progress"><div class="st-progress__bar" id="state-bar" style="width:0%"></div></div>
+      </div>
+
+      <div class="metrics" id="metrics"></div>
+
+      <div class="monitor-row">
+        <div class="st-card ctx-card">
+          <span class="card-title">Context fill</span>
+          <div class="ctx-gauge">
+            <svg class="st-gauge" viewBox="0 0 120 120" aria-hidden="true">
+              <circle class="st-gauge__track" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round"
+                      stroke-dasharray="235.6 314.2" transform="rotate(135 60 60)"/>
+              <circle class="st-gauge__fill" id="ctx-fill" cx="60" cy="60" r="50" fill="none" stroke-width="10"
+                      stroke-linecap="round" stroke-dasharray="0 314.2" transform="rotate(135 60 60)"/>
+            </svg>
+            <div class="ctx-gauge__label"><span class="ctx-gauge__pct" id="ctx-pct">0%</span><span class="muted" id="ctx-sub">&ndash;</span></div>
+          </div>
+          <div class="bar-row"><span>Experts in VRAM</span><span class="muted" id="slots-text">&ndash;</span></div>
+          <div class="st-progress"><div class="st-progress__bar" id="slots-bar" style="width:0%"></div></div>
+          <div class="bar-row"><span>System RAM</span><span class="muted" id="ram-text">&ndash;</span></div>
+          <div class="st-progress" id="ram-progress"><div class="st-progress__bar" id="ram-bar" style="width:0%"></div></div>
+        </div>
+        <div class="st-card req-card">
+          <div class="req-head"><span class="card-title">Recent requests</span>
+            <button class="st-btn st-btn--secondary" id="req-all" hidden>Show all</button></div>
+          <div class="table-wrap" id="req-wrap">
+            <table class="st-table">
+              <thead><tr><th>Time</th><th>Status</th><th class="num">Prompt</th><th class="num">Reused</th><th class="num">Output</th>
+                <th class="num" title="New prompt tokens per second, excluding reused cache tokens">Prefill t/s</th><th class="num">Decode t/s</th>
+                <th class="num" title="While writing the answer: the share of the experts looked up that were already in VRAM">VRAM hits</th><th class="num">Duration</th></tr></thead>
+              <tbody id="req-body"><tr><td colspan="9" class="muted">No requests yet</td></tr></tbody>
+            </table>
+          </div>
+          <p class="muted req-totals" id="req-totals"></p>
+        </div>
+      </div>
+
+      <div class="monitor-row monitor-row--even">
+        <div class="st-card sched-card" id="sched-card" hidden>
+          <div class="req-head"><span class="card-title">Turn scheduler</span><span class="muted small" id="sched-sum"></span></div>
+          <div class="sched-now" id="sched-now"></div>
+          <div class="table-wrap">
+            <table class="st-table sched-table">
+              <thead><tr><th>#</th><th>Session</th><th>Variant</th><th class="num">Priority</th><th class="num">Waited</th><th></th></tr></thead>
+              <tbody id="sched-queue"></tbody>
+            </table>
+          </div>
+          <div class="stat-strip" id="sched-stats"></div>
+          <p class="muted small policy" id="sched-policy"></p>
+        </div>
+        <div class="st-card models-card" id="models-card" hidden>
+          <div class="req-head"><span class="card-title">Model variants</span><span class="muted small" id="models-sum"></span></div>
+          <div class="variant-list" id="variant-list"></div>
+          <p class="muted small policy" id="models-policy"></p>
+        </div>
+      </div>
+
+      <div class="st-card cc-card" id="cc-card" hidden>
+        <div class="req-head"><span class="card-title">Conversation cache</span><span class="muted small" id="cc-sum"></span></div>
+        <div id="cc-disk" hidden>
+          <div class="bar-row"><span id="cc-bar-label">Parked files</span><span class="muted" id="cc-mem-text">&ndash;</span></div>
+          <div class="cc-seg" id="cc-seg" role="img" aria-label="Disk budget used by each parked conversation"></div>
+          <div class="table-wrap">
+            <table class="st-table cc-table">
+              <thead><tr><th></th><th>Conversation</th><th>Variant</th><th class="num">Size</th><th class="num">Parked</th><th>File</th></tr></thead>
+              <tbody id="cc-files"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="stat-strip" id="cc-stats"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ Config ============================ -->
+  <section class="view view--config" id="view-config" role="tabpanel" aria-labelledby="tab-btn-config" hidden>
+    <div class="config">
+      <aside class="st-card cfg-files">
+        <span class="card-title">Files</span>
+        <div class="cfg-file-list" id="cfg-file-list"></div>
+        <button class="st-btn st-btn--secondary" id="cfg-add-variant" type="button" hidden>Add a variant</button>
+        <p class="muted small" id="cfg-where"></p>
+      </aside>
+      <div class="cfg-main">
+        <div class="st-card cfg-editor">
+          <div class="cfg-editor__head">
+            <div><span class="card-title" id="cfg-title">Config</span><div class="muted small" id="cfg-sub"></div></div>
+            <div class="seg seg--2 cfg-mode" id="cfg-mode" role="radiogroup" aria-label="Editor">
+              <button type="button" role="radio" data-v="form" aria-checked="true">Form</button>
+              <button type="button" role="radio" data-v="json" aria-checked="false">JSON</button>
+            </div>
+          </div>
+          <div id="cfg-form"></div>
+          <div id="cfg-json-wrap" hidden>
+            <textarea class="st-input cfg-json" id="cfg-json" spellcheck="false" aria-label="The file as JSON"></textarea>
+            <div class="msg-error" id="cfg-json-error" hidden></div>
+          </div>
+        </div>
+        <div class="st-card cfg-bar">
+          <span class="cfg-dirty" id="cfg-dirty">No changes</span>
+          <span class="spacer"></span>
+          <button class="st-btn st-btn--secondary" id="cfg-revert" type="button" disabled>Discard</button>
+          <button class="st-btn st-btn--secondary" id="cfg-check" type="button" disabled>Check</button>
+          <button class="st-btn st-btn--primary" id="cfg-apply" type="button" disabled>Apply</button>
+        </div>
+        <div class="st-card cfg-result" id="cfg-result" hidden></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ About ============================ -->
+  <section class="view view--about" id="view-about" role="tabpanel" aria-labelledby="tab-btn-about" hidden>
+    <div class="about">
+      <div class="st-card">
+        <span class="card-title">Model and engine</span>
+        <dl class="facts" id="facts-engine"></dl>
+      </div>
+      <div class="st-card">
+        <span class="card-title">This PC</span>
+        <dl class="facts" id="facts-hw"></dl>
+      </div>
+      <div class="st-card">
+        <span class="card-title">Connect your tools</span>
+        <p class="muted">Any OpenAI- or Anthropic-compatible client works with these addresses.</p>
+        <dl class="facts" id="facts-api"></dl>
+      </div>
+      <div class="st-card">
+        <span class="card-title">Settings</span>
+        <div class="st-field">
+          <label class="st-label" for="api-key">API key <output>only if the server was started with one</output></label>
+          <input class="st-input" id="api-key" type="password" autocomplete="off" placeholder="Not needed">
+        </div>
+        <div class="toggle-row"><span>Dark theme</span>
+          <button class="st-toggle" id="dark-toggle" role="switch" aria-checked="false" aria-label="Dark theme"></button></div>
+        <p class="muted small">The key is kept in this browser only.</p>
+      </div>
+    </div>
+  </section>
+</main>
+<div class="st-toasts" id="toasts" aria-live="polite"></div>
+<script src="web/console.js"></script>
+</body>
+</html>
