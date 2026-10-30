@@ -9,7 +9,8 @@ A variant is a file next to the config (or the object itself) with the keys of V
 "aliases" (what requests call it), "args" (over the common ones: a variant's option replaces the common one's,
 strata_control/user_args.merge), "env" and "sampling" (key by key over the common ones) and "log".  Everything else -
 the tokenizer, the template, the picture reader, the scheduler - is the server's, so the variants are one model in
-other forms (the quantizations of one checkpoint); "parallel" and replicas are refused.
+other forms (the quantizations of one checkpoint), unless a variant is another model family (below); "parallel" and
+replicas are refused.
 
 One engine runs at a time.  A request names its variant in "model" (a variant's key, model name or alias); a name no
 variant has goes to the loaded one ("unknown_model": "current", the default), to "default_model" ("default") or is
@@ -24,6 +25,16 @@ settings and removes the others', so a shared folder would lose them at every sw
 engine removes the oldest file first when it needs room, whichever variant's).  "default_model" (null, the default: none) is a variant the server goes back to after
 "default_idle_s" (0: never) without a request (an unloaded engine is only pointed at it); the server starts with
 `startup` (--variant, $STRATA_VARIANT), else the default model, else the first variant.
+
+A variant can also be another model family: its "arch" (the GGUF architecture: "deepseek41") differs from the
+common config's (default "qwen4exp").  It names its own "tokenizer" and usually its own "exe" (strata-dsv41),
+"engine_ready_s" and "vision" section (FAMILY_KEYS), and it takes none of the common config's engine settings ("args",
+"env", "vision": another program's options); the server settings (the turn scheduler, the API, "sampling") stay
+common.  The server keeps a tokenizer, chat template, output parser and picture reader per family (serve/server.py's
+Family) and reads each request with the family of the variant it asked for; a request that names no variant is
+pinned to the one loaded when it came (Models.pin), so a switch to another family while it waits cannot change how
+its prompt was written.  DeepSeek-V4.1's engine keeps its conversation slots on disk itself (it has no SAVE): a switch
+writes no session file for it.
 """
 from __future__ import annotations
 
@@ -37,13 +48,23 @@ from pathlib import Path
 from serve import engine_fields
 from strata_control import user_args
 
+# the keys that make a variant another model family (its own engine program, tokenizer and picture reader)
+FAMILY_KEYS = frozenset({"arch", "exe", "tokenizer", "vision", "engine_ready_s"})
 # the keys a variant may set (everything else is the common config's)
-VARIANT_KEYS = frozenset({"model_name", "aliases", "args", "env", "sampling", "log", "max_context"})
+VARIANT_KEYS = frozenset({"model_name", "aliases", "args", "env", "sampling", "log", "max_context"}) | FAMILY_KEYS
+# the common config's engine settings, which a variant of another family does not take
+ENGINE_KEYS = ("args", "env", "vision")
+DEFAULT_ARCH = "qwen4exp"
 # the common config's switching keys (not part of any variant's run config)
 SWITCH_KEYS = frozenset({"models", "default_model", "default_idle_s", "model_max_wait_s", "model_min_resident_s",
                          "model_preempt", "unknown_model", "model_session_dir"})
 UNKNOWN_MODES = ("current", "default", "error")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+
+def arch_of(cfg: dict) -> str:
+    """A run config's model family: its "arch", else Flash-Next's."""
+    return cfg.get("arch") or DEFAULT_ARCH
 
 
 class UnknownModel(ValueError):
@@ -57,14 +78,22 @@ class Variant:
     model_name: str = ""
     aliases: list = field(default_factory=list)
     spawn: tuple | None = None                      # the engine's start (StrataEngine.spawn), set by the server
+    ready_s: float | None = None                    # its "engine_ready_s" (None: the server's default), set by the server
 
     def names(self) -> list[str]:
         return [self.name, self.model_name, *self.aliases]
 
+    @property
+    def arch(self) -> str:
+        return arch_of(self.cfg)
+
     def keeps_parks(self) -> bool:
         """The engine parks this variant's conversations in files it keeps across runs (--conversation-cache-dir, on
         by default; it parks the live one at QUIT), so a switch needs no session file: the variant's next request
-        goes on from its parked conversation."""
+        goes on from its parked conversation.  DeepSeek-V4.1's engine keeps its conversation slots on disk across runs
+        (ds4 slots) and has no SAVE command."""
+        if self.arch == "deepseek41":
+            return True
         return self.cfg.get("mtp") is not False and keeps_parks(self.cfg.get("args") or [])   # "mtp": false strips --mtp
 
 
@@ -97,6 +126,14 @@ class Models:
             raise UnknownModel(f"model {asked!r} is not served here (one of: {', '.join(self.all_names())})")
         return None
 
+    def pin(self, asked) -> str | None:
+        """resolve(), with a request that names no variant pinned to the loaded one when the variants are of more than
+        one family: its prompt is written with that family's tokenizer and template before it waits for the turn."""
+        name = self.resolve(asked)
+        if name is None and len({v.arch for v in self.variants.values()}) > 1:
+            name = self.committed or self.active
+        return name
+
     def all_names(self) -> list[str]:
         return [n for v in self.variants.values() for n in dict.fromkeys(v.names())]
 
@@ -117,6 +154,7 @@ class Models:
                 "resident_s": round(self.clock() - self.since, 1), "max_wait_s": self.max_wait_s,
                 "min_resident_s": self.min_resident_s, "preempt": self.preempt, "unknown": self.unknown,
                 "aliases": {n: v.aliases for n, v in self.variants.items()},
+                "arch": {n: v.arch for n, v in self.variants.items()},
                 "sampling": {n: v.cfg.get("sampling") or {} for n, v in self.variants.items()}}
 
 
@@ -130,21 +168,28 @@ def _number(cfg: dict, key: str, default: float) -> float:
 
 
 def variant_config(common: dict, own: dict, name: str) -> dict:
-    """A variant's run config: the common one without the switching keys, with the variant's keys over it."""
+    """A variant's run config: the common one without the switching keys, with the variant's keys over it.  A variant
+    of another family (its "arch" differs from the common one's) takes none of the common ENGINE_KEYS."""
     bad = sorted(set(own) - VARIANT_KEYS)
     if bad:
         raise ValueError(f'models.{name}: {", ".join(bad)} cannot differ between variants (a variant sets only '
                          f'{", ".join(sorted(VARIANT_KEYS))})')
-    cfg = {k: v for k, v in common.items() if k not in SWITCH_KEYS}
+    for k in ("arch", "exe", "tokenizer"):
+        if k in own and not (isinstance(own[k], str) and own[k]):
+            raise ValueError(f'models.{name}.{k} must be a string')
+    other = "arch" in own and own["arch"] != arch_of(common)
+    if other and "tokenizer" not in own:
+        raise ValueError(f'models.{name}: a variant of another model family ({own["arch"]}) needs its own "tokenizer"')
+    cfg = {k: v for k, v in common.items() if k not in SWITCH_KEYS and not (other and k in ENGINE_KEYS)}
     for k, v in own.items():
         if k == "args":
             if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
                 raise ValueError(f'models.{name}.args must be a list of strings')
-            cfg["args"] = user_args.merge(list(common.get("args") or []), v)
+            cfg["args"] = user_args.merge(list(cfg.get("args") or []), v)
         elif k in ("env", "sampling"):
             if not isinstance(v, dict):
                 raise ValueError(f'models.{name}.{k} must be an object')
-            cfg[k] = {**(common.get(k) or {}), **v}
+            cfg[k] = {**(cfg.get(k) or {}), **v}
         else:
             cfg[k] = v
     return cfg

@@ -294,11 +294,33 @@ part; `"models"` names each variant's own config, a file next to it or an object
 "model_session_dir": "/data/sessions"
 ```
 
-A variant sets only `model_name`, `aliases`, `args`, `env`, `sampling`, `log` and `max_context`; everything else
-(the tokenizer, the template, the picture reader, the scheduler) is common, and `"parallel"` and replicas are refused.
+A variant sets only `model_name`, `aliases`, `args`, `env`, `sampling`, `log` and `max_context`, plus the family keys
+below; everything else (the tokenizer, the template, the picture reader, the scheduler) is common, and `"parallel"` and
+replicas are refused.
 Its `args` go over the common ones: an option the variant sets replaces the common one's (`--pack`, `--native`).
 `--variant NAME` (or `$STRATA_VARIANT`) picks the variant to start with, else `default_model`, else the first one.
 `default_model` is null (none) unless set; `default_idle_s` and `"unknown_model": "default"` need one.
+
+A variant can also be another model family, for example DeepSeek-V4.1 next to Qwen3.8-Flash-Next. Such a variant names
+an `"arch"` other than the common config's (default `qwen4exp`), its own `"tokenizer"`, and usually its own `"exe"`
+(`strata-dsv41`), `"engine_ready_s"` and `"vision"` section. It takes none of the common `"args"`, `"env"` and
+`"vision"`, because those are the other engine's options; the server settings (the scheduler, the API, `"sampling"`)
+stay common. The server keeps a tokenizer, chat template, output parser and picture reader for each family, and reads
+each request with the family of the variant it asked for. With several families, a request that names no variant is
+pinned to the variant loaded when it arrives, so a switch while it waits cannot change how its prompt was written. A
+switch to another family also stops the other families' picture readers; the new family's reader starts with its
+engine. A picture for a family whose engine is not loaded starts that family's reader on its own (a CPU reader is
+best here: a GPU reader then shares the card with the other engine). DeepSeek-V4.1's engine keeps its conversations
+on disk itself (`ds4 slots`), so a switch writes no session file for it.
+
+```json
+"models": {"q2": "server-q2.json", "deepseek": "server-deepseek.json"}
+```
+```json
+{"arch": "deepseek41", "exe": "/opt/strata/engine/strata-dsv41", "tokenizer": "/data/pack-deepseek/tokenizer",
+ "model_name": "deepseek-v4.1-flash", "engine_ready_s": 3600,
+ "args": ["--pack", "/data/pack-deepseek", "--max-context", "200000", "--eos", "1"]}
+```
 
 A request names its variant in `"model"`: its key, model name or an alias. A name no variant has (a client that sends
 its own model name) goes to the variant that is loaded (`"unknown_model": "current"`), to the default (`"default"`),
