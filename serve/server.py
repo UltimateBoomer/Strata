@@ -49,6 +49,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import urllib.request
 import uuid
 from http.client import HTTPException
@@ -348,6 +349,7 @@ def engine_frozen(base: tuple[float, int], now: tuple[float, int]) -> bool:
 VISION_READY_S = _timeout_env("STRATA_VISION_READY_S", 300.0)
 VISION_ENCODE_S = _timeout_env("STRATA_VISION_ENCODE_S", 300.0)
 ENGINE_READY_S = _timeout_env("STRATA_ENGINE_READY_S", 900.0)
+ENGINE_READY_DEFAULT = ENGINE_READY_S                   # a model variant without "engine_ready_s" (set_ready_timeout)
 
 
 # ------------------------------------------------------------------------------------------------ engines
@@ -3165,6 +3167,83 @@ def engine_binary(exe: str, cfg: dict | None = None) -> str:
     return exe
 
 
+def load_tokenizer(tpath: Path):
+    """The model's tokenizer from its folder (vocab.json, merges.txt, token_type.json and the pack's tokenizer.json);
+    the byte tokenizer when the folder has none (the mock engine)."""
+    if not (tpath / "vocab.json").exists():
+        return ByteTokenizer()
+    import strata_tokenizer as ST
+    vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
+    tokens = [None] * len(vocab)
+    for t, i in vocab.items():
+        tokens[i] = t
+    merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
+    types = json.loads((tpath / "token_type.json").read_text())
+    tcfg = {}
+    try:                                                # the pack's pre-tokenizer name and special ids (DeepSeek's differ)
+        tcfg = json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    return ST.Tokenizer(tokens, merges, types, tcfg.get("pre") or "qwen35", tcfg.get("special_ids") or None)
+
+
+def chat_template_for(cfg: dict, tpath: Path) -> ChatTemplate:
+    """The model's own chat template (exported with its tokenizer), else the original model's."""
+    tpl = tpath / "chat_template.jinja"
+    if (cfg.get("arch") or "") == "deepseek41":
+        from serve import dsml
+        tpl, swapped = dsml.pick_template(tpl)
+        if swapped:
+            print("[strata] this pack's chat template spells the tool-call block differently from the V4.1 model's; "
+                  "using the V4.1 template so tool calls come back as real calls", flush=True)
+    return ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja")
+
+
+def make_vision(cfg: dict, env: dict, lazy: bool) -> "Vision":
+    """The config's picture reader (its "vision" section) as a Vision process; `lazy`: it starts with the model."""
+    elastic = cfg["vision"].get("elastic") is True and cfg.get("vram_elastic") is True
+    print("the vision encoder starts with the first picture (elastic) ..." if elastic else
+          "loading the vision encoder ..." if not lazy else
+          "vision encoder unloaded; it starts with the model ...", flush=True)
+    # relative paths are the config's cwd's, as for the engine
+    vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
+                if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
+            for k, v in cfg["vision"].items() if not (k == "exe" and engine_component.is_reference(v))}
+    if engine_component.is_reference(cfg["vision"].get("exe")):     # the engine from the component folder
+        vcfg["exe"] = _component_exe(cfg["vision"]["exe"], cfg)
+    if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
+        print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
+              "encoder its VRAM): the encoder starts with the model instead", flush=True)
+        vcfg["elastic"] = False
+    elif vcfg.get("elastic") is True and layer_split_of(cfg):
+        # the engine turns --vram-elastic off on a layer split (a cache per GPU): the encoder still starts
+        # with the first picture and stops when idle, but its VRAM has to be free already
+        print('[strata] images: on a layer split the expert cache cannot make room for the image encoder (the '
+              'engine turns --vram-elastic off); keep its VRAM free with "--vram-reserve-mib" on the '
+              "encoder's GPU, or the first picture may not get it", flush=True)
+    return Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
+                  env=vision_env(cfg, env), lazy=lazy)
+
+
+def ds_pictures_for(cfg: dict):
+    """DeepSeek-V4.1's pictures (the engine's own tower) for its config, or None (`--vision off`, a pack without one)."""
+    return DsPictures.from_config(cfg, tmp_dir=Path(cfg["log"]).parent / "ds-pictures" if cfg.get("log") else None)
+
+
+def family_for(cfg: dict, tok, spawn_args: list, *, offline: bool) -> Family:
+    """A model variant's family (serve/models.py) other than the one the server started with: its tokenizer, template,
+    parser and picture reader, which starts with its engine (lazy)."""
+    fam = Family(tok, chat_template_for(cfg, Path(cfg["tokenizer"])),
+                 slots=conversation_slots(types.SimpleNamespace(spawn=(None, spawn_args))))
+    fam.model_arch = cfg.get("arch") or "qwen4exp"
+    fam.set_family(fam.model_arch if fam.model_arch == "deepseek41" else None)
+    if cfg.get("vision"):
+        fam.vision = make_vision(cfg, child_env(cfg, offline=offline), lazy=True)
+    elif fam.family == "deepseek41":
+        fam.vision = ds_pictures_for(cfg)
+    return fam
+
+
 def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
     """#458 (opt-in): the engine arguments for "effort_position": "end" - the id of "system" as --tail-role-token, so
     the engine checkpoints in front of the trailing effort turn - or None when the config leaves it at the top (the
@@ -3234,16 +3313,29 @@ def layer_split_value(cfg: dict) -> str:
     return ",".join(str(x) for x in vals)
 
 
+def ready_timeout_of(cfg: dict) -> float | None:
+    """The config's "engine_ready_s" (None: not set).  ValueError for anything but a number > 0."""
+    v = cfg.get("engine_ready_s")
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not v > 0:
+        raise ValueError(f'"engine_ready_s" must be a number of seconds above 0, not {v!r}')
+    return float(v)
+
+
 def apply_ready_timeout(cfg: dict) -> None:
     """The config's "engine_ready_s": how long a start may take before READY (default ENGINE_READY_S, 900).  A model of 300+ GB read
     from a slow disk (DeepSeek-V4.1-Flash: setup writes 3600) needs more.  ValueError for anything but a number > 0."""
     global ENGINE_READY_S
-    v = cfg.get("engine_ready_s")
-    if v is None:
-        return
-    if isinstance(v, bool) or not isinstance(v, (int, float)) or not v > 0:
-        raise ValueError(f'"engine_ready_s" must be a number of seconds above 0, not {v!r}')
-    ENGINE_READY_S = float(v)
+    v = ready_timeout_of(cfg)
+    if v is not None:
+        ENGINE_READY_S = v
+
+
+def set_ready_timeout(seconds: float | None) -> None:
+    """A model variant's "engine_ready_s" for its engine's starts (serve/models.py), None: the default."""
+    global ENGINE_READY_S
+    ENGINE_READY_S = ENGINE_READY_DEFAULT if seconds is None else seconds
 
 
 def layer_split_of(cfg: dict) -> bool:
@@ -4063,12 +4155,69 @@ def slot_save_dir(value, base: str | None = None) -> str:
         raise ValueError(f"slot_save_path {path} is not a directory")
     return path
 
+class Family:
+    """What a model family's requests are read and written with: its tokenizer, chat template, stop tokens, output
+    parser, forced-call spelling, prompt encoder and picture reader.  A server has one; with model variants of several
+    families (serve/models.py) it has one per family, and each request uses its variant's (Service.fam)."""
+
+    def __init__(self, tokenizer, template: ChatTemplate, vision=None, slots: int | None = None):
+        self.tok, self.template, self.vision = tokenizer, template, vision
+        self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
+        self.model_arch = None                        # the config's family ("qwen4exp", "qwen35moe"): None = no model-card defaults
+        # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
+        # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points
+        # encode in full.
+        self.prompts = None
+        if hasattr(tokenizer, "encode_marked") and hasattr(tokenizer, "max_special_len"):
+            from strata_tokenizer import PromptEncoder
+            # one kept prompt per conversation the engine's cache can hold (--conversation-cache-slots); the
+            # encoder's own default without that setting
+            self.prompts = PromptEncoder(tokenizer, keep=slots) if slots is not None and slots > 0 \
+                else PromptEncoder(tokenizer)
+        self.set_family(None)
+
+    def set_family(self, family: str | None) -> None:
+        """A family whose text differs from the Qwen form this server was written for (DeepSeek-V4.1: its own end
+        token, DSML tool calls); None: the Qwen form."""
+        self.family = family                            # the model family ("deepseek41"), None for the Qwen form
+        if family == "deepseek41":
+            from serve import dsml
+            eos = (getattr(self.tok, "special_ids", None) or {}).get("eos", 1)
+            self.stop_ids = {int(eos)}
+            self.parser_cls = dsml.DsmlOutputParser
+            self.force_text = dsml.to_dsml_force
+        else:
+            self.stop_ids = set(self.tok.encode(IM_END, parse_special=True) +
+                                self.tok.encode("<|endoftext|>", parse_special=True))
+            self.parser_cls = OutputParser              # reads the model's output (reasoning, content, tool calls)
+            self.force_text = None
+
+
+def _family_attr(name: str, doc: str) -> property:
+    """A Service attribute that is its current family's (Service.fam)."""
+    return property(lambda self: getattr(self.fam, name), lambda self, v: setattr(self.fam, name, v), doc=doc)
+
+
 class Service:
+    tok = _family_attr("tok", "the tokenizer")
+    template = _family_attr("template", "the chat template")
+    vision = _family_attr("vision", "the picture reader (Vision, DsPictures) or None")
+    literals = _family_attr("literals", "texts that stay text inside a message")
+    model_arch = _family_attr("model_arch", "the config's family (\"qwen4exp\", \"deepseek41\"); None: no model-card defaults")
+    family = _family_attr("family", "the model family whose text differs from the Qwen form (\"deepseek41\"), else None")
+    stop_ids = _family_attr("stop_ids", "the tokens that end a reply")
+    parser_cls = _family_attr("parser_cls", "reads the model's output (reasoning, content, tool calls)")
+    prompts = _family_attr("prompts", "#567: the prompt encoder (None: a full encode)")
+    _force_text = _family_attr("force_text", "forced_call's opening in this family's spelling (None: as it is)")
+
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = True):
-        self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
-        self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
+        # the family the server starts with; with model variants of several families, the others' too (by "arch")
+        self.home = Family(tokenizer, template, vision, slots=conversation_slots(engine))
+        self.families: dict[str, Family] = {}
+        self.request_family = threading.local()         # the family this thread's request uses (use_request_family)
+        self.engine, self.model = engine, model_name
         self.fit_max_tokens = fit_max_tokens          # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
@@ -4076,7 +4225,6 @@ class Service:
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
-        self.model_arch = None                        # the config's family ("qwen4exp", "qwen35moe"): None = no model-card defaults
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
@@ -4182,36 +4330,54 @@ class Service:
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
-        self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
-        self.family = None                              # the model family ("deepseek41"): set_family() below
-        self.parser_cls = OutputParser                  # reads the model's output (reasoning, content, tool calls)
-        # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
-        # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points
-        # encode in full.
-        self.prompts = None
-        if hasattr(tokenizer, "encode_marked") and hasattr(tokenizer, "max_special_len"):
-            from strata_tokenizer import PromptEncoder
-            # one kept prompt per conversation the engine's cache can hold (--conversation-cache-slots); the
-            # encoder's own default without that setting
-            slots = conversation_slots(engine)
-            self.prompts = PromptEncoder(tokenizer, keep=slots) if slots is not None and slots > 0 \
-                else PromptEncoder(tokenizer)
+
+    @property
+    def fam(self) -> Family:
+        """The family this thread's request uses (use_request_family), else the loaded variant's, else the one."""
+        f = getattr(self.request_family, "fam", None)
+        if f is not None:
+            return f
+        m = getattr(self, "models", None)
+        if m is not None and self.families:
+            return self.families.get(m.variants[m.active].arch, self.home)
+        return self.home
+
+    @property
+    def loaded_vision(self):
+        """The picture reader of the loaded variant's family (whatever this thread's request is for): the one that
+        starts and stops with the engine."""
+        m = self.models
+        return self.family_of(m.active).vision if m is not None and self.families else self.home.vision
+
+    def readers_down(self, keep=None) -> None:
+        """Stop every family's picture reader process but `keep` (a family's reader started for a picture while another
+        family's engine ran, or the one a switch leaves)."""
+        for f in self.families.values() or (self.home,):
+            if f.vision is not None and f.vision is not keep and hasattr(f.vision, "unload") and \
+                    getattr(f.vision, "alive", lambda: False)():
+                f.vision.unload()
+
+    def family_of(self, variant: str) -> Family:
+        """A model variant's family (the one family when the variants are all of one)."""
+        return self.families.get(self.models.variants[variant].arch, self.home) if self.families else self.home
+
+    def use_request_family(self, variant: str | None) -> None:
+        """This thread's request is for model variant `variant`: it reads and writes with that variant's family (its
+        effort words included); None: the loaded variant's again (a new request on a kept-alive connection)."""
+        import serve.frontend as _frontend
+        if variant is None or not self.families or self.models is None:
+            self.request_family.fam = None
+            _frontend.request_family()
+            return
+        f = self.request_family.fam = self.family_of(variant)
+        _frontend.request_family(f.family)
 
     def set_family(self, family: str | None) -> None:
         """A family whose text differs from the Qwen form this server was written for (DeepSeek-V4.1: its own end
         token, DSML tool calls, reasoning-effort words).  The others keep the defaults."""
-        self.family = family
-        if family == "deepseek41":
-            from serve import dsml
-            eos = (getattr(self.tok, "special_ids", None) or {}).get("eos", 1)
-            self.stop_ids = {int(eos)}
-            self.parser_cls = dsml.DsmlOutputParser
-            self._force_text = dsml.to_dsml_force
+        self.fam.set_family(family)
         import serve.frontend as _frontend
         _frontend.use_family(family)
-
-    _force_text = None
 
     def force_text(self, force):
         """forced_call's opening of the call the reply must make, in this model's spelling."""
@@ -4436,8 +4602,8 @@ class Service:
     def _vision_down(self) -> bool:
         """The encoder should run and does not (the engine's load starts it again).  An elastic encoder is down
         between pictures by design: it starts in the image turn (_vision_up), not with the engine."""
-        return (self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
-                and not getattr(self.vision, "elastic", False))
+        v = self.loaded_vision
+        return v is not None and hasattr(v, "alive") and not v.alive() and not getattr(v, "elastic", False)
 
     def _engine_reserve(self) -> int | None:
         """The VRAM the engine keeps free for other programs outside an elastic encoder's turn: the last POST /v1/vram
@@ -4449,8 +4615,18 @@ class Service:
         """The image turn's start for an elastic encoder that is not running (the caller holds self.fifo): the expert
         cache first keeps the encoder's elastic_mib of VRAM free on top of the reserve, then the encoder starts (load and
         warm-up, a few seconds).  If the cache cannot shrink (an engine without --vram-elastic, the resident low-RAM mode)
-        the encoder starts anyway, as a non-elastic one would."""
+        the encoder starts anyway, as a non-elastic one would.  The reader of another family than the loaded variant's
+        (model variants of several families) starts as it is, if it is down: that engine has no room to make for it."""
         v = self.vision
+        if v is not self.loaded_vision:
+            if hasattr(v, "alive") and not v.alive():
+                print("[strata] images: starting the image encoder of the model this request is for (another model "
+                      "family's engine is loaded) ...", flush=True)
+                try:
+                    v.restart()
+                except Exception as e:
+                    raise EngineDied(f"the image encoder failed to start: {e}") from e
+            return
         if not getattr(v, "elastic", False) or v.alive():
             return
         if hasattr(self.engine, "vram") and self.loaded():
@@ -4477,7 +4653,7 @@ class Service:
         """An elastic encoder idle for elastic_idle_s (or force) stops, and the expert cache takes its VRAM back:
         "down", "busy" (a request holds the turn, or a picture came more recently) or "nothing" (not elastic or not
         holding anything)."""
-        v = self.vision
+        v = self.loaded_vision
         if not getattr(v, "elastic", False) or not (self.vision_held or v.alive()):
             return "nothing"
         if not force and time.time() - self.last_image_at < v.elastic_idle_s:
@@ -4500,7 +4676,7 @@ class Service:
             self.fifo.release()
 
     def start_vision_idle(self):
-        v = self.vision
+        v = self.loaded_vision
         if not getattr(v, "elastic", False):
             return
         print(f"[strata] images: the image encoder starts with the first picture and stops after {v.elastic_idle_s:g} s "
@@ -4588,7 +4764,7 @@ class Service:
         if self._vision_down():                         # first, as at a start: a GPU encoder takes its VRAM before
             print("[strata] starting the vision encoder ...", flush=True)   # the engine sizes its cache
             try:
-                self.vision.restart()
+                self.loaded_vision.restart()
             except Exception as e:
                 raise EngineDied(f"the vision encoder failed to start: {e}") from e
             vision_started = True
@@ -4604,7 +4780,7 @@ class Service:
             self.engine.restart()
         except Exception as e:
             if vision_started:
-                self.vision.unload()
+                self.loaded_vision.unload()
             # the program could not be started at all (missing, not executable, or blocked by Windows - #735): the
             # request path answers EngineDied with a 503, but takes a bare OSError for a client that went away (#2496)
             if isinstance(e, OSError):
@@ -4644,7 +4820,7 @@ class Service:
                 return {"status": "not loaded", "reserve_mib": reserve_mib,
                         "note": "applied when the model loads"}
             # an elastic encoder that runs keeps its VRAM on top of the asked reserve
-            out = self.engine.vram((reserve_mib or 0) + self.vision.elastic_mib if self.vision_held else reserve_mib)
+            out = self.engine.vram((reserve_mib or 0) + self.loaded_vision.elastic_mib if self.vision_held else reserve_mib)
             self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
             print(f"[strata] VRAM: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
                   f"{out.get('expert_cache_full_mib')} MiB ({out.get('expert_slots')} experts)", flush=True)
@@ -4667,6 +4843,9 @@ class Service:
         self.last_request_at = time.time()
         if self.loaded() and not self._vision_down():
             return
+        m, turn = self.models, getattr(self.request_turn, "turn", None)
+        if m is not None and getattr(turn, "model", None) not in (None, m.active):
+            return                                      # another variant's: its switch, at its turn, loads that one
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
         with self.status_lock:                          # #1603: waiting for the fifo to start the engine is queued, not nothing
@@ -4718,7 +4897,13 @@ class Service:
             print(f"[strata] the model is now {name} (it loads with the next request)" if not load else
                   f"[strata] loading the model {name} ...", flush=True)
         v = m.variants[name]
+        if self.family_of(old) is not self.family_of(name):
+            # another family's engine: the other families' picture readers stop (they hold RAM or VRAM that engine
+            # needs); the new family's starts with its load (ensure_loaded: _vision_down)
+            self.readers_down(keep=self.family_of(name).vision)
+            self.vision_held = False
         self.engine.spawn = v.spawn
+        set_ready_timeout(v.ready_s)
         self.apply_variant(v)
         m.active, m.committed = name, None             # (Models.switched below once it has run)
         if self.turns is not None and hasattr(self.turns, "model_switched"):
@@ -4827,8 +5012,8 @@ class Service:
     def models_listing(self) -> list[dict]:
         """GET /v1/models with variants: each one, loaded or not (all load on use), and its aliases."""
         m, loaded, out = self.models, self.loaded(), []
-        modal = ["text", "image"] if self.vision is not None else ["text"]
         for v in m.variants.values():
+            modal = ["text", "image"] if self.family_of(v.name).vision is not None else ["text"]   # its family's reader
             active = v.name == m.active
             args = v.spawn[1] if v.spawn else []
             ctx = self.reported_ctx() if active and loaded else \
@@ -4870,8 +5055,9 @@ class Service:
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
             self.engine.unload()
-            if self.vision is not None and hasattr(self.vision, "unload"):
-                self.vision.unload()
+            if self.loaded_vision is not None and hasattr(self.loaded_vision, "unload"):
+                self.loaded_vision.unload()
+            self.readers_down()                         # another family's, started for a picture
             self.vision_held = False
             print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
                   "the next request loads it again", flush=True)
@@ -6978,8 +7164,12 @@ def make_handler(svc: Service):
 
         def handle_one_request(self):
             self.answer_started = False
-            super().handle_one_request()
-            self._drain_body()
+            svc.use_request_family(None)                # a kept-alive connection's next request: the loaded family's
+            try:
+                super().handle_one_request()
+                self._drain_body()
+            finally:
+                svc.use_request_family(None)
 
         def send_response(self, code, message=None):
             self.answer_started = True                 # a malformed-request answer can only replace one not yet begun
@@ -7751,7 +7941,8 @@ def make_handler(svc: Service):
                         session_key=request_session(req, self.headers),
                         one_shot=req.get("strata_checkpoint") is False,
                         yield_now=request_flag(req, "strata_yield"), yield_tools=request_yield_tools(req),
-                        model=svc.models.resolve(req.get("model")) if svc.models is not None else None)
+                        model=svc.models.pin(req.get("model")) if svc.models is not None else None)
+                    svc.use_request_family(turn.model)      # its variant's tokenizer, template and parser
                     for gone in request_drops(req, turn.session_key):    # "strata_drop"
                         svc.drop_session(gone)
                 if path == "/v1/responses":
@@ -9331,24 +9522,18 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         ap.error(listen_problem(a.host, a.port, e))
     if cfg.get("tokenizer"):
         a.tokenizer = cfg["tokenizer"]
-    tok = ByteTokenizer()
     tpath = Path(a.tokenizer)
     if a.engine == "strata" and not (tpath / "vocab.json").exists():
         ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
-    if (tpath / "vocab.json").exists():
-        import strata_tokenizer as ST
-        vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
-        tokens = [None] * len(vocab)
-        for t, i in vocab.items():
-            tokens[i] = t
-        merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
-        types = json.loads((tpath / "token_type.json").read_text())
-        tcfg = {}
-        try:                                            # the pack's pre-tokenizer name and special ids (DeepSeek's differ)
-            tcfg = json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            pass
-        tok = ST.Tokenizer(tokens, merges, types, tcfg.get("pre") or "qwen35", tcfg.get("special_ids") or None)
+    tok = load_tokenizer(tpath)
+    family_toks = {}                                    # model variants of other families: theirs, by "arch"
+    if models is not None:
+        for v in models.variants.values():
+            if v.arch != serve_models.arch_of(cfg) and v.arch not in family_toks:
+                vpath = Path(v.cfg["tokenizer"])
+                if not (vpath / "vocab.json").exists():
+                    ap.error(f"model variant {v.name}'s tokenizer is missing ({vpath / 'vocab.json'}); run setup again")
+                family_toks[v.arch] = load_tokenizer(vpath)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.offline and (hub is not None or cfg.get("before_load") or a.before_load):
         ap.error("--offline requires MCP servers and before_load commands to be disabled in this profile")
@@ -9380,28 +9565,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         for line in card_roles_lines(cfg):             # the card roles: said first; every card Off stops here, before anything touches a card
             print(line, flush=True)
         if cfg.get("vision"):
-            elastic = cfg["vision"].get("elastic") is True and cfg.get("vram_elastic") is True
-            print("the vision encoder starts with the first picture (elastic) ..." if elastic else
-                  "loading the vision encoder ..." if not lazy else
-                  "vision encoder unloaded; it starts with the model ...", flush=True)
-            # relative paths are the config's cwd's, as for the engine below
-            vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
-                        if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
-                    for k, v in cfg["vision"].items() if not (k == "exe" and engine_component.is_reference(v))}
-            if engine_component.is_reference(cfg["vision"].get("exe")):     # the engine from the component folder
-                vcfg["exe"] = _component_exe(cfg["vision"]["exe"], cfg)
-            if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
-                print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
-                      "encoder its VRAM): the encoder starts with the model instead", flush=True)
-                vcfg["elastic"] = False
-            elif vcfg.get("elastic") is True and layer_split_of(cfg):
-                # the engine turns --vram-elastic off on a layer split (a cache per GPU): the encoder still starts
-                # with the first picture and stops when idle, but its VRAM has to be free already
-                print('[strata] images: on a layer split the expert cache cannot make room for the image encoder (the '
-                      'engine turns --vram-elastic off); keep its VRAM free with "--vram-reserve-mib" on the '
-                      "encoder's GPU, or the first picture may not get it", flush=True)
-            vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                            env=vision_env(cfg, env), lazy=lazy)
+            vision = make_vision(cfg, env, lazy)
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
@@ -9462,14 +9626,21 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if models is not None:                          # each variant's start, for Service.switch_model
             for v in models.variants.values():
                 if v.name == models.active:
-                    v.spawn = engine.spawn
+                    v.spawn, v.ready_s = engine.spawn, ready_timeout_of(cfg)
                     continue
                 vc = with_component_engine(v.cfg)
                 vexe = _component_exe(vc["exe"], vc) if engine_component.is_reference(vc["exe"]) else \
                     vc["exe"] if os.path.isabs(vc["exe"]) else os.path.abspath(os.path.join(vc.get("cwd") or ".", vc["exe"]))
                 venv = child_env(vc, offline=a.offline)
                 configure_batch_telemetry_env(venv, vc, a.batch_telemetry)
-                v.spawn = (vexe, engine_args(vc) + (effort_end or []), vc.get("cwd"), vc.get("log"), venv, False, None)
+                vend = effort_end
+                try:
+                    v.ready_s = ready_timeout_of(vc)
+                    if v.arch in family_toks:           # another family: its own tokenizer's id of "system" (#458)
+                        vend = effort_end_args(vc, vexe, family_toks[v.arch])
+                except ValueError as e:
+                    raise SystemExit(f"[strata] config models.{v.name}: {e}")
+                v.spawn = (vexe, engine_args(vc) + (vend or []), vc.get("cwd"), vc.get("log"), venv, False, None)
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
                                  linux_desktop()) if not groups and not split else None
@@ -9481,15 +9652,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             "Thinking about it.</think>\n\nHello from the mock engine."],
             cycle=getattr(a, "script_cycle", False),
             delay_s=getattr(a, "script_delay", 0.0) or 0.0), None, {}
-    # the model's own chat template (exported with its tokenizer), else the original model's
-    tpl = tpath / "chat_template.jinja"
-    if (cfg.get("arch") or "") == "deepseek41":
-        from serve import dsml
-        tpl, swapped = dsml.pick_template(tpl)
-        if swapped:
-            print("[strata] this pack's chat template spells the tool-call block differently from the V4.1 model's; "
-                  "using the V4.1 template so tool calls come back as real calls", flush=True)
-    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
+    svc = Service(engine, tok, chat_template_for(cfg, tpath),
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))
@@ -9497,7 +9660,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if (cfg.get("arch") or "") == "deepseek41" and vision is None and a.engine == "strata":
         # DeepSeek-V4.1 reads pictures with the engine's own tower (--vision on, the default): no separate reader process.
         # `--vision off` in the config's args, or a pack without a tower, leaves svc.vision None: pictures are refused with the 400 as before.
-        _dsp = DsPictures.from_config(cfg, tmp_dir=Path(cfg["log"]).parent / "ds-pictures" if cfg.get("log") else None)
+        _dsp = ds_pictures_for(cfg)
         if _dsp is not None:
             svc.vision = _dsp
             print("[strata] pictures: on (DeepSeek-V4.1 reads them with the engine's own vision tower; --vision off turns them off)", flush=True)
@@ -9524,6 +9687,13 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if models is not None:
         svc.models = models
         models.loaded = svc.loaded
+        if family_toks and a.engine == "strata":        # variants of several families: each one's tokenizer and reader
+            svc.families[serve_models.arch_of(cfg)] = svc.home
+            for v in models.variants.values():
+                if v.arch not in svc.families:
+                    svc.families[v.arch] = family_for(v.cfg, family_toks[v.arch], v.spawn[1], offline=a.offline)
+            print(f"[strata] model families: {', '.join(svc.families)} (each variant's requests are read with its "
+                  "family's tokenizer and template)", flush=True)
     park = cfg.get("park", "all")
     if park not in (None, "all", "sessions"):
         raise ValueError(f'"park" must be "all" or "sessions", not {park!r}')

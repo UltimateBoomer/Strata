@@ -151,21 +151,40 @@ def use_family(family: str | None) -> None:
     _NUMERIC_EFFORT = family == "deepseek41"
 
 
+_request = threading.local()
+_UNSET = object()
+
+
+def request_family(family=_UNSET) -> None:
+    """The family of this thread's request when the server runs variants of several (serve/models.py): its effort
+    words over use_family's.  No argument: the server's again."""
+    _request.family = family
+
+
+def _effort_words() -> tuple[dict, bool]:
+    """The effort table and whether whole numbers are levels, for this thread's request."""
+    family = getattr(_request, "family", _UNSET)
+    if family is _UNSET:
+        return EFFORT, _NUMERIC_EFFORT
+    return (EFFORT_DEEPSEEK if family == "deepseek41" else _EFFORT_QWEN), family == "deepseek41"
+
+
 def effort_kwargs(value) -> dict:
     """A reasoning effort as given by a client -> the template's kwargs.  Unknown values are a 400, not a crash."""
     if value is None or value == "":
         return {}
     if value is False:
         return {"enable_thinking": False}
-    if _NUMERIC_EFFORT and isinstance(value, int) and not isinstance(value, bool):
+    effort, numeric = _effort_words()
+    if numeric and isinstance(value, int) and not isinstance(value, bool):
         if not 1 <= value <= 100:
             raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium, high, max or 1..100")
         return {"reasoning_effort": value}
     key = str(value).strip().lower()
-    if key not in EFFORT:
+    if key not in effort:
         raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high"
-                         + (", max or 1..100" if _NUMERIC_EFFORT else ""))
-    level = EFFORT[key]
+                         + (", max or 1..100" if numeric else ""))
+    level = effort[key]
     return {"enable_thinking": False} if level is None else {"reasoning_effort": level}
 
 
@@ -175,7 +194,7 @@ def budget_effort(tokens) -> dict:
         n = int(tokens)
     except (TypeError, ValueError):
         return {}
-    return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else EFFORT["high"]}
+    return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else _effort_words()[0]["high"]}
 
 
 def _has_image(content) -> bool:

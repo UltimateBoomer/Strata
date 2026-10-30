@@ -119,7 +119,7 @@ class ConfigTest(unittest.TestCase):
 
     def test_refused(self):
         for cfg, why in [
-            (config(models={"q2": {"tokenizer": "x"}}), "cannot differ"),
+            (config(models={"q2": {"turn_slice_s": 5}}), "cannot differ"),
             (config(default_model="q9"), "default_model"),
             (config(models={"q2": {"aliases": ["q3"]}, "q3": {}}), "both"),
             (config(parallel=2), "one request at a time"),
