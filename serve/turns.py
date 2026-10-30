@@ -709,8 +709,45 @@ class TurnScheduler:
                     "switches": self.switches, "kept": self.kept, "hold_s": self.hold_s, "holding": self.holds(),
                     "hold_hits": self.hold_hits, "hold_misses": self.hold_misses,
                     "hold_idle_s": round(self.hold_idle_s, 1),
+                    "max_wait_s": self.max_wait_s, "preemptions": self.preemptions,
+                    **self._queue_view(),
                     **({"priority": self._priority_view()} if self.prio is not None else {}),
                     **({"models": self._models_view()} if self.models is not None else {})}
+
+    @staticmethod
+    def _session_name(turn: Turn | None):
+        if turn is None:
+            return None
+        if turn.session_key is not None:
+            return turn.session_key
+        s = turn.session
+        return s.key if s is not None and s.key is not None else None
+
+    def _queue_view(self) -> dict:
+        """view()'s running request, the lane and the waiting ones in arrival order (the caller holds self.cv), for the
+        Monitor: each one's session (its name; None: unnamed), priority (aged), variant and wait."""
+        now = self.clock()
+        r = self.running
+        running = None
+        if r is not None:
+            running = {"session": self._session_name(r.turn), "priority": r.run_p if self.prio is not None else None,
+                       "model": r.turn.model, "held_s": round(now - self.since, 1) if self.since is not None else None,
+                       "continues": self.continues(r.turn) if self.lane is not r.turn else True,
+                       "preempting": r.preempt.is_set()}
+        res = self.reserved(now) if self.prio is not None else None
+        hold_left = None
+        if r is None and self.holds():
+            hold_left = round(max(0.0, self.released + self.hold_s - now), 1)
+        queue = [{"session": self._session_name(t.turn), "model": t.turn.model,
+                  "priority": self.effective(t, now) if self.prio is not None else None,
+                  "waited_s": round(now - t.arrived, 1), "continues": self.continues(t.turn),
+                  "one_shot": t.turn.one_shot, "deferred": self.deferred(t, now)}
+                 for t in sorted(self.waiting, key=lambda t: t.seq)]
+        return {"running": running, "queue": queue, "lane": self._session_name(self.lane),
+                "lane_tools": len(self.lane.issued) if self.lane is not None else 0,
+                "hold_left_s": hold_left,
+                "reserved_session": (res.key if res is not None else None),
+                "reserved": res is not None}
 
     def _models_view(self) -> dict:
         """view()'s model variants (the caller holds self.cv): what waits for each one, and the committed switch."""

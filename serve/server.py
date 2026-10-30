@@ -65,6 +65,8 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthro
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve import engine_fields  # noqa: E402
+from serve import parkfiles  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from strata_control import engine_component  # noqa: E402
 from strata_control import tls  # noqa: E402
@@ -4104,6 +4106,7 @@ class Service:
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
+        self.session_names = parkfiles.SessionNames()   # session tags -> names, for the Monitor's parked files
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
         # matters); empty = no CORS headers at all, as before
         self.cors_origins: list[str] = []
@@ -5061,9 +5064,16 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+        cache = conversation_cache_view(engine, hist, totals, parked)
+        spawn = getattr(self.engine, "spawn", None)
+        if isinstance(spawn, tuple) and len(spawn) > 1 and isinstance(spawn[1], list):
+            files = parkfiles.scan(spawn[1], self.session_names.snapshot())
+            if files is not None:                       # the parked files on disk, every variant's (serve/parkfiles.py)
+                cache["files"] = files
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
-                "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
+                "conversation_cache": cache,
                 **({"turns": self.turns.view()} if self.turns is not None else {}),
+                **({"models": self.models.view()} if self.models is not None else {}),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
@@ -5601,6 +5611,8 @@ class Service:
         with self.drops_lock:
             drops, self.pending_drops = sorted(self.pending_drops), set()
         e = {"sess": session_tag(key) if key else 0, "park": not (self.park_sessions and key is None), "drop": drops}
+        if key:
+            self.session_names.note(e["sess"], key)
         if not e["sess"] and e["park"] and not drops:
             return sampling                             # nothing to say: the request goes as before
         return {**(sampling or {}), ENGINE_SESSION_KEY: e}
@@ -7518,7 +7530,8 @@ def make_handler(svc: Service):
                     self._json(200, svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0})
                 return
             if path == "" or (path == "/api-monitor" and svc.api_monitor):
-                body = (ROOT / "serve" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
+                # the fork's console (Monitor, About) at /: the chat page (index.html) is not served
+                body = (ROOT / "serve" / "web" / ("monitor.html" if path else "console.html")).read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 if not path:
@@ -9228,6 +9241,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         ap.error("--shutdown-timeout must be in 0..300 seconds")
     config_bytes = Path(a.config).read_bytes() if a.config else b""
     cfg = parse_config_text(config_bytes.decode("utf-8-sig"), a.config) if a.config else {}   # Notepad adds a BOM
+    try:                                                # "engine" / "engine_env" fields (serve/engine_fields.py)
+        cfg = engine_fields.expand(cfg, Path(a.config).name if a.config else "config")
+    except ValueError as e:
+        raise SystemExit(f"[strata] config {e}")
     split_joined_args(cfg)
     if a.config and a.engine == "strata":
         cfg = apply_saved_tuning(cfg)
@@ -9502,6 +9519,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         per_replica = requested if isinstance(requested, int) and not isinstance(requested, bool) and requested > 0 else 1
         svc.requested_slots = per_replica * len(groups) if groups else per_replica
     svc.answer_room = cfg.get("answer_room") is not False
+    if cfg.get("log"):                                  # the session names behind the parked files' tags, kept
+        svc.session_names = parkfiles.SessionNames(Path(cfg["log"]).parent / "session-names.json")
     if models is not None:
         svc.models = models
         models.loaded = svc.loaded

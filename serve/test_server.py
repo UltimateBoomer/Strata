@@ -3521,8 +3521,9 @@ class WebApp(unittest.TestCase):
         code, ctype, body = self.get("/")
         self.assertEqual(code, 200)
         self.assertIn("text/html", ctype)
-        self.assertIn(b"\"web/app.js\"", body)   # relative since #82 (works behind a path-prefixed proxy)
-        for path, want in (("/web/app.js", "javascript"), ("/web/app.css", "text/css"), ("/web/tokens.css", "text/css"),
+        self.assertIn(b"\"web/console.js\"", body)   # the fork's console; relative since #82 (works behind a proxy)
+        for path, want in (("/web/console.js", "javascript"), ("/web/console.css", "text/css"),
+                           ("/web/app.css", "text/css"), ("/web/tokens.css", "text/css"),
                            ("/web/components.css", "text/css"), ("/web/sprite.svg", "image/svg+xml")):
             with self.subTest(path=path):
                 code, ctype, _ = self.get(path)
