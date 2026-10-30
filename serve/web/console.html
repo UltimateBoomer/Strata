@@ -20,14 +20,12 @@
 </head>
 <body>
 <!-- serve/web/console.html - the fork's page at /: Monitor (the engine, the turn scheduler, the model variants, the
-     parked conversations), Config (the run config's files, applied while the server runs) and About. No chat. -->
+     parked conversations) and About. No chat. -->
 <header class="st-header">
   <span class="st-header__brand">Strata</span>
   <nav class="st-tabs" role="tablist" aria-label="Views">
     <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="true" data-tab="monitor">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg><span>Monitor</span></button>
-    <button class="st-tab" role="tab" id="tab-btn-config" aria-controls="view-config" aria-selected="false" data-tab="config">
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-settings"/></svg><span>Config</span></button>
     <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg><span>About</span></button>
   </nav>
@@ -126,42 +124,6 @@
           </div>
         </div>
         <div class="stat-strip" id="cc-stats"></div>
-      </div>
-    </div>
-  </section>
-
-  <!-- ============================ Config ============================ -->
-  <section class="view view--config" id="view-config" role="tabpanel" aria-labelledby="tab-btn-config" hidden>
-    <div class="config">
-      <aside class="st-card cfg-files">
-        <span class="card-title">Files</span>
-        <div class="cfg-file-list" id="cfg-file-list"></div>
-        <button class="st-btn st-btn--secondary" id="cfg-add-variant" type="button" hidden>Add a variant</button>
-        <p class="muted small" id="cfg-where"></p>
-      </aside>
-      <div class="cfg-main">
-        <div class="st-card cfg-editor">
-          <div class="cfg-editor__head">
-            <div><span class="card-title" id="cfg-title">Config</span><div class="muted small" id="cfg-sub"></div></div>
-            <div class="seg seg--2 cfg-mode" id="cfg-mode" role="radiogroup" aria-label="Editor">
-              <button type="button" role="radio" data-v="form" aria-checked="true">Form</button>
-              <button type="button" role="radio" data-v="json" aria-checked="false">JSON</button>
-            </div>
-          </div>
-          <div id="cfg-form"></div>
-          <div id="cfg-json-wrap" hidden>
-            <textarea class="st-input cfg-json" id="cfg-json" spellcheck="false" aria-label="The file as JSON"></textarea>
-            <div class="msg-error" id="cfg-json-error" hidden></div>
-          </div>
-        </div>
-        <div class="st-card cfg-bar">
-          <span class="cfg-dirty" id="cfg-dirty">No changes</span>
-          <span class="spacer"></span>
-          <button class="st-btn st-btn--secondary" id="cfg-revert" type="button" disabled>Discard</button>
-          <button class="st-btn st-btn--secondary" id="cfg-check" type="button" disabled>Check</button>
-          <button class="st-btn st-btn--primary" id="cfg-apply" type="button" disabled>Apply</button>
-        </div>
-        <div class="st-card cfg-result" id="cfg-result" hidden></div>
       </div>
     </div>
   </section>

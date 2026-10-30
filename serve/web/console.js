@@ -1,6 +1,6 @@
-// serve/web/console.js - the fork's page at /: Monitor, Config and About. No framework, no network beyond this server.
+// serve/web/console.js - the fork's page at /: Monitor and About. No framework, no network beyond this server.
 // Monitor reads GET /metrics every second (the engine, the turn scheduler's queue, the model variants, the parked
-// conversations on disk); Config edits the run config's files (GET / POST /api/config, serve/liveconfig.py).
+// conversations on disk).
 "use strict";
 
 const $ = (id) => document.getElementById(id);
@@ -14,10 +14,6 @@ const gb = (b, d = 1) => (b == null ? "–" : fmt(b / 1073741824, d));
 const size = (b) => (b == null ? "–" : b >= 1073741824 ? `${fmt(b / 1073741824, 2)} GB` : `${fmt(b / 1048576)} MB`);
 const secs = (s) => (s == null ? "–" : s < 60 ? `${fmt(s, s < 10 ? 1 : 0)} s` : s < 3600 ? `${fmt(s / 60, 1)} min` : `${fmt(s / 3600, 1)} h`);
 const ago = (t) => (t ? `${secs(Math.max(0, Date.now() / 1000 - t))} ago` : "–");
-const clone = (x) => JSON.parse(JSON.stringify(x));
-// key order does not make a file different
-const canon = (x) => JSON.stringify(x, (k, v) => (v && typeof v === "object" && !Array.isArray(v)
-  ? Object.fromEntries(Object.keys(v).sort().map((key) => [key, v[key]])) : v));
 
 const store = {
   get(k, d) { try { const v = localStorage.getItem("strata." + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
@@ -56,14 +52,13 @@ $("theme-btn").onclick = flipTheme;
 $("dark-toggle").onclick = flipTheme;
 setTheme(document.documentElement.dataset.theme || "light", false);
 
-const TABS = ["monitor", "config", "about"];
+const TABS = ["monitor", "about"];
 let tab = "monitor";
 function showTab(name) {
   tab = TABS.includes(name) ? name : "monitor";
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
   for (const v of TABS) $(`view-${v}`).hidden = v !== tab;
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "monitor" ? location.pathname : `#${tab}`);
-  if (tab === "config" && !cfg.server) loadConfig();
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of document.querySelectorAll(".st-tab")) b.onclick = () => showTab(b.dataset.tab);
@@ -79,7 +74,7 @@ function headers(json = false) {
 }
 $("api-key").value = apiKey;
 $("api-key").oninput = () => { apiKey = $("api-key").value.trim(); store.set("apikey", apiKey); };
-$("api-key").onchange = () => { toast("success", "API key saved", "Kept in this browser only."); if (tab === "config") loadConfig(); };
+$("api-key").onchange = () => toast("success", "API key saved", "Kept in this browser only.");
 // a JSON call: the answer's body, or an Error carrying its status and message
 async function api(path, body) {
   const r = await fetch(path, body === undefined ? {headers: headers(), cache: "no-store"}
@@ -492,339 +487,6 @@ function renderAbout(eng, hw, st) {
     ["Model name", eng.model, true],
   ]);
 }
-
-// ------------------------------------------------------------------ Config (GET / POST /api/config)
-// The main run config and each variant's file, edited as a form (known keys in sections, any other key as a row) or as
-// JSON; Apply sends every file whole. The server says what it changed, whether the engine restarted, and which keys
-// wait for a restart of the server.
-const SAMPLING = [
-  ["temperature", "number", "0 = greedy"], ["top_p", "number", "0 < top_p ≤ 1"], ["top_k", "number", "1-64"],
-  ["min_p", "number", "0-1"], ["presence_penalty", "number", "≥ 0"], ["frequency_penalty", "number", "≥ 0"],
-  ["repetition_penalty", "number", "> 0, 1 = off"], ["penalty_last_n", "number", "tokens"], ["seed", "number", "fixed seed"],
-];
-const SCHEDULER = [
-  ["turn_slice_s", "number", "engine time a conversation keeps the turn (0 = off)", 0],
-  ["turn_max_wait_s", "number", "a request waits at most this long (0 = no limit)", 120],
-  ["turn_hold_s", "number", "after tool calls, wait this long for the follow-up", 3],
-  ["turn_hold_skip_timeout_s", "number", "no hold for a call that asks a longer timeout", 120],
-  ["turn_side_wait_s", "number", "a session's one-shots wait this long for its follow-up", 0],
-  ["park", ["all", "sessions"], "park every conversation, or only those of named sessions", "all"],
-  ["priority", "bool", "request priorities (strata_priority)", "on with a slice"],
-  ["priority_preempt", ["full", "timeout", "off"], "stop a running request for a better band", "full"],
-  ["priority_preempt_delta", "number", "steps that make a band", 5],
-  ["priority_min_run_s", "number", "a request runs this long before it can be stopped", 2],
-  ["priority_preempt_timeout_s", "number", "with timeout: the better one waits this long first", 10],
-  ["priority_reserve_s", "number", "a session's tool calls keep worse bands out this long", 60],
-  ["priority_aging_s", "number", "a waiting request gains a step per this long", 30],
-  ["priority_default", "number", "a request's priority when it names none", 0],
-  ["priority_floor", "number", "the best priority a request may claim", -20],
-];
-const SWITCHING = [
-  ["default_model", "variant", "the variant to go back to when idle", "none"],
-  ["default_idle_s", "number", "go back to it after this long without requests (0 = never)", 0],
-  ["model_max_wait_s", "number", "a request for another variant switches after this long", 120],
-  ["model_min_resident_s", "number", "a variant keeps the engine at least this long", 30],
-  ["model_preempt", "bool", "a switch may stop the running request", "off"],
-  ["unknown_model", ["current", "default", "error"], "a model name no variant has", "current"],
-];
-const VARIANT_NAMES = [["model_name", "text", "what requests call it"], ["aliases", "list", "other names, comma-separated"]];
-const cfg = {server: null, draft: null, sel: null, mode: "form", busy: false};
-
-async function loadConfig(keepSel = true) {
-  try {
-    cfg.server = await api("api/config");
-  } catch (e) {
-    $("cfg-form").innerHTML = `<div class="msg-error">${esc(e.message)}</div>`;
-    return;
-  }
-  cfg.draft = clone(cfg.server.files);
-  if (!keepSel || !cfg.draft[cfg.sel]) cfg.sel = cfg.server.main;
-  renderConfig();
-}
-const isMain = (name) => cfg.server && name === cfg.server.main;
-const variantsOf = (main) => Object.fromEntries(Object.entries((main && main.models) || {}).filter(([, v]) => typeof v === "string"));
-const fileDirty = (name) => !cfg.server.files[name] || canon(cfg.draft[name]) !== canon(cfg.server.files[name]);
-function draftDirty() {
-  const a = Object.keys(cfg.draft).sort(), b = Object.keys(cfg.server.files).sort();
-  return canon(a) !== canon(b) || a.some(fileDirty);
-}
-function renderConfig() {
-  if (!cfg.server) return;
-  const main = cfg.draft[cfg.server.main], variants = variantsOf(main);
-  const rows = [[cfg.server.main, Object.keys(variants).length ? "Common settings" : "Run config"],
-                ...Object.entries(variants).map(([v, f]) => [f, v])];
-  $("cfg-file-list").innerHTML = rows.map(([f, label]) => `<button class="cfg-file" data-file="${esc(f)}" aria-current="${f === cfg.sel}">
-      <strong>${esc(label)}${!isMain(f) && cfg.server.active === label ? ` <span class="tag tag--accent">loaded</span>` : ""}${fileDirty(f) ? `<span class="dot" title="changed"></span>` : ""}</strong>
-      <span>${esc(f)}</span></button>`).join("");
-  $("cfg-add-variant").hidden = !main || main.models == null;
-  $("cfg-where").textContent = cfg.server.live_engine ? "Engine changes restart the engine; the server keeps running."
-    : "This server's engine cannot be restarted with a new start: engine changes need a restart of the server.";
-  renderEditor();
-  markDirty();
-}
-$("cfg-file-list").addEventListener("click", (e) => {
-  const b = e.target.closest("[data-file]");
-  if (!b || !commitJson()) return;
-  cfg.sel = b.dataset.file;
-  renderConfig();
-});
-for (const b of $("cfg-mode").children) b.onclick = () => {
-  if (!commitJson()) return;
-  cfg.mode = b.dataset.v;
-  for (const x of $("cfg-mode").children) x.setAttribute("aria-checked", String(x === b));
-  renderEditor();
-};
-// the JSON editor's text, taken back into the draft (false: it does not parse)
-function commitJson() {
-  if (cfg.mode !== "json" || !cfg.draft) return true;
-  try {
-    const v = JSON.parse($("cfg-json").value);
-    if (!v || typeof v !== "object" || Array.isArray(v)) throw new Error("the file must be a JSON object");
-    cfg.draft[cfg.sel] = v;
-    return true;
-  } catch (e) {
-    $("cfg-json-error").hidden = false;
-    $("cfg-json-error").textContent = `Not valid JSON: ${e.message}`;
-    return false;
-  }
-}
-
-function renderEditor() {
-  const name = cfg.sel, obj = cfg.draft[name];
-  const main = isMain(name);
-  const variant = main ? null : Object.entries(variantsOf(cfg.draft[cfg.server.main])).find(([, f]) => f === name)?.[0];
-  $("cfg-title").textContent = main ? (Object.keys(variantsOf(obj)).length ? "Common settings" : "Run config") : `Variant ${variant}`;
-  $("cfg-sub").textContent = main
-    ? `${name} · ${Object.keys(variantsOf(obj)).length ? "every variant starts from these; a variant's file overrides engine options, environment and sampling key by key" : "the server's run config"}`
-    : `${name} · over the common settings: model_name, aliases, args, env, engine, engine_env, sampling, log, max_context`;
-  $("cfg-json-wrap").hidden = cfg.mode !== "json";
-  $("cfg-form").hidden = cfg.mode !== "form";
-  $("cfg-json-error").hidden = true;
-  if (cfg.mode === "json") {
-    $("cfg-json").value = JSON.stringify(obj, null, 2);
-    return;
-  }
-  const used = new Set();
-  const sections = [];
-  const common = cfg.draft[cfg.server.main] || {};
-  if (main) {
-    sections.push(knownSection("Sampling defaults", "For requests that leave them out. A variant's own sampling overrides these key by key.",
-                               obj, "sampling", SAMPLING.map(([k, kind, help]) => [k, kind, help, null]), used));
-    if (obj.models != null) sections.push(modelsSection(obj, used));
-    sections.push(knownSection("Turn scheduler", "Who gets the engine next: time slices per conversation, holds for tool calls, priorities.",
-                               obj, null, SCHEDULER, used));
-  } else {
-    sections.push(knownSection("Names", "", obj, null, VARIANT_NAMES.map((x) => [...x, null]), used));
-    sections.push(knownSection("Sampling", "This variant's defaults for requests that leave them out; empty = the common setting (shown greyed).",
-                               obj, "sampling", SAMPLING.map(([k, kind, help]) => [k, kind, help, (common.sampling || {})[k] ?? null]), used));
-  }
-  sections.push(objectSection("Engine options", "Each one is an engine flag: expert_cache 4300 is --expert-cache 4300; true is a bare flag, false or null leaves it out.", obj, "engine", used));
-  sections.push(objectSection("Engine environment", "Each one is a STRATA_ variable: load_image is STRATA_LOAD_IMAGE; true is 1.", obj, "engine_env", used));
-  sections.push(objectSection(main ? "Other settings" : "Other", "Any other key of the file. Objects and lists are edited as JSON.", obj, null, used));
-  $("cfg-form").innerHTML = sections.join("");
-}
-const fieldId = (path) => "cfg-f-" + path.join("--").replace(/[^A-Za-z0-9_-]/g, "_");
-function inputFor(path, value, kind, placeholder) {
-  const id = fieldId(path), data = `id="${id}" data-path="${esc(JSON.stringify(path))}" data-kind="${esc(Array.isArray(kind) ? "enum" : kind)}"`;
-  const ph = placeholder == null ? "" : ` placeholder="${esc(placeholder)}"`;
-  if (kind === "bool" || Array.isArray(kind) || kind === "variant") {
-    const opts = kind === "bool" ? [["true", "on"], ["false", "off"]]
-      : kind === "variant" ? Object.keys(variantsOf(cfg.draft[cfg.server.main])).map((v) => [JSON.stringify(v), v])
-      : kind.map((x) => [JSON.stringify(x), x]);
-    const cur = value === undefined ? "" : JSON.stringify(value);
-    const def = placeholder == null ? "not set" : `default (${placeholder})`;
-    return `<select class="st-input" ${data}><option value=""${cur === "" ? " selected" : ""}>${esc(def)}</option>` +
-      (kind === "variant" ? `<option value="null"${cur === "null" ? " selected" : ""}>none</option>` : "") +
-      opts.map(([v, t]) => `<option value="${esc(v)}"${cur === v ? " selected" : ""}>${esc(t)}</option>`).join("") +
-      (cur && !opts.some(([v]) => v === cur) && !(kind === "variant" && cur === "null") ? `<option value="${esc(cur)}" selected>${esc(cur)}</option>` : "") + `</select>`;
-  }
-  if (kind === "json") return `<textarea class="st-input" rows="${Math.min(10, JSON.stringify(value, null, 2).split("\n").length)}" ${data}>${esc(JSON.stringify(value, null, 2))}</textarea>`;
-  const text = value === undefined || value === null ? "" : kind === "list" && Array.isArray(value) ? value.join(", ") : String(value);
-  const type = kind === "number" ? `type="number" step="any"` : `type="text"`;
-  return `<input class="st-input" ${type} ${data} value="${esc(text)}"${value === null ? ` placeholder="null"` : ph} autocomplete="off" spellcheck="false">`;
-}
-const removeBtn = (path) => `<button class="st-btn st-btn--icon" type="button" data-remove="${esc(JSON.stringify(path))}" aria-label="Remove" title="Remove">${icon("trash")}</button>`;
-function knownSection(title, note, obj, sub, fields, used) {
-  const holder = sub ? (obj[sub] || {}) : obj;
-  if (sub) used.add(sub); else fields.forEach(([k]) => used.add(k));
-  const rows = fields.map(([k, kind, help, def]) => {
-    const path = sub ? [sub, k] : [k];
-    return `<label for="${fieldId(path)}">${esc(k)}<small>${esc(help)}</small></label>${inputFor(path, holder[k], kind, def)}` +
-      (holder[k] !== undefined ? removeBtn(path) : "<span></span>");
-  });
-  // a key of the sub-object the form does not know
-  if (sub) for (const [k, v] of Object.entries(holder)) {
-    if (fields.some(([f]) => f === k)) continue;
-    rows.push(genericRow([sub, k], v));
-  }
-  return `<section class="cfg-section"><h3>${esc(title)}</h3>${note ? `<p>${esc(note)}</p>` : ""}<div class="cfg-rows">${rows.join("")}</div></section>`;
-}
-function genericKind(v) {
-  return typeof v === "boolean" ? "bool" : typeof v === "number" ? "number" : v !== null && typeof v === "object" ? "json" : "text";
-}
-function genericRow(path, v) {
-  return `<label for="${fieldId(path)}">${esc(path[path.length - 1])}</label>${inputFor(path, v, genericKind(v), null)}${removeBtn(path)}`;
-}
-function objectSection(title, note, obj, sub, used) {
-  let entries;
-  if (sub) { used.add(sub); entries = Object.entries(obj[sub] || {}).map(([k, v]) => [[sub, k], v]); }
-  else entries = Object.entries(obj).filter(([k]) => !used.has(k)).map(([k, v]) => [[k], v]);
-  const addKey = JSON.stringify(sub ? [sub] : []);
-  return `<section class="cfg-section"><h3>${esc(title)}</h3><p>${esc(note)}</p>
-    <div class="cfg-rows">${entries.map(([p, v]) => genericRow(p, v)).join("")}</div>
-    <div class="cfg-add" data-add="${esc(addKey)}"><input class="st-input" placeholder="new key" aria-label="New key" spellcheck="false">
-      <input class="st-input" placeholder="value (true, 4096, text or JSON)" aria-label="Value" spellcheck="false">
-      <button class="st-btn st-btn--secondary" type="button">Add</button></div></section>`;
-}
-function modelsSection(obj, used) {
-  used.add("models");
-  const rows = Object.entries(obj.models || {}).map(([v, f]) => `<label>${esc(v)}</label><span class="mono muted">${esc(typeof f === "string" ? f : "(an object: edit it as JSON)")}</span>` +
-    `<button class="st-btn st-btn--icon" type="button" data-remove-variant="${esc(v)}" aria-label="Remove ${esc(v)}" title="Remove the variant (its file stays on disk)">${icon("trash")}</button>`);
-  const known = knownSection("x", "", obj, null, SWITCHING, used).match(/<div class="cfg-rows">([\s\S]*)<\/div><\/section>$/)[1];
-  return `<section class="cfg-section"><h3>Model variants</h3><p>The variants this server switches between, and when it switches. Each has its file (the list on the left).</p>
-    <div class="cfg-rows">${rows.join("")}${known}</div></section>`;
-}
-
-// reading a field back into the draft
-function setPath(obj, path, value) {
-  let o = obj;
-  for (const k of path.slice(0, -1)) { if (o[k] == null || typeof o[k] !== "object") o[k] = {}; o = o[k]; }
-  const last = path[path.length - 1];
-  if (value === undefined) delete o[last]; else o[last] = value;
-  if (path.length > 1 && o && typeof o === "object" && !Object.keys(o).length) {   // an emptied sub-object goes too
-    let parent = obj;
-    for (const k of path.slice(0, -2)) parent = parent[k];
-    delete parent[path[path.length - 2]];
-  }
-}
-function parseLoose(s) {
-  const t = s.trim();
-  if (t === "") return undefined;
-  if (/^(true|false|null)$/.test(t) || /^-?\d+(\.\d+)?([eE][-+]?\d+)?$/.test(t) || /^[[{"]/.test(t)) {
-    try { return JSON.parse(t); } catch (e) { /* text */ }
-  }
-  return s;
-}
-function readField(el) {
-  const kind = el.dataset.kind, s = el.value;
-  if (el.tagName === "SELECT") return s === "" ? undefined : JSON.parse(s);
-  if (kind === "number") { if (s.trim() === "") return undefined; const n = Number(s); if (Number.isNaN(n)) throw new Error("not a number"); return n; }
-  if (kind === "list") { const v = s.split(",").map((x) => x.trim()).filter(Boolean); return v.length ? v : undefined; }
-  if (kind === "json") return JSON.parse(s);
-  return s === "" && el.placeholder === "null" ? null : s;
-}
-$("cfg-form").addEventListener("input", (e) => {
-  const el = e.target.closest("[data-path]");
-  if (!el) return;
-  try {
-    setPath(cfg.draft[cfg.sel], JSON.parse(el.dataset.path), readField(el));
-    el.classList.remove("bad");
-  } catch (err) { el.classList.add("bad"); el.title = err.message; return; }
-  markDirty();
-});
-$("cfg-form").addEventListener("change", (e) => { if (e.target.tagName === "SELECT") renderEditor(); });
-$("cfg-form").addEventListener("click", (e) => {
-  const rm = e.target.closest("[data-remove]");
-  if (rm) { setPath(cfg.draft[cfg.sel], JSON.parse(rm.dataset.remove), undefined); renderEditor(); markDirty(); return; }
-  const rv = e.target.closest("[data-remove-variant]");
-  if (rv) {
-    const v = rv.dataset.removeVariant, main = cfg.draft[cfg.server.main], file = main.models[v];
-    if (!confirm(`Remove the variant ${v}? Its file (${file}) stays on disk; requests for it go to the loaded variant.`)) return;
-    delete main.models[v];
-    if (typeof file === "string" && !Object.values(main.models).includes(file)) delete cfg.draft[file];
-    if (main.default_model === v) main.default_model = null;
-    renderConfig();
-    return;
-  }
-  const add = e.target.closest(".cfg-add button");
-  if (add) {
-    const box = add.closest(".cfg-add"), [k, v] = box.querySelectorAll("input");
-    const key = k.value.trim(), value = parseLoose(v.value);
-    if (!key) { k.focus(); return; }
-    setPath(cfg.draft[cfg.sel], [...JSON.parse(box.dataset.add), key], value === undefined ? "" : value);
-    renderEditor(); markDirty();
-  }
-});
-$("cfg-form").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && e.target.closest(".cfg-add")) { e.preventDefault(); e.target.closest(".cfg-add").querySelector("button").click(); }
-});
-$("cfg-json").addEventListener("input", () => {
-  try { JSON.parse($("cfg-json").value); $("cfg-json-error").hidden = true; } catch (e) { /* said on commit */ }
-  if (commitJson()) markDirty(); else { $("cfg-apply").disabled = true; $("cfg-check").disabled = true; }
-});
-$("cfg-add-variant").onclick = () => {
-  if (!commitJson()) return;
-  const name = (prompt("The new variant's name (letters, digits, '.', '_', '-'), as requests and the files call it:") || "").trim();
-  if (!name) return;
-  const main = cfg.draft[cfg.server.main];
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) || (main.models || {})[name]) { toast("error", "Not a usable name", name); return; }
-  const file = `server-${name}.json`;
-  main.models = {...(main.models || {}), [name]: file};
-  if (!cfg.draft[file]) cfg.draft[file] = cfg.server.files[file] ? clone(cfg.server.files[file]) : {model_name: name, engine: {}, engine_env: {}, sampling: {}};
-  cfg.sel = file;
-  renderConfig();
-};
-function markDirty() {
-  const dirty = draftDirty();
-  $("cfg-dirty").textContent = dirty ? "Unapplied changes" : "No changes";
-  $("cfg-dirty").classList.toggle("on", dirty);
-  for (const id of ["cfg-revert", "cfg-check", "cfg-apply"]) $(id).disabled = !dirty || cfg.busy;
-  for (const b of document.querySelectorAll(".cfg-file")) {
-    const strong = b.querySelector("strong"), dot = strong.querySelector(".dot");
-    if (fileDirty(b.dataset.file) && !dot) strong.insertAdjacentHTML("beforeend", `<span class="dot" title="changed"></span>`);
-    else if (!fileDirty(b.dataset.file) && dot) dot.remove();
-  }
-}
-$("cfg-revert").onclick = () => { if (confirm("Discard the changes?")) { cfg.draft = clone(cfg.server.files); if (!cfg.draft[cfg.sel]) cfg.sel = cfg.server.main; $("cfg-result").hidden = true; renderConfig(); } };
-window.addEventListener("beforeunload", (e) => { if (cfg.server && draftDirty()) { e.preventDefault(); e.returnValue = ""; } });
-
-function showResult(kind, html) {
-  const el = $("cfg-result");
-  el.hidden = false;
-  el.className = `st-card cfg-result ${kind}`;
-  el.innerHTML = html;
-}
-function changesHtml(r) {
-  const files = Object.entries(r.changes || {});
-  return files.length ? `<ul>${files.map(([f, keys]) => `<li><code>${esc(f)}</code>: ${keys.map((k) => `<code>${esc(k)}</code>`).join(", ")}</li>`).join("")}</ul>` : "<p>Nothing differs from the files on disk.</p>";
-}
-function restartHtml(r) {
-  return r.restart_required && r.restart_required.length
-    ? `<p><strong>Needs a restart of the server</strong> (saved, used from the next start): ${r.restart_required.map((k) => `<code>${esc(k)}</code>`).join(", ")}</p>` : "";
-}
-async function submit(dry) {
-  if (!commitJson()) return null;
-  cfg.busy = true; markDirty();
-  try {
-    return await api("api/config", {files: cfg.draft, dry_run: dry, wait_s: 120});
-  } catch (e) {
-    showResult("error", `<strong>${dry ? "The check failed" : "Not applied"}</strong><p>${esc(e.message)}</p>`);
-    if (e.body && e.body.error && e.body.error.code === "apply_failed") await loadConfig();
-    return null;
-  } finally { cfg.busy = false; markDirty(); }
-}
-$("cfg-check").onclick = async () => {
-  const r = await submit(true);
-  if (!r) return;
-  showResult("ok", `<strong>The config is usable.</strong> Applying it would change:${changesHtml(r)}
-    <p>${r.engine_restart ? "The loaded engine would restart (a few seconds; its conversation is parked)." : "The engine would keep running."}</p>${restartHtml(r)}`);
-};
-$("cfg-apply").onclick = async () => {
-  const check = await submit(true);
-  if (!check) return;
-  if (!Object.keys(check.changes || {}).length) { showResult("ok", "<p>Nothing to apply.</p>"); return; }
-  if (check.engine_restart && !confirm("This restarts the engine (a few seconds; the conversation it holds is parked). Apply?")) return;
-  const running = lastMetrics && lastMetrics.turns && lastMetrics.turns.running;
-  showResult("", `<p>${check.engine_restart ? "Applying and restarting the engine…" : "Applying…"}${running
-    ? " A request holds the engine: this waits for it to end (up to 2 min)." : ""}</p>`);
-  const r = await submit(false);
-  if (!r) return;
-  showResult("ok", `<strong>Applied.</strong>${changesHtml(r)}
-    <p>${r.engine_restarted ? "The engine restarted with the new start." : r.engine_restart ? "The engine is unloaded: it starts with the new settings at the next load." : "The engine kept running."}</p>
-    ${restartHtml(r)}<p class="muted small">The earlier files are in <code>${esc(r.backup || "")}</code>.</p>`);
-  toast("success", "Config applied", r.engine_restarted ? "The engine restarted." : "");
-  await loadConfig();
-};
 
 // ------------------------------------------------------------------ start
 showTab(location.hash.slice(1) || "monitor");
