@@ -250,10 +250,9 @@ download. Re-run `make up` after changing these settings.
 Edit `config/server.json`, which uses Strata's native server configuration format
 and is imported with `config/model.json` into the `strata-local-config`
 volume mounted at `/config` (`make config`; `make up` runs it). The server reads
-these files there directly, and the web page's Config view (below) edits them in
-place, so `make config` refuses to overwrite a file the web page changed since the
-last import: `make pull-config` copies those changes back into `config/` (review
-them with `git diff`), and `make config FORCE=1` discards them. Importing leaves
+these files there directly. `make config` refuses to overwrite a file changed in
+the volume since the last import: `make pull-config` copies those changes back into
+`config/` (review them with `git diff`), and `make config FORCE=1` discards them. Importing leaves
 files deleted from `config/` in the volume; run `podman volume rm
 strata-local-config` with the containers removed to clear them.
 
@@ -432,21 +431,10 @@ API key goes under About):
   obsolete). Session names come from the requests (`strata_session`,
   `X-Strata-Session`, `metadata.user_id`) and are kept in `/data/session-names.json`;
   a file parked before its name was seen shows the session's tag.
-- **Config**: the common `server.json` and each variant's file, as a form (sampling,
-  variants and switching, the turn scheduler, engine options and environment, any
-  other key) or as JSON. Check validates the files as a start would; Apply writes
-  them and applies them without restarting the server. Sampling, names, the
-  scheduler and switching keys take effect at once; a change to the loaded
-  variant's engine options restarts the engine only (its conversation is parked
-  first, so it comes back), and another variant's take effect at its next switch.
-  If the new engine does not start, the earlier files and engine come back. A few
-  keys (`tokenizer`, `vision`, the network settings) need the server restarted: the
-  page names them after saving. Each Apply keeps the files it replaced in
-  `/data/config-history/<time>/` (the last 50). Add a variant there too; its model
-  files still come from `make init`.
+- **About**: the model, the engine, the hardware and the API addresses.
 
-The chat page is not served. `GET /api/config` and `POST /api/config`
-(`{"files": {...}, "dry_run": true}`) are the same operations for scripts.
+The chat page is not served, and the run config is not edited from the page: change
+`config/` and run `make up`.
 
 ## Validation
 

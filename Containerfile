@@ -1,9 +1,9 @@
 ARG ROCM_IMAGE=docker.io/rocm/dev-ubuntu-24.04:7.0.2
 FROM $ROCM_IMAGE
 
-# Our fork of Niko1221/Strata: upstream v0.2.7 plus the disk-backed conversation cache (park files updated in place, read back by streaming, borrowed from), the turn slice (a conversation keeps the engine between its tool calls) and request priorities (fair share in bands, preemption) and model variants (one server switches between quantizations of one model) and load images (a variant's expert load kept in load order on disk, read sequentially) and sessions (a request names its conversation; only sessions' turns are parked, a client yields and drops by request) and parked conversations kept across restarts and variant switches (one budget for every variant's files) and a web console at / in place of the chat page (the turn scheduler, the variants and each parked conversation on the Monitor; a Config view that edits /config and applies it, restarting only the engine).
+# Our fork of Niko1221/Strata: upstream v0.2.7 plus the disk-backed conversation cache (park files updated in place, read back by streaming, borrowed from), the turn slice (a conversation keeps the engine between its tool calls) and request priorities (fair share in bands, preemption) and model variants (one server switches between quantizations of one model) and load images (a variant's expert load kept in load order on disk, read sequentially) and sessions (a request names its conversation; only sessions' turns are parked, a client yields and drops by request) and parked conversations kept across restarts and variant switches (one budget for every variant's files) and a web console at / in place of the chat page (the turn scheduler, the variants and each parked conversation on the Monitor).
 ARG STRATA_REPOSITORY=https://github.com/UltimateBoomer/Strata.git
-ARG STRATA_REVISION=091814dbe1f251693668fe93c1161ce0cc25e947
+ARG STRATA_REVISION=03f4c6796b13890375cef835fba22da9e635b4cd
 ARG HIP_ARCHITECTURES=gfx1101
 ARG BUILD_JOBS=8
 # Use the llama.cpp revision pinned by the selected Strata checkout.
