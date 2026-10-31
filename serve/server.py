@@ -4879,6 +4879,15 @@ class Service:
         self.set_aliases(v.aliases)
         self.sampling_defaults = sampling_defaults_from_config(v.cfg)
 
+    def variant_sampling(self, turn) -> dict:
+        """The config's sampling defaults for the model variant a request is for: the loaded one's (apply_variant), or,
+        for a request that waits for a switch to another variant, that one's - its sampling is merged before the
+        switch (_run), and the variant that runs it is the one it asked for."""
+        m, want = self.models, getattr(turn, "model", None)
+        if m is None or want is None or want == m.active or want not in m.variants:
+            return self.sampling_defaults
+        return sampling_defaults_from_config(m.variants[want].cfg)
+
     def switch_model(self, name: str, load: bool = True) -> None:
         """Run model variant `name` (serve/models.py): the conversation in the engine is saved to a session file, the
         engine stops and starts again as that variant (with `load`; else the next request starts it), and the
@@ -5817,7 +5826,9 @@ class Service:
         Turn with "turn_slice_s" (serve/turns.py), else None."""
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
-        defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
+        defaults = {**model_card_sampling(self.model_arch, thinking),
+                    **self.variant_sampling(call if call is not None else getattr(self.request_turn, "turn", None)),
+                    **self.shared}
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
@@ -8523,6 +8534,8 @@ def make_handler(svc: Service):
         def _count_tokens(self, req):
             """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would
             read for the same request, rendered and tokenized - the model does not run."""
+            if svc.models is not None:                        # its variant's tokenizer and template, as its request's
+                svc.use_request_family(svc.models.pin(req.get("model")))
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             stop_strings(req)                                 # the same 400 as the request itself would get
