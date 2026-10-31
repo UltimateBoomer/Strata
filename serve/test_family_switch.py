@@ -114,6 +114,7 @@ class ServerTest(unittest.TestCase):
         self.addCleanup(self.dir.cleanup)
         events = self.events = []
         prompts = self.prompts = []
+        samplings = self.samplings = []
 
         class Engine:
             max_context = 1 << 16
@@ -139,13 +140,17 @@ class ServerTest(unittest.TestCase):
             def generate(self, ids, max_new, sampling, cancel, embeddings=None):
                 name = self.spawn[0]
                 prompts.append((name, ids))
+                samplings.append((name, sampling))
                 if name == "ds":
                     yield from dtok.encode("hmm</think>from ds", parse_special=True) + [EOS]
                 else:
                     yield from qtok.encode("</think>\nfrom q2", parse_special=True)
                     yield from qtok.encode(IM_END, parse_special=True)
 
-        m, _ = serve_models.load(config(model_session_dir=self.dir.name, model_min_resident_s=0), None)
+        cfg = config(model_session_dir=self.dir.name, model_min_resident_s=0)
+        cfg["models"]["q2"]["sampling"] = {"temperature": 0.7}
+        cfg["models"]["ds"]["sampling"] = {"temperature": 1.0, "top_p": 0.9}
+        m, _ = serve_models.load(cfg, None)
 
         def spawn(name):
             return (name, m.variants[name].cfg["args"], None, None, None, False, None)
@@ -154,7 +159,8 @@ class ServerTest(unittest.TestCase):
             v.ready_s = server.ready_timeout_of(v.cfg)
         self.engine = Engine()
         svc = self.svc = Service(self.engine, qtok, ChatTemplate(ROOT / "serve" / "chat_template.jinja"),
-                                 model_name="qwen-q2")
+                                 model_name="qwen-q2", sampling_defaults=server.sampling_defaults_from_config(
+                                     m.variants["q2"].cfg))
         svc.model_arch = "qwen4exp"
         svc.set_family(None)
         svc.vision = self.vision = Vision(events)
@@ -222,6 +228,42 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(server.ENGINE_READY_S, server.ENGINE_READY_DEFAULT)
         self.assertIs(self.svc.fam, self.svc.home)
         self.assertEqual(self.svc.models.switches, 2)
+
+    def test_sampling_of_the_variant_asked_for(self):
+        """A request for another variant is sent with that variant's sampling, not the loaded one's (it is merged
+        before the switch)."""
+        self.chat("qwen")
+        self.chat("deepseek")
+        self.chat("qwen")
+        got = [(name, s.get("temperature"), s.get("top_p")) for name, s in self.samplings]
+        self.assertEqual(got, [("q2", 0.7, 0.95), ("ds", 1.0, 0.9), ("q2", 0.7, 0.95)])
+
+    def count_tokens(self, model):
+        body = {"model": model, "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]}
+        r = urllib.request.Request(self.base + "/v1/messages/count_tokens", data=json.dumps(body).encode(),
+                                   headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(r, timeout=30) as resp:
+            return json.loads(resp.read())["input_tokens"]
+
+    def test_count_tokens_with_the_variant_asked_for(self):
+        """/v1/messages/count_tokens counts with the family of the variant it names, whichever is loaded."""
+        from serve.frontend import anthropic_to_messages
+        req = {"messages": [{"role": "user", "content": "hi"}]}
+
+        def expected(variant):
+            self.svc.use_request_family(variant)
+            try:
+                messages, tools, kw = anthropic_to_messages(self.svc.with_shared(dict(req), "anthropic"),
+                                                            self.svc.anthropic_think_unasked)
+                return len(self.svc.encode_prompt(messages, tools, kw, store=False))
+            finally:
+                self.svc.use_request_family(None)
+        q2, ds = expected("q2"), expected("ds")
+        self.assertNotEqual(q2, ds)
+        self.assertEqual((self.count_tokens("qwen"), self.count_tokens("deepseek")), (q2, ds), "Qwen loaded")
+        self.chat("deepseek")
+        self.assertEqual((self.count_tokens("qwen"), self.count_tokens("deepseek")), (q2, ds), "DeepSeek loaded")
+        self.assertEqual(self.prompts[-1][0], "ds", "counting switched nothing")
 
     def test_reader_of_another_family(self):
         """A Qwen request's pictures, while DeepSeek's engine runs: Qwen's reader starts for them as it is (the encode
