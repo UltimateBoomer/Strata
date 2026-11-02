@@ -24,4 +24,9 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
 /// `stats` is nullptr or 4 device uint64 counters: tail entries seen, swaps, non-resident before, non-resident after.
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok, float margin,
                            int rank_lo, int rank_hi, unsigned long long* stats, void* stream);
+struct LiveRoute;   // route_prior.hpp
+/// STRATA_ROUTE_LIVE: the same with the margin and ranks read from `live` at run time (a request's); nothing is written
+/// when its margin is <= 0.
+void native_route_resident_live(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
+                                const LiveRoute* live, unsigned long long* stats, void* stream);
 }

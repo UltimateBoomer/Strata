@@ -11,6 +11,10 @@
 
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <new>
 
 namespace strata::kernels {
 namespace {
@@ -27,8 +31,13 @@ __device__ __forceinline__ float wsum(float v) {
 }
 
 // one warp per token; 512 experts = 16 values per lane (as the native router)
+// `live` (STRATA_ROUTE_LIVE): lambda is the request's, read at run time; off (<= 0) writes nothing
 __global__ void route_prior_k(const float* __restrict__ logits, const int32_t* __restrict__ res, float lambda,
-                                  int32_t* __restrict__ ids, float* __restrict__ weights) {
+                                  const LiveRoute* live, int32_t* __restrict__ ids, float* __restrict__ weights) {
+    if (live != nullptr) {
+        lambda = *(const volatile float*) &live->prior;
+        if (!(lambda > 0.0f)) return;
+    }
     const float* lg = logits + (size_t) blockIdx.x * 512;
     int32_t* id = ids + (size_t) blockIdx.x * 10;
     float* w = weights + (size_t) blockIdx.x * 10;
@@ -73,7 +82,59 @@ __global__ void route_prior_k(const float* __restrict__ logits, const int32_t* _
 void route_prior_top10(const float* logits, const int32_t* res_layer, float lambda, int32_t* ids, float* weights,
                              int n_tok, void* stream) {
     if (n_tok <= 0) return;
-    route_prior_k<<<n_tok, 32, 0, (cudaStream_t) stream>>>(logits, res_layer, lambda, ids, weights);
+    route_prior_k<<<n_tok, 32, 0, (cudaStream_t) stream>>>(logits, res_layer, lambda, nullptr, ids, weights);
 }
+
+void route_prior_top10_live(const float* logits, const int32_t* res_layer, const LiveRoute* live, int32_t* ids,
+                            float* weights, int n_tok, void* stream) {
+    if (n_tok <= 0 || live == nullptr) return;
+    route_prior_k<<<n_tok, 32, 0, (cudaStream_t) stream>>>(logits, res_layer, 0.0f, live, ids, weights);
+}
+
+LiveRoute& live_route_startup() {
+    static LiveRoute s = [] {
+        LiveRoute r;
+        if (const char* v = std::getenv("STRATA_ROUTE_PRIOR")) r.prior = (float) std::atof(v);
+        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT")) r.rr_margin = (float) std::atof(v);
+        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(v, "%d-%d", &r.rr_lo, &r.rr_hi);
+        return r;
+    }();
+    return s;
+}
+
+namespace {
+struct LiveBlock {
+    LiveRoute* host = nullptr;
+    const LiveRoute* dev = nullptr;
+};
+LiveBlock& live_block() {
+    static LiveBlock b;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const char* v = std::getenv("STRATA_ROUTE_LIVE");
+        if (v == nullptr || std::atoi(v) == 0) return;
+        void* h = nullptr;
+        void* d = nullptr;
+        // portable: every GPU of a layer split reads the one block
+        if (cudaHostAlloc(&h, sizeof(LiveRoute), cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+            cudaHostGetDevicePointer(&d, h, 0) != cudaSuccess) {
+            (void) cudaGetLastError();
+            if (h != nullptr) cudaFreeHost(h);
+            std::fprintf(stderr, "strata verify: STRATA_ROUTE_LIVE: the mapped block could not be allocated; requests "
+                                 "cannot change the routing (route_prior / route_resident keys ignored)\n");
+            return;
+        }
+        b.host = new (h) LiveRoute(live_route_startup());
+        b.dev = (const LiveRoute*) d;
+        std::fprintf(stderr, "strata verify: STRATA_ROUTE_LIVE: requests set route_prior / route_resident (start-up "
+                             "values: route_prior %g, route_resident %g ranks %d-%d)\n",
+                     b.host->prior, b.host->rr_margin, b.host->rr_lo, b.host->rr_hi);
+    });
+    return b;
+}
+}  // namespace
+
+LiveRoute* live_route_host() { return live_block().host; }
+const LiveRoute* live_route_device() { return live_block().dev; }
 
 }  // namespace strata::kernels

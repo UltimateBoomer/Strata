@@ -788,6 +788,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     release_gpu_fn().store(&release_live_verifiers);
     cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
     rr_stats_ = route_resident_cfg().stats_on(device_);   // STRATA_ROUTE_RESIDENT: this GPU's counters, outside graph capture
+    (void) strata::kernels::live_route_host();   // STRATA_ROUTE_LIVE: the mapped block, allocated outside graph capture
     strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
     strata::kernels::fused_gr_persist_init();   // opt-in STRATA_HC_PERSIST=1 (HIP)
     wt_ = &wt;
@@ -2090,10 +2091,20 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // experts; the weights stay the router's (route_prior.cu).  g_route_prior() above: off unless STRATA_ROUTE_PRIOR is set
         // (measured on an RTX 3060 12 GB at 2.0: story +37.6%, code +35.2%; on an RTX PRO 5000 72 GB -1.9% / -0.5%, on 2x RTX A4000
         // -4.2% / +11.0%, so it only helps a card that streams most experts).
+        // STRATA_ROUTE_LIVE=1: both kernels are in every window graph and read the request's values (route_prior.hpp,
+        // LiveRoute); a value that is off writes nothing, so a request that sets none gets the bits of the graphs without them
+        const strata::kernels::LiveRoute* live_route = strata::kernels::live_route_device();
+        if (live_route != nullptr && NE == 512 && K == 10 && hits_.d_res != nullptr) {
+            route_prior_top10_live(logits_ + tb * NE, hits_.d_res + l * g.n_expert, live_route, ids_ + tb * K, w_ + tb * K, n, cs);
+            try {
+                native_route_resident_live(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
+                                           live_route, rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs);
+            } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
+        }
         const float route_prior = g_route_prior();
-        if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
+        if (live_route == nullptr && route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
             route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
-        if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
+        if (live_route == nullptr && route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
             // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output)
             try {
                 native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
