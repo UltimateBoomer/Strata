@@ -31,11 +31,6 @@ services:
   strata-server:
     <<: *runtime
     restart: unless-stopped
-    # /config writable: the web page's Config view edits these files and applies them (make pull-config copies them
-    # back into config/); the versions it replaces go to /data/config-history.
-    volumes:
-      - strata-data:/data
-      - strata-config:/config
     # The engine parks the conversation it holds as it stops (kept for the next start); the server allows it 20 s
     # before terminating it, so the 10 s default would kill it first.
     stop_grace_period: 60s

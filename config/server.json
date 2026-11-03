@@ -21,9 +21,12 @@
   "priority_floor": -20,
   "models": {
     "q2": "server-q2.json",
-    "q3": "server-q3.json",
     "q1": "server-q1.json",
-    "q3s": "server-q3s.json"
+    "q3s-slow": "server-q3s-slow.json",
+    "q3s-fast": "server-q3s-fast.json",
+    "q4-slow": "server-q4-slow.json",
+    "q4-fast": "server-q4-fast.json",
+    "deepseek": "server-deepseek.json"
   },
   "default_model": null,
   "default_idle_s": 0,
@@ -35,7 +38,6 @@
   "engine_env": {
     "hipblaslt_tuning": "/config/gfx1101-hipblaslt-100000.txt",
     "resident_headroom_gib": 1,
-    "route_prior": 1.5,
     "hip_wmma": 1,
     "pa_fast": 1,
     "select_wmma": 1,
@@ -61,7 +63,7 @@
     "kv": "int8",
     "pool_workers": 0,
     "pcie_frac": 0.15,
-    "vram_reserve_mib": 1024,
+    "vram_reserve_mib": 512,
     "vision": true
   },
   "vision": {

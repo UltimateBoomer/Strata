@@ -197,13 +197,31 @@ def config_path(kind, model):
     return Path('/config') / (f'{kind}.json' if model == 'qwen' else f'{kind}-{model}.json')
 
 
+def variant_model(server_dir, name, file):
+    """The model a variant runs: the <name> of its pack, /data/pack-<name> ("engine": {"pack": ...} or --pack in its
+    "args"), so variants of one model with other settings (q3s-fast, q3s-slow) share one download; else the variant's
+    own name."""
+    try:
+        cfg = json.loads((Path(server_dir) / file).read_text()) if isinstance(file, str) else file
+    except (OSError, ValueError):
+        cfg = None
+    pack = None
+    if isinstance(cfg, dict):
+        pack = (cfg.get('engine') or {}).get('pack')
+        args = cfg.get('args') or []
+        if pack is None and '--pack' in args and args.index('--pack') + 1 < len(args):
+            pack = args[args.index('--pack') + 1]
+    m = re.fullmatch(r'/data/pack-([a-z0-9][a-z0-9_-]*)', pack) if isinstance(pack, str) else None
+    return m.group(1) if m else name
+
+
 def models_to_prepare(model):
     """(model config, link suffix) pairs for STRATA_MODEL: a server config with "models" (Strata's model variants)
-    prepares each variant from /config/model-<variant>.json, linked as /data/{model,pack}-<variant>; else the model's
-    own config."""
+    prepares the model of each variant (variant_model: its pack's name, once for the variants that share it) from
+    /config/model-<name>.json, linked as /data/{model,pack}-<name>; else the model's own config."""
     server = config_path('server', model)
     variants = json.loads(server.read_text()).get('models') if server.is_file() else None
-    names = list(variants) if variants else [model]
+    names = list(dict.fromkeys(variant_model(server.parent, n, f) for n, f in variants.items())) if variants else [model]
     return [(config_path('model', n), '' if n == 'qwen' else '-' + n) for n in names]
 
 

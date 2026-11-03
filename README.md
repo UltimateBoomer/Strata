@@ -91,24 +91,30 @@ Use your stored API key as a Bearer token and request model
 
 ### Switching models
 
-The image carries two engines, and `STRATA_MODEL` picks the model `make up`
-serves:
+The image carries two engines, and one server switches between the Qwen variants
+and DeepSeek-V4.1-Flash as requests ask for them (the fork's `"models"` with
+variants of two model families, documented in Strata's `docs/BATCHING.md`):
 
 ```sh
-make up                          # Qwen3.8-Flash-Next, Q2_0, IQ3_XXS and Coder IQ1_M variants (config/server.json)
-make up STRATA_MODEL=deepseek    # DeepSeek-V4.1-Flash IQ1_M (config/model-deepseek.json, config/server-deepseek.json)
+make up                              # starts with Qwen Q2_0; every variant below is served
+make up STRATA_VARIANT=deepseek      # starts with DeepSeek-V4.1-Flash IQ1_M instead
 ```
 
-Any other name selects `config/model-<name>.json` and `config/server-<name>.json`,
-linked as `/data/model-<name>` and `/data/pack-<name>`. Every model stays
-downloaded and packed, so switching back is quick. `make up` without the
-variable serves Qwen again; to keep another model across runs, set
-`STRATA_MODEL` in `mise.local.toml`. Only one model runs at a time: each takes
-the whole GPU and most of the RAM.
+Request `deepseek-v4.1-flash` (or `deepseek`) to switch to DeepSeek, and any Qwen
+name to switch back; `POST /v1/load {"model": "deepseek"}` switches by hand. Each
+request is read with its own model's tokenizer, chat template and tool-call
+format. A request that names no model goes to the model loaded when it arrives.
+Only one model runs at a time: each takes the whole GPU and most of the RAM.
+A switch to DeepSeek takes as long as its engine start (it may take up to
+`engine_ready_s`, 3600 s), and Qwen's picture reader stops while DeepSeek runs.
+`make init` downloads and packs DeepSeek too (about 240 GB, below).
+
+`STRATA_MODEL=<name>` still serves `config/server-<name>.json` alone, with
+`config/model-<name>.json` linked as `/data/model-<name>` and `/data/pack-<name>`.
 
 #### Qwen variants
 
-The Qwen server holds three variants of the same model and switches between them
+The server holds several Qwen variants of the same model and switches between them
 while it runs (the fork's `"models"`, documented in Strata's
 `docs/BATCHING.md`). `config/server.json` is the common config; each variant
 adds its own pack and shards:
@@ -118,6 +124,23 @@ adds its own pack and shards:
 | `qwen3.8-flash-next-q2_0`, `q2`, `qwen`, `qwen3.8-flash-next` | Q2_0 | `config/{model,server}-q2.json` |
 | `qwen3.8-flash-next-iq3_xxs`, `q3` | IQ3_XXS | `config/{model,server}-q3.json` |
 | `qwen3.8-flash-next-coder-iq1_m`, `q1`, `coder`, `qwen3.8-flash-next-coder` | Coder IQ1_M | `config/{model,server}-q1.json` |
+| `qwen3.8-flash-next-iq3_s-slow`, `q3s-slow` | IQ3_S | `config/model-q3s.json`, `config/server-q3s-slow.json` |
+| `qwen3.8-flash-next-iq3_s-fast`, `q3s-fast` | IQ3_S, residency-biased routing | `config/model-q3s.json`, `config/server-q3s-fast.json` |
+| `qwen3.8-flash-next-ud-q4_k_xl-slow`, `q4-slow` | Unsloth UD-Q4_K_XL | `config/model-q4.json`, `config/server-q4-slow.json` |
+| `qwen3.8-flash-next-ud-q4_k_xl-fast`, `q4-fast` | Unsloth UD-Q4_K_XL, residency-biased routing | `config/model-q4.json`, `config/server-q4-fast.json` |
+
+IQ3_S and UD-Q4_K_XL each come as two variants of one engine: `-slow` answers as
+the engine always has, and `-fast` turns on the fork's residency-biased routing
+(`route_prior` 1.5: an expert already in VRAM gets a logit bonus, fewer misses to
+read, answers that differ from `-slow`'s) and lets a request trade more quality
+for speed with its own `"strata_tune"`: `tail_skip` (0-9), `kva` (true/false),
+`route_resident` and `route_resident_ranks` (Strata's `docs/BATCHING.md`, "Variants
+of one engine"). The two differ only in their sampling block, so a switch between
+them restarts nothing and keeps the conversation; they share the download, the
+pack, the load image and one conversation folder (`/data/convcache/<base>-slow`). Their engine runs
+with `STRATA_ROUTE_LIVE=1` (`engine_env.route_live`), which puts both routing
+kernels in every verify graph; with `route_prior` 0 they write nothing, so
+`-slow`'s answers are the bits of an engine without them.
 
 The Coder is ISTA-DASLab's expert-pruned release: 256 of each layer's 512 experts
 kept (chosen for code, tool use and pictures), stored at 3.5 bits, with upstream's
@@ -137,6 +160,11 @@ variant's next request goes on from that file. No session file is written
 (`"model_session_dir": false`). `make up STRATA_VARIANT=q3`
 starts with IQ3_XXS, and `POST /v1/load {"model": "q3"}` switches by hand.
 `make init` downloads and packs every variant (IQ3_XXS: 76 GB more, the Coder: 29.6 GB more, IQ3_S: 110 GB more; its second shard, the per-layer table, is shared with Q2_0).
+UD-Q4_K_XL (Unsloth's 4-bit file, 111.3 GB) is packed with `--compat-bf16` and
+read from its GGUF shards in place (no `experts.bin`). Its 71.7 GiB of experts
+are twice IQ3_S's, so on pc26 (32 GB of RAM) 44 GiB of them are read from the SSD:
+measured 2026-11-02, it answers at 8-11 tokens/s (IQ3_S: 19-24) and reads prompts
+at 690-810 tokens/s (IQ3_S: 930-1150).
 
 Each variant keeps a load image in `/data/load-image/<variant>` (the fork's
 `STRATA_LOAD_IMAGE`): its GPU expert cache and RAM experts as two files in the
@@ -167,7 +195,7 @@ about 30 tokens/s. Q2_0 with every expert in RAM read 832 tokens/s with
 reader and session saves; the 22 GiB budget keeps about 5 GB free. Larger
 budgets answer faster on IQ3_XXS (26 GiB: 25 tokens/s) but leave no RAM free.
 
-DeepSeek-V4.1-Flash (ISTA-DASLab's 1.75 bpw set, 81920 context) is upstream
+DeepSeek-V4.1-Flash (ISTA-DASLab's 1.75 bpw set, 200000 context, the `deepseek` variant) is upstream
 Strata's `strata-dsv41` engine, built here for gfx1101 although upstream ships
 it for gfx12 only (its kernel tests pass on gfx1101). It needs about 240 GB of
 disk: the shards, the 111 GB n-gram table read from the SSD while it answers,

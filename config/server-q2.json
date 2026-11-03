@@ -1,9 +1,5 @@
 {
   "model_name": "qwen3.8-flash-next-q2_0",
-  "aliases": [
-    "qwen",
-    "qwen3.8-flash-next"
-  ],
   "sampling": {
     "temperature": 1.0,
     "top_p": 0.95,
@@ -21,7 +17,7 @@
     "native": "/data/model-q2/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
     "expert_profile": "/data/pack-q2/expert-profile.bin",
     "mtp": "/data/pack-q2/mtp/rt",
-    "expert_cache": 5760,
+    "expert_cache": "auto",
     "resident_budget_gib": 22,
     "prefill": "auto"
   }

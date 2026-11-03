@@ -99,8 +99,11 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(cfg['vision']['mmproj'], '/data/model-q2/' + q2['vision_file'])
         self.assertEqual(cfg['vision']['model'], '/data/model-q2/' + Path(q2['files'][0]).name)
         for name, file in cfg['models'].items():
+            if 'arch' in json.loads((root / 'config' / file).read_text()):
+                continue                                # another model family (DeepSeek): its own test below
             with self.subTest(variant=name):
                 variant = server_config(root / 'config' / file)
+                name = init.variant_model(root / 'config', name, file)   # q3s-fast, q3s-slow: q3s's files
                 model = json.loads((root / f'config/model-{name}.json').read_text())
                 init.model_files(model)
                 args = variant['args']
@@ -116,7 +119,9 @@ class PreparationTests(unittest.TestCase):
                     self.assertNotIn(flag, cfg['args'], 'set per variant')
                 for flag in ('--expert-cache', '--prefill'):
                     self.assertIn(flag, args)
-                self.assertEqual(model['vision_file'], q2['vision_file'], 'the variants share the picture reader')
+                # (another repository's variant, Unsloth's, downloads none: the reader is Q2_0's)
+                self.assertEqual(model.get('vision_file', q2['vision_file']), q2['vision_file'],
+                                 'the variants share the picture reader')
 
     def test_variants_are_prepared_with_their_own_links(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -130,6 +135,24 @@ class PreparationTests(unittest.TestCase):
                 self.assertEqual(init.models_to_prepare('qwen'),
                                  [(root / 'model-q2.json', '-q2'), (root / 'model-q3.json', '-q3')])
                 self.assertEqual(init.models_to_prepare('deepseek'), [(root / 'model-deepseek.json', '-deepseek')])
+
+    def test_variants_of_one_model_share_its_download(self):
+        """Variants whose pack is one model's (/data/pack-q3s) prepare that model once, under its own name."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'server.json').write_text(json.dumps({'models': {
+                'q2': 'server-q2.json', 'q3s-slow': 'server-q3s-slow.json', 'q3s-fast': 'server-q3s-fast.json',
+                'raw': 'server-raw.json'}}))
+            for kind in ('slow', 'fast'):
+                (root / f'server-q3s-{kind}.json').write_text(json.dumps({'engine': {'pack': '/data/pack-q3s'}}))
+            (root / 'server-raw.json').write_text(json.dumps({'args': ['--pack', '/data/pack-q4']}))
+
+            def path(kind, model):
+                return root / (f'{kind}.json' if model == 'qwen' else f'{kind}-{model}.json')
+            with patch.object(init, 'config_path', path):
+                self.assertEqual(init.models_to_prepare('qwen'),
+                                 [(root / 'model-q2.json', '-q2'), (root / 'model-q3s.json', '-q3s'),
+                                  (root / 'model-q4.json', '-q4')])
 
     def test_generic_repository_resolves_revision_and_reuses_preparation(self):
         for files in (['single.gguf'], ['q/part1.gguf', 'q/part2.gguf', 'q/part3.gguf']):

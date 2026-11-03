@@ -17,7 +17,7 @@
     "native": "/data/model-q3/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
     "expert_profile": "/data/pack-q3/expert-profile.bin",
     "mtp": "/data/pack-q3/mtp/rt",
-    "expert_cache": 4300,
+    "expert_cache": "auto",
     "resident_budget_gib": 22,
     "prefill": "auto"
   }
