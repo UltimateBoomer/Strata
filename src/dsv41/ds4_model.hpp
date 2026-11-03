@@ -196,6 +196,8 @@ public:
 
     void save_profile() const;
     const Stats& stats() const;
+    /// The most drafts a round can offer (the drafter's block, under DS4_DSPARK_MAX / --dspark-block; 0: no drafter).
+    int draft_cap() const;
     std::string describe() const;
     /// INFO / VRAM lines for the server's Monitor.
     std::vector<std::string> info_lines() const;

@@ -3056,6 +3056,31 @@ class CancelledRead(unittest.TestCase):
         self.assertEqual([(r["prompt_tokens"], r["prompt_read"]) for r in rows], [(8, 8), (total, 20), (total, None)])
         self.assertEqual(m["totals"]["prompt_tokens"], 8 + 2 * total)
 
+class MtpAcceptance(unittest.TestCase):
+    """The MTP acceptance length: draft_rounds and draft_max as key=value fields on any engine's DONE line (the main
+    engine's after its sixteen positional fields, DeepSeek's after ten); 1 + accepted / rounds, None without rounds."""
+
+    def test_parse_done_draft_fields(self):
+        import serve.server as S
+        e = SimpleNamespace()
+        StrataEngine._parse_done(e, "DONE 73 12000 900.0 80.0 stop 45 68 0 7 9 0 0 0.0 12000 2 chunk=1536 "
+                                    "experts_streamed=0 draft_rounds=24 draft_max=3")
+        self.assertEqual((e.last["draft_rounds"], e.last["draft_max"], e.last["offloaded"]), (24, 3, 2))
+        StrataEngine._parse_done(e, "DONE 73 400 90.0 800.0 stop 45 68 0 0 0 draft_rounds=20 draft_max=7")
+        self.assertEqual((e.last["drafts_accepted"], e.last["hits"], e.last["draft_rounds"]), (45, 0, 20))
+        self.assertNotIn("ram_blobs", e.last)              # (a key=value field is not a positional one)
+        self.assertEqual(S.accept_len(e.last), 3.25)
+        StrataEngine._parse_done(e, "DONE 73 400 90.0 800.0 stop 45 68 0 0 0")
+        self.assertIsNone(S.accept_len(e.last))
+        self.assertIsNone(S.accept_len({"drafts_accepted": 0, "draft_rounds": 0}))
+        self.assertEqual(S.accept_len({"drafts_accepted": 0, "draft_rounds": 5}), 1.0)
+
+    def test_segments_sum_rounds(self):
+        import serve.server as S
+        last = S.request_stats([{"drafts_accepted": 8, "draft_rounds": 4, "draft_max": 3},
+                                {"drafts_accepted": 7, "draft_rounds": 6, "draft_max": 3}])
+        self.assertEqual((last["draft_rounds"], last["draft_max"], S.accept_len(last)), (10, 3, 2.5))
+
 
 class HeldBackArgKeepalive(unittest.TestCase):
     """#1666: with stream_tools a tool call's array or object argument is held until it is whole, so a big one

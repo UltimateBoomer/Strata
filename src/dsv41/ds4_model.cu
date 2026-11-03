@@ -10773,6 +10773,10 @@ bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::str
 std::string Model::slot_identity() const { return p_->slot_identity(); }
 void Model::settle_idle(const std::atomic<bool>& cancel) { p_->cache_settle_idle(cancel); }
 void Model::save_profile() const { p_->save_profile(); }
+int Model::draft_cap() const {
+    const int T = p_->g.n_mtp > 0 ? p_->g.d_block : 0;
+    return p_->max_drafts > 0 ? std::min(T, p_->max_drafts) : T;
+}
 const Stats& Model::stats() const {
     Stats& st = p_->st;
     if (p_->store) {   // (the store keeps its own counters: copied in when asked)

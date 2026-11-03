@@ -1445,7 +1445,8 @@ class StrataEngine:
         self.info = {**info, **self.info}
 
     def _parse_done(self, line):
-        f = line.split()
+        words = line.split()
+        f = [w for w in words if "=" not in w]            # the positional fields; key=value ones may follow any of them
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
                      "decode_ms": float(f[4]), "finish": f[5]}
         if len(f) >= 9:                                   # the conversation cache's fields (engine 0.1.3+)
@@ -1458,9 +1459,11 @@ class StrataEngine:
             self.last.update(prompt_read=int(f[14]))
         if len(f) >= 16:                                  # #588 (engine 0.1.39+): routed experts read over PCIe
             self.last.update(offloaded=int(f[15]))
-        for tok in f[16:]:                                # key=value fields after the positional ones (the prompt's
-            key, eq, value = tok.partition("=")           # first chunk and its streamed expert blobs)
-            if eq and key in ("chunk", "experts_streamed"):
+        # key=value fields after the positional ones: the prompt's first chunk and its streamed expert blobs; the
+        # rounds that offered a draft and the most drafts a round can offer (the MTP acceptance length's)
+        for tok in words[6:]:
+            key, eq, value = tok.partition("=")
+            if eq and key in ("chunk", "experts_streamed", "draft_rounds", "draft_max"):
                 try:
                     self.last[key] = int(value)
                 except ValueError:
@@ -6578,7 +6581,12 @@ class Service:
                                 "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
-                                "drafts_accepted": last.get("drafts_accepted")})
+                                "drafts_accepted": last.get("drafts_accepted"),
+                                # the MTP acceptance length: tokens a drafting round gave, 1 to 1 + draft_max (None:
+                                # no round drafted, or an engine without draft_rounds)
+                                "accept_len": accept_len(last), "draft_rounds": last.get("draft_rounds"),
+                                "draft_max": last.get("draft_max"),
+                                "variant": self.models.active if self.models is not None else None})
                             t = self.totals
                             t["requests"] += 1
                             t["prompt_tokens"] += seen
@@ -6754,6 +6762,15 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
                if last.get("drafts_offered") is not None else {})}
 
 
+def accept_len(last: dict) -> float | None:
+    """The mean tokens a drafting round committed (its accepted drafts and the verified token after them), from the
+    DONE line's drafts_accepted and draft_rounds; None when no round drafted."""
+    rounds = last.get("draft_rounds")
+    if not rounds or last.get("drafts_accepted") is None:
+        return None
+    return round(1 + last["drafts_accepted"] / rounds, 2)
+
+
 def request_stats(segments: list[dict]) -> dict:
     """Keep input/cache accounting at the original API boundary and total native work across continuations."""
     if not segments:
@@ -6764,7 +6781,9 @@ def request_stats(segments: list[dict]) -> dict:
             result[key] = segments[0][key]
         else:
             result.pop(key, None)
-    for key in ("prompt_ms", "decode_ms", "generated", "drafts_offered", "drafts_accepted",
+    if any(segment.get("draft_max") is not None for segment in segments):
+        result["draft_max"] = max(segment.get("draft_max") or 0 for segment in segments)
+    for key in ("prompt_ms", "decode_ms", "generated", "drafts_offered", "drafts_accepted", "draft_rounds",
                 "hits", "lookups", "offloaded", "ram_blobs", "file_blobs", "file_mb", "experts_streamed"):
         if any(segment.get(key) is not None for segment in segments):
             result[key] = sum(segment.get(key) or 0 for segment in segments)

@@ -3570,7 +3570,7 @@ struct Serve {
         std::mt19937_64 rng(smp.seed);
         std::vector<int32_t> hist = ids;
         const auto d0 = Clock::now();
-        long long produced = 0, offered = 0, accepted = 0;
+        long long produced = 0, offered = 0, accepted = 0, rounds = 0;
         const char* finish = "length";
         // greedy requests alone with the MTP block: speculative steps of mtp_d drafts (verified, so the text is the greedy
         // text); sampled ones, and requests beside others, one token at a time
@@ -3633,6 +3633,7 @@ struct Serve {
                 const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop);
                 offered += E.mtp_d;
                 accepted += a;
+                ++rounds;
                 // the state now holds x and every accepted draft, whether or not the answer ends inside them (an end of
                 // answer, max_new): the held tokens say so, so a later request that continues this conversation matches them
                 // (a prompt that has the same tokens next reuses the state, any other reads from the start) and never reads
@@ -3656,8 +3657,9 @@ struct Serve {
         }
         E.sess[(size_t) E.cur].pos = E.pos;
         const double decode_ms = ms_since(d0);
-        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
-                    decode_ms, finish, accepted, offered, reuse, (long long) fresh);
+        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0 0 0 0.0 %lld 0 draft_rounds=%lld draft_max=%d\n", produced,
+                    ids.size(), prompt_ms, decode_ms, finish, accepted, offered, reuse, (long long) fresh, rounds,
+                    spec ? E.mtp_d : 0);
         std::fflush(stdout);
         std::fprintf(stderr, "strata serve: session %d: prompt %zu tokens = %zu reused + %lld read in %.0f ms (%.1f tok/s), "
                      "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld (%s)\n", s, ids.size(), reuse,
