@@ -79,6 +79,7 @@
 #include "strata/core/draft_cap.hpp"
 #endif
 #include "strata/prefill/kva.hpp"
+#include "strata/kernels/route_prior.hpp"
 #include "strata/prefill/kva_floor.hpp"
 #include "strata/prefill/prefill.hpp"
 #if defined(STRATA_PREFILL_MMQ)
@@ -6316,10 +6317,11 @@ int main(int argc, char** argv) {
         if (kc.explicit_on && !strata::prefill::kKvaBackend)
             std::fprintf(stderr, "strata generate: STRATA_KVA is set, but this build has no state-only late-layer path; "
                                  "every prompt is read exactly\n");
+        // (worked out with KVA off too: a request's kva=1 asks for it with the same rules)
+        if (multi_gpu) ke.blocked = "a layer split across GPUs";
+        else if (o.batch > 0) ke.blocked = "batch slots (--batch)";
+        else if (o.peer_device >= 0) ke.blocked = "a peer device (--peer-device)";
         if (kc.on) {
-            if (multi_gpu) ke.blocked = "a layer split across GPUs";
-            else if (o.batch > 0) ke.blocked = "batch slots (--batch)";
-            else if (o.peer_device >= 0) ke.blocked = "a peer device (--peer-device)";
             if (!ke.blocked.empty()) {
                 if (kc.explicit_on)
                     std::fprintf(stderr, "strata generate: KVA (the approximate late-layer prompt read) is off here: %s\n",
@@ -14406,6 +14408,11 @@ int main(int argc, char** argv) {
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
             double req_pipe = -1.0;   // --prefill-pipe for this request (setup's calibration of a layer split)
             int req_aux_cpus = -1;   // aux_cpus=0|1: --aux-cpus for this request (-1 = the start-up value)
+            // keys that change the answers, for this request only (-1: the start-up value): tail_skip=R
+            // (STRATA_ROUTE_TAIL_SKIP), kva=0|1 (STRATA_KVA), and with STRATA_ROUTE_LIVE=1 route_prior=F
+            // (STRATA_ROUTE_PRIOR), route_resident=F and route_resident_ranks=LO-HI (STRATA_ROUTE_RESIDENT(_RANKS))
+            int req_tail_skip = -1, req_kva = -1, req_rr_lo = -1, req_rr_hi = -1;
+            float req_route_prior = -1.0f, req_rr_margin = -1.0f;
             // #2228: img_keys=<hex>,<hex>,... (GENI): each picture's key from the server (its normalized bytes' hash),
             // in prompt order.  With them the conversation cache matches a picture by its key and grid, not by its
             // embedding floats, so a picture encoded again with other bits still matches.  Absent: the embeddings' hash.
@@ -14466,6 +14473,17 @@ int main(int argc, char** argv) {
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "pipe") req_pipe = std::max(0.0, (double) fv);
                     else if (key == "aux_cpus") req_aux_cpus = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
+                    else if (key == "tail_skip") req_tail_skip = std::clamp(std::atoi(tok.c_str() + eq + 1), 0, 9);
+                    else if (key == "kva") req_kva = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
+                    else if (key == "route_prior") req_route_prior = std::max(0.0f, fv);
+                    else if (key == "route_resident") req_rr_margin = std::max(0.0f, fv);
+                    else if (key == "route_resident_ranks") {
+                        int lo = -1, hi = -1;
+                        if (std::sscanf(tok.c_str() + eq + 1, "%d-%d", &lo, &hi) == 2 && 0 <= lo && lo <= hi && hi < 10) {
+                            req_rr_lo = lo;
+                            req_rr_hi = hi;
+                        }
+                    }
                     else if (key == "img_keys") {
                         req_img_keys.clear();
                         const char* q = tok.c_str() + eq + 1;
@@ -14482,6 +14500,28 @@ int main(int argc, char** argv) {
                 }
             }
             strata::prefill::Prefill::set_pipe_request(req_pipe);   // every request sets it: none carries over
+            // the tuning keys that change the answers (a client's choice, serve's "client_tune"): every request sets them
+            // too, to its own value or the start-up one.  Not with --batch: a window mixes the slots' requests.
+            // (the start-up rank: STRATA_ROUTE_TAIL_SKIP or the default set before the first request, read at the first)
+            static const int tail_skip_startup = strata::core::tail_skip_rank();
+            if (o.batch == 0) {
+                strata::core::set_tail_skip_rank(req_tail_skip >= 0 ? req_tail_skip : tail_skip_startup);
+                strata::prefill::kva_request().store(req_kva, std::memory_order_relaxed);
+                if (strata::kernels::LiveRoute* lr = strata::kernels::live_route_host()) {
+                    const strata::kernels::LiveRoute& st = strata::kernels::live_route_startup();
+                    lr->prior = req_route_prior >= 0.0f ? req_route_prior : st.prior;
+                    lr->rr_margin = req_rr_margin >= 0.0f ? req_rr_margin : st.rr_margin;
+                    lr->rr_lo = req_rr_lo >= 0 ? req_rr_lo : st.rr_lo;
+                    lr->rr_hi = req_rr_lo >= 0 ? req_rr_hi : st.rr_hi;
+                } else if (req_route_prior >= 0.0f || req_rr_margin >= 0.0f) {
+                    static bool said = false;
+                    if (!said) {
+                        said = true;
+                        std::fprintf(stderr, "strata serve: route_prior / route_resident keys are ignored: the engine was "
+                                             "started without STRATA_ROUTE_LIVE=1\n");
+                    }
+                }
+            }
             size_t marked_files = 0;
             for (const uint64_t d : req_drops) {   // before anything below matches or parks
                 const size_t marked = conversations.drop_session(d);

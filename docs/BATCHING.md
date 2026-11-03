@@ -349,6 +349,42 @@ restored when it loads again; the session file carries the model's fingerprint, 
 `--no-conversation-cache-keep` clears them at every start. With a `default_model`, after `default_idle_s` (0: never)
 without a request the server goes back to it; an unloaded engine is only pointed at it.
 
+### Variants of one engine: settings per request
+
+Variants that differ only in what the server reads (`"model_name"`, `"aliases"`, `"sampling"`, `"log"`) are one
+engine. A switch between them restarts nothing: the conversation in the engine goes on, the scheduler gives a request
+for either one the turn as it would one for the loaded variant, and they share one `--conversation-cache-dir` folder
+(named after the first of them). `GET /v1/models` lists them all as loaded. What makes them differ is the sampling block:
+its `"strata_tune"` goes on every request (`serve/tune.py`), and its `"client_tune"` lists the `strata_tune` keys a
+request's own `"strata_tune"` may set, over the variant's one by one (absent: every key, as before; `[]`: none). The
+listing's `meta.tune` reports both.
+
+The keys that change the answers, a client's quality-for-speed trade (each one for that request only; a request without
+it runs with the engine's start-up value):
+
+| Key | Engine variable | What it does |
+|---|---|---|
+| `tail_skip` (0-9) | `STRATA_ROUTE_TAIL_SKIP` | a missed expert every token of a verify window routes at this rank or lower is neither copied nor computed; 0 off |
+| `kva` (true/false) | `STRATA_KVA` | the approximate late-layer read of a long cold prompt |
+| `route_prior` (>= 0) | `STRATA_ROUTE_PRIOR` | residency-biased routing: the logit bonus of an expert already in VRAM; 0 off |
+| `route_resident` (>= 0), `route_resident_ranks` (`"lo-hi"`) | `STRATA_ROUTE_RESIDENT(_RANKS)` | a missed tail expert swapped for the best resident one within this margin; 0 off |
+
+`route_prior` and `route_resident` run inside the captured verify graphs, so the engine needs `STRATA_ROUTE_LIVE=1`
+(`"engine_env": {"route_live": 1}`): both kernels are then in every window graph and read the request's values from
+mapped host memory; one whose value is 0 writes nothing, so a request that sets neither gets the bits of an engine
+without them. Without it the keys are ignored (said once). None of the keys applies with `--batch`. A conversation
+continued under other settings keeps the cells read under the earlier ones.
+
+The speed keys (`pcie_frac`, `spec_min_p`, `prefill_pipe`, `aux_cpus`) are setup's calibration's; keep them out of
+`"client_tune"` and set them in the variant's `"strata_tune"`.
+
+```json
+"models": {"q3s-slow": "server-q3s-slow.json", "q3s-fast": "server-q3s-fast.json"}
+// server-q3s-fast.json: the same engine as q3s-slow, residency-biased routing on, the other trades a client's
+{"model_name": "...-fast", "engine": {...the same...},
+ "sampling": {"strata_tune": {"route_prior": 1.5}, "client_tune": ["tail_skip", "kva", "route_resident", "route_resident_ranks"]}}
+```
+
 A start reads each variant's experts blob by blob from the pack: the GPU cache's slots from the profile, then the RAM
 copy. `STRATA_LOAD_IMAGE=<dir>` in a variant's `"env"` (Linux; one folder per variant) keeps those bytes as two files
 in the order they are loaded (`vram.img`, `ram.img`), written after the first start and read sequentially, unbuffered,

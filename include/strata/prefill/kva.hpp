@@ -33,6 +33,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -191,6 +192,27 @@ inline KvaConfig kva_config_from_env() {
 /// The process's KVA settings, parsed once (the engine's own options are parsed once too).
 inline const KvaConfig& kva_config() {
     static const KvaConfig c = kva_config_from_env();
+    return c;
+}
+
+/// A request's KVA choice (serve: kva=0|1), over STRATA_KVA for the reads of that request: -1 = STRATA_KVA's.  The serve
+/// loop sets it for every request, so none carries over.
+inline std::atomic<int>& kva_request() {
+    static std::atomic<int> r{-1};
+    return r;
+}
+
+/// Is KVA on for the read starting now: the request's choice, else STRATA_KVA.  A read that is on still goes through
+/// KvaConfig::decline (a continuation, a short prompt, a layer split, ... read exactly).
+inline bool kva_on_now() {
+    const int r = kva_request().load(std::memory_order_relaxed);
+    return r < 0 ? kva_config().on : (kKvaBackend && r == 1);
+}
+
+/// kva_config() with `on` as kva_on_now() says.
+inline KvaConfig kva_config_now() {
+    KvaConfig c = kva_config();
+    c.on = kva_on_now();
     return c;
 }
 

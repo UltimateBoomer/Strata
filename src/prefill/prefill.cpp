@@ -2946,7 +2946,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const int64_t LB = stage_lb_, LE = stage_le_;
     // STRATA_KVA: the approximate-prefix plan of this run, if it qualifies (a cold read of one long prompt, one
     // stage, no capture).  Positions [0, kva_frontier) are approximated in the layers at and after the split.
-    const KvaConfig& kva = kva_config();
+    const KvaConfig kva = kva_config_now();   // STRATA_KVA, or this request's kva= key
     const KvaEngine& kva_eng = kva_engine();
     const int64_t kva_suffix = kva.effective_suffix();
     bool kva_routine = false;
@@ -5984,7 +5984,7 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
     // features of run_impl this walk does not carry: the DFlash2 drafter's prompt taps, and KVA's approximate late layers
     // (a prompt that wants them takes the chunk-major path, which has both)
     if (!tap_layers_.empty()) { why = "the DFlash2 drafter's prompt taps"; return 0; }
-    if (kva_config().on) { why = "STRATA_KVA is on"; return 0; }
+    if (kva_on_now()) { why = "STRATA_KVA is on"; return 0; }
     if (stop_at_chunk) { why = "a batch read that yields at chunk boundaries"; return 0; }
     if (force_chunk_ > 0) { why = "a --prefill-pipe plan sets the chunks of this read"; return 0; }   // (left set for run_impl)
 #if STRATA_EXPERT_NIBBLE_BUILT   // the 4-bit expert slots (STRATA_EXPERT_NIBBLE) are gathered for MMQ only by run_impl

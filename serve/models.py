@@ -26,6 +26,12 @@ engine removes the oldest file first when it needs room, whichever variant's).  
 "default_idle_s" (0: never) without a request (an unloaded engine is only pointed at it); the server starts with
 `startup` (--variant, $STRATA_VARIANT), else the default model, else the first variant.
 
+Variants that differ only in the keys the server reads (SERVER_ONLY_KEYS: "model_name", "aliases", "sampling", "log")
+are one engine (engine_identity): a model's settings for the engine are the run config's strata_tune, sent on every
+request (serve/tune.py), so "q3s-fast" and "q3s-slow" can be one IQ3_S engine with two sampling blocks.  The scheduler
+gives a request for either the turn as it would a request for the loaded variant, and a switch between them restarts
+nothing (Service.switch_model): the conversation in the engine goes on.
+
 A variant can also be another model family: its "arch" (the GGUF architecture: "deepseek41") differs from the
 common config's (default "qwen4exp").  It names its own "tokenizer" and usually its own "exe" (strata-dsv41),
 "engine_ready_s" and "vision" section (FAMILY_KEYS), and it takes none of the common config's engine settings ("args",
@@ -55,6 +61,8 @@ VARIANT_KEYS = frozenset({"model_name", "aliases", "args", "env", "sampling", "l
 # the common config's engine settings, which a variant of another family does not take
 ENGINE_KEYS = ("args", "env", "vision")
 DEFAULT_ARCH = "qwen4exp"
+# the keys only the server reads: variants that differ in nothing else run on one engine (Variant.engine)
+SERVER_ONLY_KEYS = frozenset({"model_name", "aliases", "sampling", "log"})
 # the common config's switching keys (not part of any variant's run config)
 SWITCH_KEYS = frozenset({"models", "default_model", "default_idle_s", "model_max_wait_s", "model_min_resident_s",
                          "model_preempt", "unknown_model", "model_session_dir"})
@@ -67,6 +75,13 @@ def arch_of(cfg: dict) -> str:
     return cfg.get("arch") or DEFAULT_ARCH
 
 
+def engine_identity(cfg: dict) -> str:
+    """What makes a variant's engine: its run config without the keys only the server reads (SERVER_ONLY_KEYS).  Two
+    variants with the same one are one engine with two names and sampling blocks (the strata_tune of serve/tune.py
+    goes on each request), so a switch between them is no restart."""
+    return json.dumps({k: v for k, v in cfg.items() if k not in SERVER_ONLY_KEYS}, sort_keys=True, default=str)
+
+
 class UnknownModel(ValueError):
     """A request named a model no variant has, with "unknown_model": "error"."""
 
@@ -77,6 +92,7 @@ class Variant:
     cfg: dict                                       # its whole run config (the common one with its own keys over it)
     model_name: str = ""
     aliases: list = field(default_factory=list)
+    engine: str = ""                                # its engine settings (engine_identity): equal ones share one engine
     spawn: tuple | None = None                      # the engine's start (StrataEngine.spawn), set by the server
     ready_s: float | None = None                    # its "engine_ready_s" (None: the server's default), set by the server
 
@@ -133,6 +149,13 @@ class Models:
         if name is None and len({v.arch for v in self.variants.values()}) > 1:
             name = self.committed or self.active
         return name
+
+    def same_engine(self, a: str | None, b: str | None) -> bool:
+        """Variants `a` and `b` run on one engine (the same one, or equal engine settings): no restart between them."""
+        if a is None or b is None:
+            return a == b
+        va, vb = self.variants.get(a), self.variants.get(b)
+        return a == b or (va is not None and vb is not None and va.engine == vb.engine)
 
     def all_names(self) -> list[str]:
         return [n for v in self.variants.values() for n in dict.fromkeys(v.names())]
@@ -241,7 +264,8 @@ def keeps_parks(args: list) -> bool:
 def separate_cache_dirs(variants: dict) -> None:
     """Variants that share a --conversation-cache-dir each get <dir>/<variant> instead, and <dir> as their
     --conversation-cache-group, so the budget covers them together (in place; a group a variant sets stays).  One that
-    has the folder alone keeps it, and its budget covers it alone."""
+    has the folder alone keeps it, and its budget covers it alone.  Variants of one engine (engine_identity: they differ
+    only in the server's keys) are one engine and share <dir>/<the first of them>."""
     by_dir: dict[str, list] = {}
     for v in variants.values():
         args = v.cfg.get("args")
@@ -249,11 +273,15 @@ def separate_cache_dirs(variants: dict) -> None:
         if at is not None:
             by_dir.setdefault(os.path.normpath(at[1]), []).append((v, at))
     for folder, shared in by_dir.items():
-        if len(shared) < 2:
+        # variants of one engine (engine_identity) are one engine: they share the folder of the first of them
+        first: dict[str, str] = {}
+        for v, _ in shared:
+            first.setdefault(engine_identity(v.cfg), v.name)
+        if len(first) < 2:
             continue
         for v, (i, value) in shared:
             args = list(v.cfg["args"])
-            own = os.path.join(value, v.name)
+            own = os.path.join(value, first[engine_identity(v.cfg)])
             args[i] = own if args[i] == value else f"{CACHE_DIR}={own}"
             if not any(isinstance(a, str) and a.startswith(CACHE_GROUP) for a in args):
                 args += [CACHE_GROUP, value]
@@ -288,6 +316,8 @@ def load(cfg: dict, config_path: str | None, startup: str | None = None) -> tupl
             raise ValueError(f"models.{name}.aliases must be a list of names")
         variants[name] = Variant(name, vcfg, vcfg.get("model_name") or name, list(aliases))
     separate_cache_dirs(variants)
+    for v in variants.values():
+        v.engine = engine_identity(v.cfg)
     seen: dict[str, str] = {}
     for v in variants.values():
         for n in dict.fromkeys(v.names()):

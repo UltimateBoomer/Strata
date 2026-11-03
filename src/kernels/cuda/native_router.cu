@@ -21,6 +21,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "strata/kernels/native_router.hpp"
+#include "strata/kernels/route_prior.hpp"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cfloat>
@@ -264,9 +265,16 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
 // and the softmax is the same expression.
 __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
                                  const int32_t* __restrict__ res, int n_tok, float margin, int lo, int hi,
-                                 unsigned long long* __restrict__ stats) {
+                                 unsigned long long* __restrict__ stats, const LiveRoute* live) {
     const int t = blockIdx.x;
     if (t >= n_tok) return;
+    if (live != nullptr) {   // STRATA_ROUTE_LIVE: the request's values; off writes nothing
+        const volatile LiveRoute* lv = live;
+        margin = lv->rr_margin;
+        lo = lv->rr_lo;
+        hi = lv->rr_hi;
+        if (!(margin > 0.0f)) return;
+    }
     const int lane = (int) threadIdx.x;
     const float* l = logits + (size_t) t * 512;
     int32_t* id = ids + (size_t) t * 10;
@@ -322,7 +330,15 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
                            int rank_lo, int rank_hi, unsigned long long* stats, void* stream) {
     if (!stream || n_tok < 1 || !res_layer) throw std::invalid_argument("native_route_resident: bad arguments");
     route_resident_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(
-        logits, ids, weights, res_layer, n_tok, margin, rank_lo, rank_hi, stats);
+        logits, ids, weights, res_layer, n_tok, margin, rank_lo, rank_hi, stats, nullptr);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_route_resident_live(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
+                                const LiveRoute* live, unsigned long long* stats, void* stream) {
+    if (!stream || n_tok < 1 || !res_layer || !live) throw std::invalid_argument("native_route_resident_live: bad arguments");
+    route_resident_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(
+        logits, ids, weights, res_layer, n_tok, 0.0f, 6, 9, stats, live);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

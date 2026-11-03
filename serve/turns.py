@@ -467,7 +467,9 @@ class TurnScheduler:
         return s
 
     def _eligible(self, t: Ticket, model: str | None) -> bool:
-        return t.turn.model is None or t.turn.model == model
+        # a variant of the same engine (serve/models.py: Models.same_engine) needs no switch: it is the loaded one
+        return t.turn.model is None or t.turn.model == model or \
+            (self.models is not None and self.models.same_engine(t.turn.model, model))
 
     def _by_model(self, order: list[Ticket]) -> list[Ticket]:
         """The waiting tickets that may take the turn with model variants (the module's docstring; the caller holds

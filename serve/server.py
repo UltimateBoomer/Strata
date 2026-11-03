@@ -67,6 +67,7 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthro
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import engine_fields  # noqa: E402
+from serve import tune as tune_mod  # noqa: E402
 from serve import parkfiles  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from strata_control import engine_component  # noqa: E402
@@ -1550,23 +1551,9 @@ class StrataEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
-        # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
-        tune = sampling.get("strata_tune")
-        if isinstance(tune, dict):
-            for k in ("pcie_frac", "spec_min_p"):
-                v = tune.get(k)
-                if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
-                    keys += f" {k}={float(v)!r}"
-            # a layer split's prompt chunks (--prefill-pipe): 0 off, 1 evened out, > 1 the rig's b/a in tokens
-            v = tune.get("prefill_pipe")
-            if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 262144.0:
-                keys += f" pipe={float(v)!r}"
-            # --aux-cpus for this request: 1 puts the engine's threads that are neither pool workers nor the host on the
-            # spare CPUs, 0 leaves them where they were created (true/false or 1/0; the engine started without a spare CPU
-            # ignores a 1).  Anything else is not sent.
-            ac = tune.get("aux_cpus")
-            if isinstance(ac, bool) or (isinstance(ac, (int, float)) and ac in (0, 1)):
-                keys += f" aux_cpus={int(ac)}"
+        # "strata_tune" (serve/tune.py): engine settings for this request only, without a restart - setup's calibration
+        # measures the speed ones through it, and the answer ones (tail_skip, kva, route_prior, ...) are a client's trade
+        keys += tune_mod.engine_keys(sampling.get("strata_tune"))
         # "strata_checkpoint": false - a one-shot call (a classification, a probe) whose turn no later request
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
@@ -5127,6 +5114,20 @@ class Service:
                 self.ensure_loaded()
             return
         old, t0 = m.active, time.monotonic()
+        v = m.variants[name]
+        if m.same_engine(old, name):
+            # one engine with two names (serve/models.py: engine_identity): its settings come with each request
+            # (strata_tune), so nothing restarts and the conversation in the engine goes on
+            self.engine.spawn = v.spawn
+            set_ready_timeout(v.ready_s)
+            self.apply_variant(v)
+            m.active, m.committed = name, None
+            m.switched(name, time.monotonic() - t0)
+            print(f"[strata] the model is now {name} (the engine {old} runs, with {name}'s settings per request)",
+                  flush=True)
+            if load:
+                self.ensure_loaded()
+            return
         if self.loaded():
             print(f"[strata] switching the model from {old} to {name} ...", flush=True)
             self._save_variant_session(old)
@@ -5134,7 +5135,6 @@ class Service:
         else:
             print(f"[strata] the model is now {name} (it loads with the next request)" if not load else
                   f"[strata] loading the model {name} ...", flush=True)
-        v = m.variants[name]
         if self.family_of(old) is not self.family_of(name):
             # another family's engine: the other families' picture readers stop (they hold RAM or VRAM that engine
             # needs); the new family's starts with its load (ensure_loaded: _vision_down)
@@ -5252,14 +5252,15 @@ class Service:
         m, loaded, out = self.models, self.loaded(), []
         for v in m.variants.values():
             modal = ["text", "image"] if self.family_of(v.name).vision is not None else ["text"]   # its family's reader
-            active = v.name == m.active
+            active = m.same_engine(v.name, m.active)     # a variant of the loaded engine is loaded too
             args = v.spawn[1] if v.spawn else []
             ctx = self.reported_ctx() if active and loaded else \
                 int(args[args.index("--max-context") + 1]) if "--max-context" in args else None
             names = [n for n in dict.fromkeys([v.name, *v.aliases]) if n != v.model_name]
             entry = {"id": v.model_name, "object": "model",
                      "status": {"value": "loaded" if active and loaded else "unloaded"},
-                     "meta": {"n_ctx": ctx, "variant": v.name, "default": v.name == m.default},
+                     "meta": {"n_ctx": ctx, "variant": v.name, "default": v.name == m.default,
+                              **variant_tune_meta(v.cfg)},
                      "architecture": {"input_modalities": modal, "output_modalities": ["text"]},
                      **({"aliases": names} if names else {})}
             out += [entry, *({**entry, "id": x, "alias_of": v.model_name} for x in names)]
@@ -6059,12 +6060,23 @@ class Service:
         Turn with "turn_slice_s" (serve/turns.py), else None."""
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
+        sampling_req = sampling
         defaults = {**model_card_sampling(self.model_arch, thinking),
                     **self.variant_sampling(call if call is not None else getattr(self.request_turn, "turn", None)),
                     **self.shared}
+        client_tune = defaults.pop("client_tune", None)
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        if sampling and (client_tune is not None or isinstance(defaults.get("strata_tune"), dict)):
+            # "strata_tune" key by key over the config's, and only the keys "client_tune" lets a request set
+            tune, dropped = tune_mod.merge(defaults.get("strata_tune"), (sampling_req or {}).get("strata_tune"), client_tune)
+            if dropped:
+                print(f"[strata] strata_tune: {', '.join(dropped)} left out (this model lets a request set "
+                      f"{', '.join(client_tune) or 'none'})", flush=True)
+            sampling = {k: v for k, v in sampling.items() if k != "strata_tune"}
+            if tune:
+                sampling["strata_tune"] = tune
         if sampling and ENGINE_SESSION_KEY in sampling:  # the server's own key (engine_session), never a client's
             sampling = {k: v for k, v in sampling.items() if k != ENGINE_SESSION_KEY}
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
@@ -9355,10 +9367,16 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
             if not number or value != int(value) or value <= 0:
                 raise SystemExit(f"[strata] config sampling.seed={value!r}: expected a positive integer")
             out[key] = int(value)
-        elif key == "strata_tune":           # a saved tuning's per-request settings (strata_control/presets.py)
-            if not isinstance(value, dict):
-                raise SystemExit(f"[strata] config sampling.strata_tune={value!r}: expected an object")
-            out[key] = {k: v for k, v in value.items() if k in ("pcie_frac", "spec_min_p", "aux_cpus")}
+        elif key == "strata_tune":           # a saved tuning's per-request settings (strata_control/presets.py, serve/tune.py)
+            try:
+                out[key] = tune_mod.clean(value, "sampling.strata_tune")
+            except ValueError as e:
+                raise SystemExit(f"[strata] config {e}") from None
+        elif key == "client_tune":           # the strata_tune keys a request may set (serve/tune.py)
+            try:
+                out[key] = tune_mod.clean_client(value, "sampling.client_tune")
+            except ValueError as e:
+                raise SystemExit(f"[strata] config {e}") from None
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
                 raise SystemExit(f"[strata] config sampling.experimental_speed_projection={value!r}: expected true or "
@@ -9469,6 +9487,18 @@ def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bo
         raise
     return sp.SplitEngine(engines["prefill"], engines["decode"], min_tokens=spec["min_prompt_tokens"], work_dir=work,
                           arena_file=arena)
+
+
+def variant_tune_meta(cfg: dict) -> dict:
+    """GET /v1/models: a variant's strata_tune (serve/tune.py) and the keys a request may set, when its sampling names
+    them: {"tune": {"settings": {...}, "client": [...]}}."""
+    sampling = cfg.get("sampling") if isinstance(cfg.get("sampling"), dict) else {}
+    out = {}
+    if isinstance(sampling.get("strata_tune"), dict):
+        out["settings"] = dict(sampling["strata_tune"])
+    if isinstance(sampling.get("client_tune"), list):
+        out["client"] = list(sampling["client_tune"])
+    return {"tune": out} if out else {}
 
 
 def check_request_sampling(req) -> None:

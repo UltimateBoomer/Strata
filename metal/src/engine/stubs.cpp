@@ -309,6 +309,12 @@ namespace strata::kernels { void resident_plan(const int32_t * p0, int p1, int p
 namespace strata::kernels { void rms_norm_weighted(float * p0, const float * p1, int64_t p2, int64_t p3, float p4, void * p5) { strata::metal_engine::missing("strata::kernels::rms_norm_weighted"); } }
 namespace strata::kernels { void rope_neox_apply(const float * p0, float * p1, int64_t p2, int p3, int p4, const float * p5, const float * p6, const int * p7, void * p8) { strata::metal_engine::missing("strata::kernels::rope_neox_apply"); } }
 namespace strata::kernels { void route_prior_top10(const float * p0, const int32_t * p1, float p2, int32_t * p3, float * p4, int p5, void * p6) { strata::metal_engine::missing("strata::kernels::route_prior_top10"); } }
+// STRATA_ROUTE_LIVE: no live routing block on Metal (the verifier then takes the start-up values, as before)
+namespace strata::kernels { LiveRoute* live_route_host() { return nullptr; } }
+namespace strata::kernels { const LiveRoute* live_route_device() { return nullptr; } }
+namespace strata::kernels { LiveRoute& live_route_startup() { static LiveRoute r; return r; } }
+namespace strata::kernels { void route_prior_top10_live(const float * p0, const int32_t * p1, const LiveRoute * p2, int32_t * p3, float * p4, int p5, void * p6) { strata::metal_engine::missing("strata::kernels::route_prior_top10_live"); } }
+namespace strata::kernels { void native_route_resident_live(const float * p0, int32_t * p1, float * p2, const int32_t * p3, int p4, const LiveRoute * p5, unsigned long long * p6, void * p7) { strata::metal_engine::missing("strata::kernels::native_route_resident_live"); } }
 namespace strata::kernels { void router_top10(const float * p0, int p1, int p2, int p3, int * p4, float * p5, void * p6) { strata::metal_engine::missing("strata::kernels::router_top10"); } }
 namespace strata::kernels { void row_top_prob(const float * p0, int p1, int p2, const int32_t * p3, float * p4, void * p5) { strata::metal_engine::missing("strata::kernels::row_top_prob"); } }
 namespace strata::kernels { void row_top_prob_split(const float * p0, int p1, int p2, const int32_t * p3, float * p4, void * p5, void * p6) { strata::metal_engine::missing("strata::kernels::row_top_prob_split"); } }
