@@ -30,3 +30,8 @@ strata-*.json
 strata-*.txt
 run-*.sh
 run-*.bat
+
+# fork: the deployment's machine-local settings (deploy/local)
+deploy/*/mise.local.toml
+deploy/*/.env
+deploy/*/.dev/

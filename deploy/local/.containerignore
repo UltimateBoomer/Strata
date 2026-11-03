@@ -1,0 +1,8 @@
+.git
+.agents
+.codex
+.aws
+__pycache__
+tests
+.env
+.dev
