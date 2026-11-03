@@ -228,8 +228,8 @@ STRATA_BIND_ADDRESS=0.0.0.0 HIP_ARCHITECTURES=gfx1101 make up
 make logs
 ```
 
-Builds upload this checkout as the build context and compile on the remote
-host, so set `HIP_ARCHITECTURES` for its GPU. `make up` also imports `config/`
+Builds upload the repository (the working tree, two directories up) as the
+build context and compile on the remote host, so set `HIP_ARCHITECTURES` for its GPU. `make up` also imports `config/`
 into the remote `strata-local-config` volume. `STRATA_BIND_ADDRESS`
 names a remote host address; without it the server is reachable only from the
 remote host itself. `make secrets` decrypts the credentials here
@@ -425,13 +425,20 @@ Compose accepts these environment overrides (or an ignored `.env` file):
 | `BUILD_JOBS` | `8` | Parallel compile jobs; lower it to limit compiler memory use |
 | `STRATA_VERIFY_EXISTING` | `0` | Set to `1` to checksum existing GGUFs during initialization |
 
-The image builds Strata from our fork,
-[UltimateBoomer/Strata](https://github.com/UltimateBoomer/Strata), at the commit
-in the `Containerfile`'s `STRATA_REVISION`: upstream
-[Niko1221/Strata](https://github.com/Niko1221/Strata) v0.2.2 plus the disk-backed
-conversation cache described above. To change the engine, push a commit to the fork and update
-`STRATA_REVISION` (or pass `--build-arg STRATA_REVISION=...`). The llama.cpp
-commit is the one that Strata revision pins in `third_party/ggml/VERSION.txt`.
+This directory lives in our fork,
+[UltimateBoomer/Strata](https://github.com/UltimateBoomer/Strata) (upstream
+[Niko1221/Strata](https://github.com/Niko1221/Strata) plus the features described
+above), at `deploy/local/`; it was the separate strata-local repository until
+its history was merged in as a subtree. The image builds the fork's working tree as it is, uncommitted
+changes included, so a change is tested with `make up` before it is committed or
+pushed. The `Containerfile` copies the engines' sources (`CMakeLists.txt`,
+`cmake/`, `include/`, `src/`, `third_party/`, `tools/`, `tests/`) before compiling
+them and the rest of the tree after, so a change to the server or the console
+rebuilds in seconds and only an engine change recompiles. The image is labelled
+with the commit (`org.opencontainers.image.revision`, `-dirty` for uncommitted
+changes), and the DeepSeek engine's `--version` is the last commit to the engines'
+sources. The llama.cpp commit is the one the checkout pins in
+`third_party/ggml/VERSION.txt`.
 The ROCm 7.0.2 development image tag is not digest pinned.
 hipBLAS, rocBLAS and hipBLASLt development packages are
 installed inside the image; the base image's HIP compiler alone is insufficient

@@ -3,11 +3,14 @@ name: strata-local
 x-runtime: &runtime
   image: localhost/strata-local:hip
   build:
-    context: .
-    dockerfile: Containerfile
+    # The repository root: the image builds the working tree (uncommitted changes included), not a pushed commit.
+    context: ../..
+    dockerfile: deploy/local/Containerfile
     args:
       HIP_ARCHITECTURES: "${HIP_ARCHITECTURES:-gfx1101}"
       BUILD_JOBS: "${BUILD_JOBS:-8}"
+      STRATA_BUILD_ID: "${STRATA_BUILD_ID:-unknown}"
+      STRATA_COMMIT: "${STRATA_COMMIT:-unknown}"
   platform: linux/amd64
   # A file log, not journald: a rootless system user (UID < 1000) cannot read its containers' journald entries.
   logging:

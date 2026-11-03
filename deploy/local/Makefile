@@ -7,6 +7,13 @@ STRATA_MODEL ?= qwen
 export STRATA_MODEL
 STRATA_VARIANT ?=
 export STRATA_VARIANT
+# Image build arguments (compose.yaml): the checkout's commit, and the last commit to the engines' sources (the
+# Containerfile's engine steps), each with -dirty when the working tree changes them.
+ENGINE_SOURCES := CMakeLists.txt cmake include src third_party tools tests
+git_id = $(shell cd ../.. && echo "$$(git log -1 --format=%h $(1))$$(git status --porcelain $(1) | grep -q . && echo -dirty)")
+STRATA_COMMIT ?= $(call git_id,)
+STRATA_BUILD_ID ?= $(call git_id,-- $(ENGINE_SOURCES))
+export STRATA_COMMIT STRATA_BUILD_ID
 
 .PHONY: set-api-key set-hf-token migrate-keyring-secrets secrets config pull-config build init ports up down logs calibrate tune check
 set-api-key:
