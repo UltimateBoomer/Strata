@@ -1,0 +1,43 @@
+{
+  "repository": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+  "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",
+  "files": [
+    "IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+    "IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf"
+  ],
+  "vision_file": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+  "prepare": [
+    [
+      "iq_pack.py",
+      "--gguf",
+      "{first_file}",
+      "--out",
+      "{pack}",
+      "--experts-bin"
+    ],
+    ["mtp_fetch.py", "fetch", "--out", "{pack}/mtp"],
+    ["mtp_fetch.py", "verify", "--out", "{pack}/mtp"],
+    [
+      "mtp_pack.py",
+      "--src",
+      "{pack}/mtp",
+      "--experts",
+      "q2_0",
+      "--out",
+      "{pack}/mtp/mtp-q2_0.gguf"
+    ],
+    [
+      "mtp_rt.py",
+      "--gguf",
+      "{pack}/mtp/mtp-q2_0.gguf",
+      "--out",
+      "{pack}/mtp/rt"
+    ]
+  ],
+  "copies": [
+    {
+      "source": "{root}/data/expert-profile.bin",
+      "target": "{pack}/expert-profile.bin"
+    }
+  ]
+}

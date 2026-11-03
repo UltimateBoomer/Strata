@@ -1,0 +1,44 @@
+{
+  "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+  "revision": "38bb39ee97821de2c9009abb7e93950eec396e66",
+  "files": [
+    "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+    "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf",
+    "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf",
+    "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf"
+  ],
+  "prepare": [
+    [
+      "iq_pack.py",
+      "--gguf",
+      "{first_file}",
+      "--out",
+      "{pack}",
+      "--compat-bf16"
+    ],
+    ["mtp_fetch.py", "fetch", "--out", "{pack}/mtp"],
+    ["mtp_fetch.py", "verify", "--out", "{pack}/mtp"],
+    [
+      "mtp_pack.py",
+      "--src",
+      "{pack}/mtp",
+      "--experts",
+      "q2_0",
+      "--out",
+      "{pack}/mtp/mtp-q2_0.gguf"
+    ],
+    [
+      "mtp_rt.py",
+      "--gguf",
+      "{pack}/mtp/mtp-q2_0.gguf",
+      "--out",
+      "{pack}/mtp/rt"
+    ]
+  ],
+  "copies": [
+    {
+      "source": "{root}/data/expert-profile.bin",
+      "target": "{pack}/expert-profile.bin"
+    }
+  ]
+}

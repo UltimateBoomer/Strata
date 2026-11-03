@@ -1,0 +1,8 @@
+{
+  "network": {
+    "allowedDomains": [
+      "pi.dev",
+      "raw.githubusercontent.com"
+    ]
+  }
+}

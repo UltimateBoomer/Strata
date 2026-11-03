@@ -1,0 +1,22 @@
+{
+  "arch": "deepseek41",
+  "exe": "/opt/strata/engine/strata-dsv41",
+  "tokenizer": "/data/pack-deepseek/tokenizer",
+  "model_name": "deepseek-v4.1-flash",
+  "log": "/data/strata-deepseek.log",
+  "engine_ready_s": 3600,
+  "engine_env": {
+    "ds4_hipk": 1
+  },
+  "env": {
+    "DS4_FAST_ATTN": "1",
+    "DS4_STORE_GB": "22"
+  },
+  "engine": {
+    "pack": "/data/pack-deepseek",
+    "max_context": 1000000,
+    "eos": 1,
+    "dspark": "auto",
+    "dspark_conf": 0.65
+  }
+}

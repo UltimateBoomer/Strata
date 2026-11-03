@@ -1,0 +1,77 @@
+name: strata-local
+
+x-runtime: &runtime
+  image: localhost/strata-local:hip
+  build:
+    context: .
+    dockerfile: Containerfile
+    args:
+      HIP_ARCHITECTURES: "${HIP_ARCHITECTURES:-gfx1101}"
+      BUILD_JOBS: "${BUILD_JOBS:-8}"
+  platform: linux/amd64
+  # A file log, not journald: a rootless system user (UID < 1000) cannot read its containers' journald entries.
+  logging:
+    driver: k8s-file
+  volumes:
+    - strata-data:/data
+    - strata-config:/config:ro
+
+services:
+  model-init:
+    <<: *runtime
+    restart: "no"
+    entrypoint: [python, /usr/local/lib/strata-local/model-init.py]
+    environment:
+      STRATA_MODEL: "${STRATA_MODEL:-qwen}"
+      STRATA_VERIFY_EXISTING: "${STRATA_VERIFY_EXISTING:-0}"
+    secrets:
+      - source: strata-local-hf-token
+        target: hf_token
+
+  strata-server:
+    <<: *runtime
+    restart: unless-stopped
+    # The engine parks the conversation it holds as it stops (kept for the next start); the server allows it 20 s
+    # before terminating it, so the 10 s default would kill it first.
+    stop_grace_period: 60s
+    depends_on:
+      model-init:
+        condition: service_completed_successfully
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    security_opt:
+      - label=disable
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "${STRATA_BIND_ADDRESS:-127.0.0.1}:${STRATA_PORT:-9931}:8080"
+    environment:
+      STRATA_MODEL: "${STRATA_MODEL:-qwen}"
+      # With model variants (config/server.json "models"): the one to start with; empty = its default_model
+      STRATA_VARIANT: "${STRATA_VARIANT:-}"
+      HIP_VISIBLE_DEVICES: "${STRATA_GPU:-0}"
+    secrets:
+      - source: strata-local-api-key
+        target: strata_api_key
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 600s
+      retries: 3
+
+volumes:
+  strata-data:
+  # Filled from config/ by make config, so it also works with a remote Podman.
+  strata-config:
+    name: strata-local-config
+    external: true
+
+secrets:
+  strata-local-api-key:
+    external: true
+  strata-local-hf-token:
+    external: true
