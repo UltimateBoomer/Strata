@@ -92,6 +92,7 @@ async function api(path, body) {
 // ------------------------------------------------------------------ Monitor: the metric cards
 const METRICS = [
   {key: "speed", label: "Speed", icon: "gauge"},
+  {key: "mtp", label: "MTP accept", icon: "activity", tone: "info"},
   {key: "gpu", label: "GPU load", icon: "gpu", tone: ""},
   {key: "vram", label: "VRAM", icon: "layers"},
   {key: "temp", label: "GPU temp", icon: "thermometer", tone: "warn"},
@@ -244,6 +245,18 @@ function renderMonitor(m) {
   setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s", live.state === "reading" ? "Prefill now" : last ? "Prefill last request" : "Prefill");
   spark("sp-speed", h.tok_s);
   spark("sp-prefill", h.prefill_tok_s_mean);
+  // MTP acceptance length: the tokens a drafting round gave (accepted drafts + the verified one), 1 to 1 + the most
+  // drafts a round holds; the loaded variant's requests only
+  const active = m.models ? m.models.active : undefined;
+  const drafted = requests.filter((r) => r.accept_len != null && (active === undefined || r.variant === active));
+  const top = drafted.length && drafted[0].draft_max != null ? drafted[0].draft_max + 1
+    : eng.spec ? Math.max(1, eng.mtp_max || eng.spec) : null;
+  const acc = drafted.reduce((a, r) => a + (r.accept_len - 1) * (r.draft_rounds || 0), 0);
+  const rounds = drafted.reduce((a, r) => a + (r.draft_rounds || 0), 0);
+  setMetric("mtp", drafted.length ? fmt(drafted[0].accept_len, 1) : null, top ? `/ ${top}` : "",
+            drafted.length ? `Last request${rounds ? ` · ${fmt(1 + acc / rounds, 1)} over ${fmt(drafted.length)}` : ""}`
+            : top ? "No drafts yet" : "No draft layer");
+  spark("sp-mtp", drafted.map((r) => r.accept_len).reverse(), top || 1);
   setMetric("gpu", hw.gpu_util == null ? null : fmt(hw.gpu_util), "%", st.gpu_name || "");
   spark("sp-gpu", h.gpu_util, 100);
   setMetric("vram", hw.gpu_mem_used == null ? null : gb(hw.gpu_mem_used), hw.gpu_mem_total ? `/ ${gb(hw.gpu_mem_total, 0)} GB` : "GB",

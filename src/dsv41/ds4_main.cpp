@@ -8,9 +8,10 @@
 //
 // --serve speaks what serve/server.py's StrataEngine expects: INFO lines, then `READY <context> stop`; per request
 // `GEN <max_new> [key=value ...] <id,id,...>` answered by `T <id>` lines and `DONE <generated> <prompt> <prompt ms>
-// <decode ms> <stop|length|cancel> 0 0 <reused> 0 0`; `STOP` ends a request early, `QUIT` the engine.  A prompt that
-// continues the state (the conversation so far) reuses it; one that only shares the last prompt's start goes back to
-// that prompt's end; anything else starts over.  `GENI <max_new> [keys] <file> <ids>` carries the prompt's pictures
+// <decode ms> <stop|length|cancel> <drafts accepted> <drafts offered> <reused> 0 0 draft_rounds=<rounds that drafted>
+// draft_max=<most drafts a round>`; `STOP` ends a request early, `QUIT` the engine.  A prompt that continues the state
+// (the conversation so far) reuses it; one that only shares the last prompt's start goes back to that prompt's end;
+// anything else starts over.  `GENI <max_new> [keys] <file> <ids>` carries the prompt's pictures
 // (the file: see read_pics); the state is shared only where the same picture sits at the same place.  With
 // STRATA_DS4_SLOT_KEEP=1 the conversations are kept when another one takes the model (a slot each: the state, the
 // compressed KV included), and across runs in STRATA_DS4_SLOT_DIR - so a request that does not continue the state but
@@ -930,7 +931,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         long long produced = 0;
         const char* finish = "length";
         const long long limit = r.max_new > 0 ? r.max_new : m.max_context() - (long long) r.ids.size();
-        long long d_off = 0, d_acc = 0;
+        long long d_off = 0, d_acc = 0, d_rounds = 0;   // (rounds: the ones that offered a draft)
         bool cool = false;
         int tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter++);
         std::vector<int> got;
@@ -997,6 +998,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 }
                 d_off += off;
                 d_acc += acc;
+                if (off > 0) ++d_rounds;
                 cool = try_spec && off == 0;
                 std::reverse(got.begin(), got.end());
             }
@@ -1007,8 +1009,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         //  the checkpoint at this prompt's end)
         stat_line();
         const double t2 = now_ms();
-        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", produced, r.ids.size(), t1 - t0, t2 - t1, finish,
-                    d_acc, d_off, from);
+        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0 draft_rounds=%lld draft_max=%d\n", produced, r.ids.size(),
+                    t1 - t0, t2 - t1, finish, d_acc, d_off, from, d_rounds, m.draft_cap());
         std::fflush(stdout);
         const auto& s = m.stats();
         std::fprintf(stderr,

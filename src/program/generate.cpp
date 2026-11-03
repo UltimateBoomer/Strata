@@ -16779,7 +16779,7 @@ int main(int argc, char** argv) {
             std::vector<int32_t> cbuf((size_t) S, 0), ctail;
             strata::spec::PromptLookupSource lookup_src(sfx);
             static const bool chain_fixed = std::getenv("STRATA_LOOKUP_CHAIN_FIXED") != nullptr;   // no policy gate
-            int64_t draft_offered = 0, draft_accepted = 0;
+            int64_t draft_offered = 0, draft_accepted = 0, draft_rounds = 0;   // (rounds: the windows that held a draft)
             // what the session holds once this request is done: the prompt read so far, then every committed token
             std::vector<int32_t> consumed;
             consumed.reserve((size_t) (n + max_new + S));
@@ -17316,6 +17316,7 @@ int main(int argc, char** argv) {
                     for (int i = 0; i <= a; ++i) consumed.push_back(A.tok[i]);
                     draft_offered += A.T - 1;
                     draft_accepted += a;
+                    if (A.T > 1) ++draft_rounds;
                     ++rounds;
                     if (drive.d.fs) drive.d.fs->completed.fetch_add(1, std::memory_order_release);
                     ++dec_windows;
@@ -17774,6 +17775,7 @@ int main(int argc, char** argv) {
                 if (!merged) {   // (a merged window's rows are prompt tokens, not drafts)
                     draft_offered += T - 1;
                     draft_accepted += a;
+                    if (T > 1) ++draft_rounds;
                 }
                 const bool initial_round = first_window;   // a single-row window: no proposal to learn from
                 first_window = false;
@@ -18074,23 +18076,25 @@ int main(int argc, char** argv) {
             //                    not in [lookups])
             //      [lookup-chain accepted] [lookup-chain offered] [suffix accepted] [suffix offered] [windows]
             //      (only with --lookup-chain)
-            //      chunk=<tokens> experts_streamed=<blobs>   (key=value, last: the first chunk of the request's longest
+            //      chunk=<tokens> experts_streamed=<blobs>   (key=value: the first chunk of the request's longest
             //      batched segment, 0 when it read none; the expert blobs its prompt read copied host -> device on
             //      every stage - not the CPU share's, the stage helper's or a --peer-device peer's)
+            //      draft_rounds=<windows> draft_max=<drafts>   (key=value: the windows that held a draft, the most
+            //      drafts a window holds; the Monitor's MTP acceptance length is 1 + accepted / rounds, up to 1 + max)
             char chain_txt[128] = "";
             if (o.lookup_chain > 0)
                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
             std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s chunk=%lld "
-                        "experts_streamed=%lld\n",
+                        "experts_streamed=%lld draft_rounds=%lld draft_max=%d\n",
                         (long long) produced_n,
                         (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
                         (long long) resume, (long long) req_hits, (long long) req_look,
                         (long long) (src.ram_reads() - ram0), (long long) (src.file_reads() - files0),
                         (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
                         (long long) req_offload, chain_txt, (long long) req_chunk,
-                        (long long) (sp.chain_experts_streamed() - streamed0));
+                        (long long) (sp.chain_experts_streamed() - streamed0), (long long) draft_rounds, S - 1);
             std::fflush(stdout);
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
