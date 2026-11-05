@@ -1,5 +1,5 @@
 {
-  "model_name": "qwen3.8-flash-next-iq3_s-fast",
+  "model_name": "qwen3.8-flash-next-iq3_s",
   "sampling": {
     "temperature": 1.0,
     "top_p": 0.95,
@@ -7,15 +7,7 @@
     "min_p": 0.0,
     "presence_penalty": 0.0,
     "repetition_penalty": 1.0,
-    "strata_tune": {
-      "route_prior": 1.5
-    },
-    "client_tune": [
-      "tail_skip",
-      "kva",
-      "route_resident",
-      "route_resident_ranks"
-    ]
+    "client_tune": []
   },
   "engine_env": {
     "unbuffered_load": true,

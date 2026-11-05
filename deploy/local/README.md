@@ -122,30 +122,19 @@ adds its own pack and shards:
 | request `model` | variant | files |
 |---|---|---|
 | `qwen3.8-flash-next-q2_0`, `q2`, `qwen`, `qwen3.8-flash-next` | Q2_0 | `config/{model,server}-q2.json` |
-| `qwen3.8-flash-next-iq3_xxs`, `q3` | IQ3_XXS | `config/{model,server}-q3.json` |
-| `qwen3.8-flash-next-coder-iq1_m`, `q1`, `coder`, `qwen3.8-flash-next-coder` | Coder IQ1_M | `config/{model,server}-q1.json` |
-| `qwen3.8-flash-next-iq3_s-slow`, `q3s-slow` | IQ3_S | `config/model-q3s.json`, `config/server-q3s-slow.json` |
-| `qwen3.8-flash-next-iq3_s-fast`, `q3s-fast` | IQ3_S, residency-biased routing | `config/model-q3s.json`, `config/server-q3s-fast.json` |
-| `qwen3.8-flash-next-ud-q4_k_xl-slow`, `q4-slow` | Unsloth UD-Q4_K_XL | `config/model-q4.json`, `config/server-q4-slow.json` |
-| `qwen3.8-flash-next-ud-q4_k_xl-fast`, `q4-fast` | Unsloth UD-Q4_K_XL, residency-biased routing | `config/model-q4.json`, `config/server-q4-fast.json` |
+| `qwen3.8-flash-next-ud-iq3_xxs`, `q3` | Unsloth UD-IQ3_XXS (Dynamic V3.1) | `config/{model,server}-q3.json` |
+| `qwen3.8-flash-next-iq3_s`, `q3s` | IQ3_S | `config/{model,server}-q3s.json` |
+| `qwen3.8-flash-next-ud-q4_k_xl`, `q4` | Unsloth UD-Q4_K_XL | `config/{model,server}-q4.json` |
 
-IQ3_S and UD-Q4_K_XL each come as two variants of one engine: `-slow` answers as
-the engine always has, and `-fast` turns on the fork's residency-biased routing
-(`route_prior` 1.5: an expert already in VRAM gets a logit bonus, fewer misses to
-read, answers that differ from `-slow`'s) and lets a request trade more quality
-for speed with its own `"strata_tune"`: `tail_skip` (0-9), `kva` (true/false),
-`route_resident` and `route_resident_ranks` (Strata's `docs/BATCHING.md`, "Variants
-of one engine"). The two differ only in their sampling block, so a switch between
-them restarts nothing and keeps the conversation; they share the download, the
-pack, the load image and one conversation folder (`/data/convcache/<base>-slow`). Their engine runs
-with `STRATA_ROUTE_LIVE=1` (`engine_env.route_live`), which puts both routing
-kernels in every verify graph; with `route_prior` 0 they write nothing, so
-`-slow`'s answers are the bits of an engine without them.
+The IQ3_S, UD-IQ3_XXS and UD-Q4_K_XL engines run with `STRATA_ROUTE_LIVE=1`
+(`engine_env.route_live`), which puts the fork's routing kernels in every verify
+graph; with `route_prior` 0 (no `"strata_tune"`) they write nothing, so the
+answers are the bits of an engine without them.
 
-The Coder is ISTA-DASLab's expert-pruned release: 256 of each layer's 512 experts
-kept (chosen for code, tool use and pictures), stored at 3.5 bits, with upstream's
-Coder expert profile. Its shard 2 (the n-gram table) is the same file as Q2_0's
-and is hard-linked from it, so it downloads only its 29.6 GB shard 1.
+UD-IQ3_XXS is Unsloth's Dynamic V3.1 file (2026-11-04, 83.6 GB in four shards):
+its experts mix IQ2_S, IQ3_XXS and IQ4_XS gate/up projections with IQ4_NL and
+Q2_0 downs, and its fourth shard is the IQ4_NL n-gram table. Like UD-Q4_K_XL it
+is packed with `--compat-bf16` and read from its GGUF shards in place.
 
 Another model name is served by whichever variant is loaded. A switch takes
 about as long as an engine start, about 8 s with load images (below); the scheduler keeps a variant loaded while
@@ -158,8 +147,8 @@ Each variant parks its conversations in its own folder, `/data/convcache/<varian
 switch: the outgoing engine parks the conversation it holds as it stops, and the
 variant's next request goes on from that file. No session file is written
 (`"model_session_dir": false`). `make up STRATA_VARIANT=q3`
-starts with IQ3_XXS, and `POST /v1/load {"model": "q3"}` switches by hand.
-`make init` downloads and packs every variant (IQ3_XXS: 76 GB more, the Coder: 29.6 GB more, IQ3_S: 110 GB more; its second shard, the per-layer table, is shared with Q2_0).
+starts with UD-IQ3_XXS, and `POST /v1/load {"model": "q3"}` switches by hand.
+`make init` downloads and packs every variant (UD-IQ3_XXS: 83.6 GB more, IQ3_S: 55 GB more; its second shard, the per-layer table, is shared with Q2_0).
 UD-Q4_K_XL (Unsloth's 4-bit file, 111.3 GB) is packed with `--compat-bf16` and
 read from its GGUF shards in place (no `experts.bin`). Its 71.7 GiB of experts
 are twice IQ3_S's, so on pc26 (32 GB of RAM) 44 GiB of them are read from the SSD:
@@ -187,7 +176,8 @@ fit in pc26's RAM beside the GPU's share (33 GB outside VRAM, against Q2_0's
 | prompt reading, 29-34K tokens | 987 tokens/s | 919 tokens/s |
 | answer speed | 43 tokens/s | 18-20 tokens/s |
 
-Measured on pc26 on 2026-10-25. IQ3_XXS with Q2_0's earlier settings (its whole
+Measured on pc26 on 2026-10-25, with ISTA-DASLab's IQ3_XXS (the `q3` variant until
+UD-IQ3_XXS replaced it on 2026-11-05; UD-IQ3_XXS is not measured yet). IQ3_XXS with Q2_0's earlier settings (its whole
 remainder page-locked, the rest read through the page cache, 2048-token chunks)
 re-read the experts several times over per prompt chunk and read prompts at
 about 30 tokens/s. Q2_0 with every expert in RAM read 832 tokens/s with

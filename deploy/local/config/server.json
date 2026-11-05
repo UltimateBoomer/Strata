@@ -21,11 +21,9 @@
   "priority_floor": -20,
   "models": {
     "q2": "server-q2.json",
-    "q1": "server-q1.json",
-    "q3s-slow": "server-q3s-slow.json",
-    "q3s-fast": "server-q3s-fast.json",
-    "q4-slow": "server-q4-slow.json",
-    "q4-fast": "server-q4-fast.json",
+    "q3": "server-q3.json",
+    "q3s": "server-q3s.json",
+    "q4": "server-q4.json",
     "deepseek": "server-deepseek.json"
   },
   "default_model": null,

@@ -1,5 +1,5 @@
 {
-  "model_name": "qwen3.8-flash-next-ud-q4_k_xl-slow",
+  "model_name": "qwen3.8-flash-next-ud-q4_k_xl",
   "sampling": {
     "temperature": 1.0,
     "top_p": 0.95,

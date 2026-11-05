@@ -1,11 +1,12 @@
 {
-  "repository": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
-  "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",
+  "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+  "revision": "d96201194f103c906994f283f504209dc8d2a10c",
   "files": [
-    "IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
-    "IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf"
+    "UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf",
+    "UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00002-of-00004.gguf",
+    "UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00003-of-00004.gguf",
+    "UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00004-of-00004.gguf"
   ],
-  "vision_file": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
   "prepare": [
     [
       "iq_pack.py",
@@ -13,7 +14,7 @@
       "{first_file}",
       "--out",
       "{pack}",
-      "--experts-bin"
+      "--compat-bf16"
     ],
     ["mtp_fetch.py", "fetch", "--out", "{pack}/mtp"],
     ["mtp_fetch.py", "verify", "--out", "{pack}/mtp"],
