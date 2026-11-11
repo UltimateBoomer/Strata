@@ -86,13 +86,13 @@ class ConfigTest(unittest.TestCase):
                            (["--prompt-cache", "0"], "checkpoints off"),
                            (["--layer-split", "12,24"], "a split parks in RAM")):
             self.assertFalse(serve_models.keeps_parks(base + extra), why)
-        self.assertFalse(serve_models.keeps_parks(base[2:]), "no --mtp: the file tier is off")
+        self.assertTrue(serve_models.keeps_parks(base[2:]), "no --mtp (DFlash2 alone): files without the draft K/V")
         self.assertFalse(serve_models.keeps_parks(base[:2]), "no folder")
         common = {**COMMON, "args": COMMON["args"] + base}
         m, _ = serve_models.load({**common, "models": {"q2": {}, "q3": {}}}, None)
         self.assertTrue(m.variants["q2"].keeps_parks())
         m, _ = serve_models.load({**common, "mtp": False, "models": {"q2": {}, "q3": {}}}, None)
-        self.assertFalse(m.variants["q2"].keeps_parks(), '"mtp": false starts the engine without --mtp')
+        self.assertTrue(m.variants["q2"].keeps_parks(), '"mtp": false: the engine parks on disk without --mtp')
 
     def test_no_session_dir(self):
         m, _ = serve_models.load(config(model_session_dir=False), None)

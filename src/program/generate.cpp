@@ -1140,7 +1140,8 @@ void usage() {
                  "                       --no-conversation-cache-keep); one read back is updated in place when\n"
                  "                       parked again\n"
                  "                       (the budget then caps the files, oldest pruned first; slots 0 = no slot\n"
-                 "                       limit; one GPU with --mtp on Linux, else they stay in RAM)\n"
+                 "                       limit; one GPU on Linux, else they stay in RAM; the files carry the MTP\n"
+                 "                       layer's K/V when it is loaded)\n"
                  "  --no-conversation-cache-keep  --serve, with --conversation-cache-dir: remove the parked files at\n"
                  "                       start (default: keep them across restarts of the same model and settings,\n"
                  "                       others removed at start, the live conversation parked at QUIT)\n"
@@ -12178,8 +12179,10 @@ int main(int argc, char** argv) {
             }
         }
         // --conversation-cache-dir with --conversation-cache-slots 0: no slot limit, only the byte budget
+        // (with or without --mtp: a file holds the draft layer's K/V exactly when the MTP layer is loaded, use_mtp; DFlash2
+        // alone, --draft-fallback none, writes and reads files without it)
         const bool park_disk = o.prompt_cache > 0 && o.conversation_cache_mib > 0 && !o.conversation_cache_dir.empty() &&
-                               use_mtp && stages.empty();
+                               stages.empty();
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             park_disk && o.conversation_cache_slots == 0 ? SIZE_MAX : (size_t) o.conversation_cache_slots,
@@ -12273,7 +12276,7 @@ int main(int argc, char** argv) {
         // the base's directory (conversations.base()): what an update in place starts from
         strata::core::ParkFileState park_base_state;
         if (!o.conversation_cache_dir.empty() && o.conversation_cache_mib > 0 && !park_disk)
-            std::fprintf(stderr, "strata serve: conversation cache: --conversation-cache-dir needs --mtp and one GPU; "
+            std::fprintf(stderr, "strata serve: conversation cache: --conversation-cache-dir needs one GPU; "
                                  "parking in RAM\n");
         // a parked file's read limits: RESTORE's bounds, and the RAM admission above the parking floor
         auto park_limits = [&](strata::core::SessionReadLimits& limits, std::string& why) {
@@ -12287,7 +12290,7 @@ int main(int argc, char** argv) {
                     ram_note(mem) + ")";
                 return false;
             };
-            return strata::core::conversation_session_read_limits(limits, ss, g, mtp.kv_state(),
+            return strata::core::conversation_session_read_limits(limits, ss, g, use_mtp ? &mtp.kv_state() : nullptr,
                 (uint64_t) o.max_context, (uint64_t) std::max(o.prompt_cache, 1) + 2, why);
         };
         // the same file read back with its K/V streamed into the session as it is read: RAM holds the running state
@@ -12617,9 +12620,9 @@ int main(int argc, char** argv) {
             // RAM only holds the running state and checkpoints the file also carries, never the whole image.  The file
             // this conversation was read back from (the base) is updated in place: only the K/V past the pages the
             // session has not written since, the new checkpoints and the running state are written.
-            if (park_disk && draft0 == nullptr) {
-                std::fprintf(stderr, "strata serve: conversation cache: skip parking (%zu tokens%s: no draft K/V for the file)\n",
-                             src.ids.size(), src.what.c_str());
+            if (park_disk && (draft0 != nullptr) != use_mtp) {   // the files read back with the draft K/V exactly when use_mtp
+                std::fprintf(stderr, "strata serve: conversation cache: skip parking (%zu tokens%s: %s)\n",
+                             src.ids.size(), src.what.c_str(), use_mtp ? "no draft K/V for the file" : "a draft K/V the files do not carry");
                 return true;
             }
             if (park_disk) {
@@ -12696,7 +12699,7 @@ int main(int argc, char** argv) {
                 const ConvCheckpoint* at = live_at >= 0 ? &view.checkpoints[(size_t) live_at] : nullptr;
                 const int64_t park_tokens = at ? (int64_t) at->ids.size() : (int64_t) src.ids.size();
                 strata::core::SessionReadLimits caps;   // the regions a new file reserves: each part at --max-context
-                if (!strata::core::conversation_snapshot_sources(meta, sources, view, src.session, g, *draft0, err, at) ||
+                if (!strata::core::conversation_snapshot_sources(meta, sources, view, src.session, g, draft0, err, at) ||
                     !park_limits(caps, why)) {
                     give_up();
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n",
@@ -12706,7 +12709,7 @@ int main(int argc, char** argv) {
                 }
                 // what each K/V part still shares with the base: the pages before the first token written since
                 std::vector<std::array<uint64_t, 5>> keep;
-                if (base && !strata::core::conversation_snapshot_keep(keep, src.session, g, *draft0, park_tokens,
+                if (base && !strata::core::conversation_snapshot_keep(keep, src.session, g, draft0, park_tokens,
                                                                       base->unchanged, why)) {
                     keep.clear();   // (then every byte is written again)
                     why.clear();
@@ -17053,7 +17056,7 @@ int main(int argc, char** argv) {
                     std::printf("ERR the K/V cannot grow to the parked conversation: no VRAM is left\n");
                     return 1;
                 }
-                const strata::core::QsaState* draft_in = &mtp.kv_state();   // (park_disk: --mtp, no layer split)
+                const strata::core::QsaState* draft_in = use_mtp ? &mtp.kv_state() : nullptr;   // (park_disk: no layer split; DFlash2 alone: no draft K/V)
                 strata::core::SessionKvTarget target;
                 strata::core::SavedConversation meta;
                 bool written = false;
@@ -17202,7 +17205,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 const auto t_load = Clock::now();
-                const strata::core::QsaState* draft_in = &mtp.kv_state();   // (park_disk: --mtp)
+                const strata::core::QsaState* draft_in = use_mtp ? &mtp.kv_state() : nullptr;   // (DFlash2 alone: no draft K/V)
                 strata::core::SessionKvTarget target;
                 strata::core::SavedConversation meta;
                 bool written = false;

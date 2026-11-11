@@ -786,8 +786,8 @@ or borrowed from (another conversation with the same system prompt). A copy park
 not obsolete. The engine's
 keys are `sess=<tag>` (64 bits of the session name's hash), `park=0` and `drop=<tag>,...` on the `GEN` line.
 
-`--conversation-cache-dir DIR` (fork option; one GPU with `--mtp`, Linux) parks conversations in files in DIR instead
-of RAM, and the byte budget then caps what the files hold. Each is a park file, `park-<n>.park`: a 4 KiB superblock,
+`--conversation-cache-dir DIR` (fork option; one GPU, Linux) parks conversations in files in DIR instead
+of RAM (with the MTP layer's K/V when it is loaded; DFlash2 alone, `--draft-fallback none`, parks without it), and the byte budget then caps what the files hold. Each is a park file, `park-<n>.park`: a 4 KiB superblock,
 every K/V part in its own region reserved for `--max-context` (a sparse file: only what is written takes space, at
 4 KiB-aligned offsets), the live running state and each checkpoint as a record, and a directory that names them, with
 a hash per MiB of K/V and per record. A conversation read back keeps its file, and when it is parked again the file

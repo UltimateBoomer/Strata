@@ -489,6 +489,92 @@ void full_session(int fmt, int mode, int experts) {
         fs::remove_all(dir,ec);
         ids.resize(65);
     }
+    for (int64_t dirty : {65, 0}) {
+        // DFlash2 alone (no MTP layer loaded): park files WITHOUT the draft layer's K/V (draft == nullptr), written,
+        // read back, updated in place and read back again; a file of the other kind is refused by its layer count
+        namespace fs=std::filesystem;
+        const fs::path dir=fs::temp_directory_path()/("strata-park-nodraft-"+std::to_string(experts)+"-"+std::to_string(dirty)+"-"+
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        fs::create_directories(dir);
+        const std::string p=(dir/"conv.park").string(), pd=(dir/"draft.park").string();
+        check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore A for its draftless park file");
+        SessionReadLimits caps, dcaps;
+        check(conversation_session_read_limits(caps,ss,g,nullptr,(uint64_t)ss.max_cells,8,err) &&
+              conversation_session_read_limits(dcaps,ss,g,draft.state,(uint64_t)ss.max_cells,8,err) &&
+              caps.max_kv_layers+1==dcaps.max_kv_layers && caps.max_kv_bytes.size()+1==dcaps.max_kv_bytes.size(),
+              "draftless park regions: one K/V layer fewer");
+        SavedConversation pm;
+        std::vector<SessionKvSource> src;
+        ParkFileState pst;
+        ParkWriteStats pws;
+        check(conversation_snapshot_sources(pm,src,view,ss,g,nullptr,err) && src.size()==caps.max_kv_layers &&
+              park_file_write(p,7,nullptr,pm,view.checkpoints,src,caps.max_kv_bytes,{},0,{},pst,pws,err),"write a draftless park file");
+        SavedConversation expect;
+        check(snap_save(expect,view,ss,g,nullptr,err),"a draftless capture of A");
+        fill(223);   // another conversation in the session
+        SessionKvTarget t;
+        SavedConversation back;
+        SessionStatus rs;
+        check(conversation_snapshot_target(t,ss,g,nullptr,err) && park_file_read(p,7,back,t,caps,pst,err,&rs) &&
+              conversation_snapshot_stream_finish(back,ss,g,nullptr,err)==ConversationRestore::restored,
+              "read the draftless park file back into the session");
+        SavedConversation got;
+        check(snap_save(got,view,ss,g,nullptr,err),"capture it without the draft");
+        check(got.kv.size()==expect.kv.size() && got.live.gdn==expect.live.gdn && equal(got.kv[0],expect.kv[0]) &&
+              equal(got.kv.back(),expect.kv.back()),"the draftless park file reads back as it was parked");
+        // grown or rewound, then updated in place with the pages kept
+        main.fill_after(92,dirty);
+        cuda_check(cudaMemset(ss.gdn_state,92,sizes.gdn));
+        ids.resize(70);
+        for (size_t i=65;i<ids.size();++i) ids[i]=int32_t(i+1);
+        cuda_check(cudaMemcpy(main.state.idx_pooled+(ids.size()/4)*g.idx_key_dim,
+                              main.state.idx_dead,sizes.dead,cudaMemcpyDeviceToDevice));
+        SavedConversation fresh;
+        check(snap_save(fresh,view,ss,g,nullptr,err),"draftless full capture after growth or rewind");
+        std::vector<std::array<uint64_t,5>> keep;
+        check(conversation_snapshot_keep(keep,ss,g,nullptr,70,dirty,err) && keep.size()==src.size(),"the draftless pages kept");
+        const std::vector<ConversationCheckpoint> chain=back.checkpoints;
+        const ConversationView grown{ids,images,chain,true};
+        SavedConversation um;
+        std::vector<SessionKvSource> usrc;
+        ParkFileState ust;
+        ParkWriteStats uws;
+        check(conversation_snapshot_sources(um,usrc,grown,ss,g,nullptr,err) &&
+              park_file_write(p,7,&pst,um,grown.checkpoints,usrc,caps.max_kv_bytes,keep,0,{},ust,uws,err),
+              "update the draftless park file in place");
+        fill(224);
+        SessionKvTarget t2;
+        SavedConversation again;
+        check(conversation_snapshot_target(t2,ss,g,nullptr,err) && park_file_read(p,7,again,t2,caps,ust,err,&rs) &&
+              conversation_snapshot_stream_finish(again,ss,g,nullptr,err)==ConversationRestore::restored,
+              "read the updated draftless park file back");
+        SavedConversation got2;
+        check(snap_save(got2,view,ss,g,nullptr,err),"capture it again");
+        check(got2.live.gdn==fresh.live.gdn && equal(got2.kv[0],fresh.kv[0]) && equal(got2.kv.back(),fresh.kv.back()),
+              "the updated draftless park file equals a full capture after growth or rewind");
+        // the two kinds do not mix: a draftless reader refuses a file with the draft K/V, and the other way round
+        ids.resize(65);
+        check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore A for a file with the draft");
+        SavedConversation dm;
+        std::vector<SessionKvSource> dsrc;
+        ParkFileState dst;
+        ParkWriteStats dws;
+        check(conversation_snapshot_sources(dm,dsrc,view,ss,g,draft.state,err) &&
+              park_file_write(pd,8,nullptr,dm,view.checkpoints,dsrc,dcaps.max_kv_bytes,{},0,{},dst,dws,err),"write a park file with the draft");
+        SessionKvTarget tx, ty;
+        SavedConversation x, y;
+        err.clear();
+        check(conversation_snapshot_target(tx,ss,g,nullptr,err) && !park_file_read(pd,8,x,tx,dcaps,dst,err,&rs),
+              "a draftless reader refuses a file with the draft K/V");
+        check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore A after the refused read");
+        err.clear();
+        check(conversation_snapshot_target(ty,ss,g,&draft.state,err) && !park_file_read(p,7,y,ty,dcaps,ust,err,&rs),
+              "a reader with the draft refuses a draftless file");
+        err.clear();
+        check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore A after the refused reads");
+        std::error_code ec;
+        fs::remove_all(dir,ec);
+    }
     {
         // a layer split's later stage: the same image WITHOUT the draft layer's K/V (draft == nullptr)
         check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore A before stage images");

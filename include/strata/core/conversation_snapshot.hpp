@@ -69,6 +69,10 @@ bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, i
 bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& session, const ModelGeometry& g,
                                       const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
                                       std::string& error);
+// The same with `draft == nullptr`: files without the draft layer's K/V (DFlash2 alone: no MTP layer is loaded).
+bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& session, const ModelGeometry& g,
+                                      const QsaState* draft, uint64_t max_tokens, uint64_t max_checkpoints,
+                                      std::string& error);
 
 struct ConversationStateSizes {
     size_t gdn = 0, ple = 0, tail = 0, dead = 0, block_pos = 0;
@@ -158,6 +162,11 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
                                    const ConversationView& view, const SessionState& session,
                                    const ModelGeometry& g, const QsaState& draft, std::string& error,
                                    const ConversationCheckpoint* at = nullptr);
+// The same with `draft == nullptr`: no draft source (the file holds the session's own QSA layers only).
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& session,
+                                   const ModelGeometry& g, const QsaState* draft, std::string& error,
+                                   const ConversationCheckpoint* at = nullptr);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
 /// #2409: true when a restore (or a copy) on CUDA device `device` from the calling thread creates no copy stream: this
@@ -233,6 +242,10 @@ ConversationRestore conversation_snapshot_stream_finish_prefix(const SavedConver
 // one token fewer: its final cell may not have been computed when the output cap was reached, as for a capture).
 bool conversation_snapshot_keep(std::vector<std::array<uint64_t, 5>>& keep, const SessionState& session,
                                 const ModelGeometry& g, const QsaState& draft, int64_t upto, int64_t unchanged,
+                                std::string& error);
+// The same with `draft == nullptr`: no draft entry.
+bool conversation_snapshot_keep(std::vector<std::array<uint64_t, 5>>& keep, const SessionState& session,
+                                const ModelGeometry& g, const QsaState* draft, int64_t upto, int64_t unchanged,
                                 std::string& error);
 
 } // namespace strata::core

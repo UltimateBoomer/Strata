@@ -110,7 +110,7 @@ class Variant:
         (ds4 slots) and has no SAVE command."""
         if self.arch == "deepseek41":
             return True
-        return self.cfg.get("mtp") is not False and keeps_parks(self.cfg.get("args") or [])   # "mtp": false strips --mtp
+        return keeps_parks(self.cfg.get("args") or [])   # (with or without --mtp: "mtp": false and DFlash2 alone park on disk too)
 
 
 class Models:
@@ -252,9 +252,10 @@ def _flag_value(args: list, flag: str) -> str | None:
 
 def keeps_parks(args: list) -> bool:
     """Whether an engine started with `args` keeps its parked conversations on disk across runs: a
-    --conversation-cache-dir without --no-conversation-cache-keep, with the file tier's needs (--mtp, one GPU) and the
-    cache not turned off (--conversation-cache-mib 0, --prompt-cache 0)."""
-    if _cache_dir_at(args) is None or "--no-conversation-cache-keep" in args or _flag_value(args, "--mtp") is None:
+    --conversation-cache-dir without --no-conversation-cache-keep, with the file tier's need (one GPU: no layer split)
+    and the cache not turned off (--conversation-cache-mib 0, --prompt-cache 0).  --mtp is not needed: an engine
+    without the MTP layer (DFlash2 alone, "mtp": false) writes its files without the draft K/V."""
+    if _cache_dir_at(args) is None or "--no-conversation-cache-keep" in args:
         return False
     if _flag_value(args, "--layer-split") is not None:
         return False
