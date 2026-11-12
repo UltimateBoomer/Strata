@@ -6,8 +6,8 @@ waits for a one-shot model initializer, then recreates the authenticated server.
 The endpoint is `http://127.0.0.1:9931/v1` by default; set
 `STRATA_BIND_ADDRESS` to publish on another interface.
 
-The default is **Qwen3.8-Flash-Next Q2_0**, with CPU image encoding,
-200000 context, INT8 KV and MTP drafting. It uses the original full-expert model.
+The default is **Qwen3.8-Flash-Next Unsloth UD-IQ1_M** (Dynamic V3.1, about 1 bit), with CPU image encoding,
+200000 context, INT8 KV and DFlash2 drafting (no MTP layer loaded). It keeps every expert of the model.
 See [supported models](https://github.com/Niko1221/Strata/blob/main/docs/MODELS.md).
 
 ## Requirements
@@ -86,7 +86,7 @@ make down
 ```
 
 Use your stored API key as a Bearer token and request model
-`qwen3.8-flash-next-q2_0`. The server also exposes `/v1/models`.
+`qwen3.8-flash-next-unsloth-ud-iq1_m`. The server also exposes `/v1/models`.
 `make down` preserves the model volume and credentials.
 
 ### Switching models
@@ -96,7 +96,7 @@ and DeepSeek-V4.1-Flash as requests ask for them (the fork's `"models"` with
 variants of two model families, documented in Strata's `docs/BATCHING.md`):
 
 ```sh
-make up                              # starts with Qwen Q2_0; every variant below is served
+make up                              # starts with Qwen UD-IQ1_M; every variant below is served
 make up STRATA_VARIANT=deepseek      # starts with DeepSeek-V4.1-Flash IQ1_M instead
 ```
 
@@ -121,12 +121,11 @@ adds its own pack and shards:
 
 | request `model` | variant | files |
 |---|---|---|
-| `qwen3.8-flash-next-q2_0`, `q2`, `qwen`, `qwen3.8-flash-next` | Q2_0 | `config/{model,server}-q2.json` |
+| `qwen3.8-flash-next-unsloth-ud-iq1_m`, `q1` | Unsloth UD-IQ1_M (Dynamic V3.1) | `config/{model,server}-q1.json` |
 | `qwen3.8-flash-next-ud-iq3_xxs`, `q3` | Unsloth UD-IQ3_XXS (Dynamic V3.1) | `config/{model,server}-q3.json` |
-| `qwen3.8-flash-next-iq3_s`, `q3s` | IQ3_S | `config/{model,server}-q3s.json` |
 | `qwen3.8-flash-next-ud-q4_k_xl`, `q4` | Unsloth UD-Q4_K_XL | `config/{model,server}-q4.json` |
 
-The IQ3_S, UD-IQ3_XXS and UD-Q4_K_XL engines run with `STRATA_ROUTE_LIVE=1`
+The UD-IQ3_XXS and UD-Q4_K_XL engines run with `STRATA_ROUTE_LIVE=1`
 (`engine_env.route_live`), which puts the fork's routing kernels in every verify
 graph; with `route_prior` 0 (no `"strata_tune"`) they write nothing, so the
 answers are the bits of an engine without them.
@@ -136,11 +135,35 @@ its experts mix IQ2_S, IQ3_XXS and IQ4_XS gate/up projections with IQ4_NL and
 Q2_0 downs, and its fourth shard is the IQ4_NL n-gram table. Like UD-Q4_K_XL it
 is packed with `--compat-bf16` and read from its GGUF shards in place.
 
+UD-IQ1_M (`q1`) is Unsloth's Dynamic V3.1 file from the same revision (68.0 GB in
+three shards; its third shard is the n-gram table). It replaced ISTA-DASLab's Q2_0 on
+2026-11-10 and is packed the same way as UD-IQ3_XXS. Its picture reader is
+ISTA-DASLab's `mmproj-Qwen3.8-Flash-Next-BF16.gguf` (a `sources` entry in
+`config/model-q1.json`). Unsloth's UD-IQ1_S cannot be used: it mixes two expert
+formats in one layer, which Strata refuses.
+
+The Qwen variants draft with DFlash2 alone (`"draft": "dflash2"`, `"draft_fallback": "none"`,
+`"spec": 6`, `"draft_conf": 0.7` in `config/server.json`'s `engine`): the MTP layer is not
+loaded, which leaves about 1 GB more VRAM for the expert cache. `--mtp` stays in the arguments;
+the engine reads only the draft vocabulary from it. Parked conversations stay on disk: the
+fork's engine (branch `dflash2-disk-park`) writes park files without the MTP layer's K/V when
+that layer is not loaded. An engine without that change parks them in RAM instead, and they are
+lost at every switch and restart. `"drafting": "args"` is a fork setting: the server passes
+those options as written instead of Strata's own choice. A DFlash2 that cannot start ends the
+start with an error (there is no MTP to fall back to); q1's start is then retried with the MTP
+alone. `make init` fetches the drafter once, into `/data/dflash2` (`"dflash2": true` in
+`config/model-q1.json`: about 1.2 GB downloaded, 0.52 GB kept). DeepSeek takes none of these
+options. DFlash2 is not measured on gfx1101. To keep the MTP layer as the fallback, set
+`"draft_fallback": "mtp"`; to go back to the MTP alone, set `"drafting": "mtp"`, remove the five
+`draft*` options and set `"spec"` back to 4.
+UD-IQ1_M is not measured on pc26 yet;
+the Q2_0 numbers below are kept for comparison.
+
 Another model name is served by whichever variant is loaded. A switch takes
 about as long as an engine start, about 8 s with load images (below); the scheduler keeps a variant loaded while
 its requests are queued and switches once a request for another has waited
 `model_max_wait_s` (120 s). There is no default variant: the server starts with
-`q2` (the first listed, or `STRATA_VARIANT`) and stays on whichever is loaded
+`q1` (the first listed, or `STRATA_VARIANT`) and stays on whichever is loaded
 (`"default_model"` with `"default_idle_s"` would switch back to one when idle).
 Each variant parks its conversations in its own folder, `/data/convcache/<variant>`
 (the server derives them from the common `/data/convcache`), and they survive a
@@ -148,10 +171,10 @@ switch: the outgoing engine parks the conversation it holds as it stops, and the
 variant's next request goes on from that file. No session file is written
 (`"model_session_dir": false`). `make up STRATA_VARIANT=q3`
 starts with UD-IQ3_XXS, and `POST /v1/load {"model": "q3"}` switches by hand.
-`make init` downloads and packs every variant (UD-IQ3_XXS: 83.6 GB more, IQ3_S: 55 GB more; its second shard, the per-layer table, is shared with Q2_0).
+`make init` downloads and packs every variant (UD-IQ3_XXS: 83.6 GB more).
 UD-Q4_K_XL (Unsloth's 4-bit file, 111.3 GB) is packed with `--compat-bf16` and
 read from its GGUF shards in place (no `experts.bin`). Its 71.7 GiB of experts
-are twice IQ3_S's, so on pc26 (32 GB of RAM) 44 GiB of them are read from the SSD:
+are about twice those of ISTA-DASLab's IQ3_S, so on pc26 (32 GB of RAM) 44 GiB of them are read from the SSD:
 measured 2026-11-02, it answers at 8-11 tokens/s (IQ3_S: 19-24) and reads prompts
 at 690-810 tokens/s (IQ3_S: 930-1150).
 
@@ -279,7 +302,7 @@ key is an option without its dashes, `-` written as `_`
 (`"conversation_cache_mib": 16384` is `--conversation-cache-mib 16384`); `true`
 is a bare flag (`"resident_experts": true`), and `false` or `null` leaves the
 option out. `engine_env` does the same for the engine's `STRATA_` environment
-variables (`"load_image": "/data/load-image/q2"` is `STRATA_LOAD_IMAGE`; `true`
+variables (`"load_image": "/data/load-image/q1"` is `STRATA_LOAD_IMAGE`; `true`
 is `1`). Our fork's server expands both as it reads the config, in the common
 file and in each variant's, into the `args` and `env` the engine starts with. A
 variant's option replaces the common one of the same name. Raw `args` and `env`
@@ -472,7 +495,7 @@ make calibrate
 
 This stops the Strata server and runs upstream `tools/calibrate.py` against the
 served model's run config (for the Qwen variants, `config/server.json` with the
-variant's own file over it: `STRATA_VARIANT`, default `q2`) in a temporary
+variant's own file over it: `STRATA_VARIANT`, default `q1`) in a temporary
 container with the same GPU and model mounts.
 Stop other GPU inference servers first. Calibration measures PCIe share, draft
 confidence, CPU worker count, and adaptive expert-cache settings; it can take

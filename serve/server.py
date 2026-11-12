@@ -3992,9 +3992,19 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
     shaped = {**cfg, "args": args}
     backend, archs = drafting.detect_hardware()
     parallel_n = cfg.get("parallel")
-    decision = drafting.apply(shaped, klass=drafting_card_class(), data_dir=drafting.data_dir_of(args), backend=backend, archs=archs,
-                              vram_mib=drafting_vram_mib(cfg, backend, archs),
-                              slots=parallel_n if isinstance(parallel_n, int) and not isinstance(parallel_n, bool) else 0, engine=exe)
+    if cfg.get("drafting") == "args":
+        # The fork's "drafting": "args": the run config's own drafter options go to the engine as written (deploy/local: DFlash2 with
+        # --draft-fallback mtp, which keeps --mtp and so the disk parking that DFlash2 alone loses). Elsewhere it reads as Auto (normalize),
+        # so a start that ends retries with the MTP (mtp_retry_args) or with no drafter (nodraft_retry_args) as Auto's would.
+        draft = drafting._flag_value(args, "--draft")
+        decision = drafting.Decision("auto", "dflash2" if draft == "dflash2" else "mtp" if "--mtp" in args else "off")
+        if announce and draft:
+            print(f"[strata] drafting: as the config says (--draft {draft}, --draft-fallback {drafting._flag_value(args, '--draft-fallback') or '-'}, "
+                  f"--draft-conf {drafting._flag_value(args, '--draft-conf') or '-'}, --spec {drafting._flag_value(args, '--spec') or '-'})", flush=True)
+    else:
+        decision = drafting.apply(shaped, klass=drafting_card_class(), data_dir=drafting.data_dir_of(args), backend=backend, archs=archs,
+                                  vram_mib=drafting_vram_mib(cfg, backend, archs),
+                                  slots=parallel_n if isinstance(parallel_n, int) and not isinstance(parallel_n, bool) else 0, engine=exe)
     args = shaped["args"]
     if announce:
         drafting.remember_note(decision.note)

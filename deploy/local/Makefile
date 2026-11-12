@@ -2,7 +2,7 @@
 COMPOSE ?= podman compose
 # The served model: qwen (config/server.json: the variants it lists, Qwen's and DeepSeek's, each
 # config/{model,server}-<variant>.json) or another config/{model,server}-<name>.json pair served alone. STRATA_VARIANT
-# picks the variant to start with (default: the first listed, q2).
+# picks the variant to start with (default: the first listed, q1).
 STRATA_MODEL ?= qwen
 export STRATA_MODEL
 STRATA_VARIANT ?=

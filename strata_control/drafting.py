@@ -1080,6 +1080,8 @@ def data_dir_of(args: list[Any]) -> Path | None:
             path = Path(items[items.index(flag) + 1])
             if flag == "--mtp" and path.name.isdigit():
                 continue
+            if flag == "--pack" and path.parent.name != "packs" and path.is_symlink():
+                path = path.resolve()                        # a link to <data>/packs/<tag> (the fork's deploy/local: /data/pack-<variant>)
             return path.parents[up - 1] if len(path.parents) >= up else None
     return None
 

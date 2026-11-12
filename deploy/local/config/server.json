@@ -1,8 +1,9 @@
 {
   "exe": "/opt/strata/engine/strata",
   "cwd": "/opt/strata",
-  "tokenizer": "/data/pack-q2/tokenizer",
+  "tokenizer": "/data/pack-q1/tokenizer",
   "backend": "hip",
+  "drafting": "args",
   "log": "/data/strata.log",
   "park": "sessions",
   "turn_slice_s": 300,
@@ -20,9 +21,8 @@
   "priority_default": 0,
   "priority_floor": -20,
   "models": {
-    "q2": "server-q2.json",
+    "q1": "server-q1.json",
     "q3": "server-q3.json",
-    "q3s": "server-q3s.json",
     "q4": "server-q4.json",
     "deepseek": "server-deepseek.json"
   },
@@ -55,8 +55,13 @@
     "conversation_cache_live_tail": 4096,
     "conversation_cache_min_free_mib": 512,
     "resident_experts": true,
-    "spec": 4,
+    "spec": 6,
     "spec_min_p": 0.7,
+    "draft": "dflash2",
+    "draft_model": "/data/dflash2/qwen3.8-flash-next-dflash2.q4_0.pack",
+    "draft_fallback": "none",
+    "draft_conf": 0.7,
+    "mtp_draft_vocab": "/data/dflash2/draft_vocab.bin",
     "max_context": 200000,
     "kv": "int8",
     "pool_workers": 0,
@@ -66,8 +71,8 @@
   },
   "vision": {
     "exe": "/opt/strata/engine/strata-vision",
-    "mmproj": "/data/model-q2/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
-    "model": "/data/model-q2/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+    "mmproj": "/data/model-q1/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+    "model": "/data/model-q1/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf",
     "gpu": false,
     "threads": 8,
     "max_tokens": 300

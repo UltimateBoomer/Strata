@@ -105,6 +105,14 @@ def prepare(cfg, folder, pack):
     complete.write_text('complete\n')
 
 
+def fetch_dflash2():
+    """The DFlash2 drafter, for a model config with "dflash2": true: Strata's own pinned, checked fetch into
+    /data/dflash2, where the server looks for it (strata_control/drafting.py data_dir_of: the variant's
+    /data/pack-<name> link resolves to /data/packs/<id>). A drafter already there is kept."""
+    subprocess.run([sys.executable, str(ROOT / 'strata.py'), 'drafting', 'fetch', '--data-dir', str(DATA)],
+                   cwd=ROOT, check=True)
+
+
 def reuse_cached_file(target, filename, info):
     """Link a file another model folder already holds (an older cache layout, or the same blob under another name:
     the Coder's shard 2 is Q2_0's) without copying large files."""
@@ -178,6 +186,8 @@ def initialize(cfg, session, suffix=''):
         fetch(session, source['repository'], source_metadata, source['files'], folder)
     (folder / 'manifest.json').write_text(json.dumps(metadata, indent=2) + '\n')
     prepare(cfg, folder, pack)
+    if cfg.get('dflash2'):
+        fetch_dflash2()
     # Each model has its own links (the default model /data/model and /data/pack, another /data/model-<name> and
     # /data/pack-<name>): an engine still running another model never writes through them (DeepSeek saves its
     # expert profile into its pack when it stops).
